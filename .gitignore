@@ -1,0 +1,17 @@
+# Environment and credentials
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.venv/
+venv/
+env/
+
+# Local runtime/cache data
+known_faces/known_faces.db
+known_faces/known_faces.db-shm
+known_faces/known_faces.db-wal
