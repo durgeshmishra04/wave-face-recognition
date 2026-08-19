@@ -64,7 +64,7 @@ CUDA_DEVICE_ID = int(os.getenv("CUDA_DEVICE_ID", "0"))
 KNOWN_FACES_DIR = Path("known_faces")
 
 # Local web server
-HOST = "127.0.0.1"
+HOST = "0.0.0.0"
 PORT = 5000
 
 # ============================================================
