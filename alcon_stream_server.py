@@ -59,7 +59,7 @@ PORT = 5000
 # Streaming tuning (important for mobile bandwidth)
 STREAM_JPEG_QUALITY = 65        # lower = smaller payload, good for mobile data
 STREAM_MAX_WIDTH = 800          # frames resized before sending over socket
-STREAM_TARGET_FPS = 8           # frames pushed per second to clients (not the same as detection fps)
+STREAM_TARGET_FPS = 10          # frames pushed per second to clients (not the same as detection fps)
 
 UNKNOWN_ALERT_COOLDOWN = 10.0
 UNKNOWN_GONE_CLEARANCE = 0.75
@@ -391,60 +391,100 @@ def camera_worker():
                                 unknown_present = True
                                 unknown_first_seen = now
                             unknown_last_seen = now
-                        else:
-                            if unknown_present and (now - unknown_last_seen >= UNKNOWN_GONE_CLEARANCE):
-                                presence_duration = unknown_last_seen - unknown_first_seen
-                                if presence_duration >= MIN_UNKNOWN_PRESENCE:
-                                    if now - last_unknown_alert > UNKNOWN_ALERT_COOLDOWN:
-                                        print("[ALERT] Unknown person detected (left the frame)!")
-                                        camera_status = "Unknown person detected"
-                                        last_unknown_alert = now
-                                        push_alert("Unknown person detected at MAIN GATE 01")
-                                unknown_present = False
-                                unknown_first_seen = 0.0
-                                unknown_last_seen = 0.0
+                        elif unknown_present and now - unknown_last_seen >= UNKNOWN_GONE_CLEARANCE:
+                            presence_duration = unknown_last_seen - unknown_first_seen
+                            if presence_duration >= MIN_UNKNOWN_PRESENCE:
+                                if now - last_unknown_alert > UNKNOWN_ALERT_COOLDOWN:
+                                    print("[ALERT] Unknown person detected (left the frame)!")
+                                    camera_status = "Unknown person detected"
+                                    last_unknown_alert = now
+                                    push_alert("Unknown person detected at MAIN GATE 01")
+                            unknown_present = False
+                            unknown_first_seen = 0.0
+                            unknown_last_seen = 0.0
 
                     except Exception as e:
                         print(f"[ERROR] Face processing error: {e}")
 
-                # Build lightweight metadata payload (frame coords, no drawing needed -
-                # React Native draws its own overlay boxes using this data)
-                h, w = frame.shape[:2]
+                height, width = frame.shape[:2]
                 for face in last_faces:
                     x1, y1, x2, y2 = face.bbox.astype(int)
                     faces_payload.append({
                         "name": getattr(face, "recognized_name", "Unknown"),
                         "score": round(float(getattr(face, "recognition_score", 0.0)), 3),
                         "box": {
-                            "x1": int(max(0, min(x1, w - 1))),
-                            "y1": int(max(0, min(y1, h - 1))),
-                            "x2": int(max(0, min(x2, w - 1))),
-                            "y2": int(max(0, min(y2, h - 1))),
+                            "x1": int(max(0, min(x1, width - 1))),
+                            "y1": int(max(0, min(y1, height - 1))),
+                            "x2": int(max(0, min(x2, width - 1))),
+                            "y2": int(max(0, min(y2, height - 1))),
                         }
                     })
 
                 now = time.time()
                 if now - last_emit_time >= emit_interval:
                     last_emit_time = now
+                    send_frame = frame.copy()
 
-                    # Resize before encoding to keep mobile payload small
-                    send_frame = frame
-                    if w > STREAM_MAX_WIDTH:
-                        scale = STREAM_MAX_WIDTH / float(w)
-                        send_frame = cv2.resize(frame, (STREAM_MAX_WIDTH, int(h * scale)))
+                    for face in last_faces:
+                        x1, y1, x2, y2 = face.bbox.astype(int)
+                        name = getattr(face, "recognized_name", "Unknown")
+                        score = float(getattr(face, "recognition_score", 0.0))
+
+                        x1 = max(0, min(x1, width - 1))
+                        y1 = max(0, min(y1, height - 1))
+                        x2 = max(0, min(x2, width - 1))
+                        y2 = max(0, min(y2, height - 1))
+
+                        if name == "Unknown":
+                            color = (0, 0, 255)
+                            label = "Unknown"
+                        else:
+                            color = (0, 255, 0)
+                            label = f"{name}  {score:.2f}"
+
+                        cv2.rectangle(send_frame, (x1, y1), (x2, y2), color, 2)
+
+                        (text_width, text_height), baseline = cv2.getTextSize(
+                            label,
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.65,
+                            2,
+                        )
+                        label_y1 = max(0, y1 - text_height - baseline - 8)
+                        label_y2 = max(text_height + baseline + 8, y1)
+                        cv2.rectangle(
+                            send_frame,
+                            (x1, label_y1),
+                            (x1 + text_width + 10, label_y2),
+                            color,
+                            -1,
+                        )
+                        cv2.putText(
+                            send_frame,
+                            label,
+                            (x1 + 5, label_y2 - 6),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.65,
+                            (255, 255, 255),
+                            2,
+                            cv2.LINE_AA,
+                        )
+
+                    if width > STREAM_MAX_WIDTH:
+                        scale = STREAM_MAX_WIDTH / float(width)
+                        send_frame = cv2.resize(send_frame, (STREAM_MAX_WIDTH, int(height * scale)))
 
                     success, encoded = cv2.imencode(
                         ".jpg", send_frame, [cv2.IMWRITE_JPEG_QUALITY, STREAM_JPEG_QUALITY]
                     )
 
                     if success:
+                        encoded_bytes = encoded.tobytes()
                         with latest_frame_lock:
-                            latest_annotated_frame = encoded.tobytes()
-
-                        b64_frame = base64.b64encode(encoded.tobytes()).decode("utf-8")
+                            latest_annotated_frame = encoded_bytes
 
                         socketio.emit("face_frame", {
-                            "image": b64_frame,          # base64 jpeg, no data: prefix
+                            "image": base64.b64encode(encoded_bytes).decode("utf-8"),
                             "width": send_frame.shape[1],
                             "height": send_frame.shape[0],
                             "faces": faces_payload,

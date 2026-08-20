@@ -1,6 +1,12 @@
-flask
-opencv-python
-numpy
-insightface
-onnxruntime-gpu[cuda,cudnn]>=1.27
-python-dotenv
+opencv-python==4.10.0.84
+numpy==1.26.4
+onnxruntime==1.19.2
+# If you have an NVIDIA GPU + CUDA installed, use this instead of onnxruntime:
+# onnxruntime-gpu==1.19.2
+insightface==0.7.3
+python-dotenv==1.0.1
+Flask==3.0.3
+flask-cors==5.0.0
+flask-socketio==5.4.1
+python-socketio==5.11.4
+eventlet==0.37.0
