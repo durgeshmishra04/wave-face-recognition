@@ -10,6 +10,22 @@ import hashlib
 import io
 from collections import deque
 
+# Force RTSP over TCP instead of UDP. This NVR is reachable at a public IP
+# (not a LAN address), and OpenCV/FFmpeg defaults RTSP to UDP transport —
+# over a WAN link that silently drops packets under any jitter, and the
+# loss gets rendered as corrupted macroblocks / brightness pulses baked
+# directly into the decoded frame. That shows up client-side as flicker,
+# and no amount of client-side buffering can fix it since the source
+# frame itself is already bad. Must be set before cv2.VideoCapture() is
+# ever called.
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+    "rtsp_transport;tcp|"
+    "max_delay;500000|"
+    "reorder_queue_size;64|"
+    "buffer_size;1048576|"
+    "stimeout;5000000"
+)
+
 import cv2
 import numpy as np
 import onnxruntime as ort
@@ -20,16 +36,6 @@ from flask_socketio import SocketIO
 from insightface.app import FaceAnalysis
 
 load_dotenv()
-
-# Force RTSP over TCP instead of UDP. This NVR is reachable at a public IP
-# (not a LAN address), and OpenCV/FFmpeg defaults RTSP to UDP transport —
-# over a WAN link that silently drops packets under any jitter, and the
-# loss gets rendered as corrupted macroblocks / brightness pulses baked
-# directly into the decoded frame. That shows up client-side as flicker,
-# and no amount of client-side buffering can fix it since the source
-# frame itself is already bad. Must be set before cv2.VideoCapture() is
-# ever called.
-os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
 
 # ============================================================
 # CONFIGURATION
@@ -60,6 +66,7 @@ PORT = 5000
 STREAM_JPEG_QUALITY = 65        # lower = smaller payload, good for mobile data
 STREAM_MAX_WIDTH = 800          # frames resized before sending over socket
 STREAM_TARGET_FPS = 10          # frames pushed per second to clients (not the same as detection fps)
+MAX_CONSECUTIVE_READ_FAILURES = 5
 
 UNKNOWN_ALERT_COOLDOWN = 10.0
 UNKNOWN_GONE_CLEARANCE = 0.75
@@ -362,13 +369,21 @@ def camera_worker():
 
             camera_status = "LIVE"
             print("[OK] RTSP stream connected.")
+            consecutive_read_failures = 0
 
             while camera_running:
                 ok, frame = cap.read()
                 if not ok or frame is None:
+                    consecutive_read_failures += 1
+                    if consecutive_read_failures < MAX_CONSECUTIVE_READ_FAILURES:
+                        time.sleep(0.05)
+                        continue
+
                     camera_status = "Stream lost - reconnecting..."
-                    print("[WARNING] Frame read failed.")
+                    print("[WARNING] Frame read failed repeatedly.")
                     break
+
+                consecutive_read_failures = 0
 
                 frame_counter += 1
                 faces_payload = []

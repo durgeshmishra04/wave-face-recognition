@@ -15,3 +15,5 @@ env/
 known_faces/known_faces.db
 known_faces/known_faces.db-shm
 known_faces/known_faces.db-wal
+
+pythonai.json
