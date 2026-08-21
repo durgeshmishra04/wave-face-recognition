@@ -1046,6 +1046,8 @@ def camera_worker():
 
     known_face_memory = []
 
+    last_unknown_frame = None
+
     last_emit_time = 0.0
 
     emit_interval = (
@@ -1357,6 +1359,8 @@ def camera_worker():
 
                                 unknown_first_seen = now
 
+                            last_unknown_frame = frame.copy()
+
                             if unknown_present:
 
                                 unknown_last_seen = now
@@ -1405,7 +1409,9 @@ def camera_worker():
                                 push_alert(
                                     "New person detected "
                                     "on Main Gate 01",
-                                    frame,
+                                    last_unknown_frame
+                                    if last_unknown_frame is not None
+                                    else frame,
                                     "Main Gate 01"
                                 )
 
@@ -1415,6 +1421,8 @@ def camera_worker():
                             unknown_first_seen = 0.0
 
                             unknown_last_seen = 0.0
+
+                            last_unknown_frame = None
 
 
                     except Exception as e:
