@@ -9,6 +9,8 @@ import json
 import hashlib
 import io
 from collections import deque
+import firebase_admin
+from firebase_admin import credentials, messaging
 
 # Force RTSP over TCP instead of UDP. This NVR is reachable at a public IP
 # (not a LAN address), and OpenCV/FFmpeg defaults RTSP to UDP transport —
@@ -68,7 +70,6 @@ STREAM_MAX_WIDTH = 800          # frames resized before sending over socket
 STREAM_TARGET_FPS = 10          # frames pushed per second to clients (not the same as detection fps)
 MAX_CONSECUTIVE_READ_FAILURES = 5
 
-UNKNOWN_ALERT_COOLDOWN = 10.0
 UNKNOWN_GONE_CLEARANCE = 0.75
 MIN_UNKNOWN_PRESENCE = 1.0
 
@@ -94,7 +95,6 @@ face_app = None
 unknown_present = False
 unknown_first_seen = 0.0
 unknown_last_seen = 0.0
-last_unknown_alert = 0.0
 
 alert_history = deque(maxlen=MAX_ALERT_HISTORY)  # each item: {"time":..., "message":...}
 connected_clients = 0
@@ -325,6 +325,21 @@ def recognize_face(face):
     return "Unknown", best_score
 
 
+def boxes_overlap(first_box, second_box):
+    first_x1, first_y1, first_x2, first_y2 = first_box
+    second_x1, second_y1, second_x2, second_y2 = second_box
+
+    intersection_width = max(0, min(first_x2, second_x2) - max(first_x1, second_x1))
+    intersection_height = max(0, min(first_y2, second_y2) - max(first_y1, second_y1))
+    intersection_area = intersection_width * intersection_height
+
+    first_area = max(0, first_x2 - first_x1) * max(0, first_y2 - first_y1)
+    second_area = max(0, second_x2 - second_x1) * max(0, second_y2 - second_y1)
+    union_area = first_area + second_area - intersection_area
+
+    return union_area > 0 and intersection_area / union_area >= 0.30
+
+
 # ============================================================
 # ALERT HANDLING
 # ============================================================
@@ -341,7 +356,7 @@ def push_alert(message):
 # ============================================================
 
 def camera_worker():
-    global camera_status, last_unknown_alert
+    global camera_status
     global unknown_present, unknown_first_seen, unknown_last_seen
     global latest_annotated_frame
 
@@ -390,12 +405,26 @@ def camera_worker():
 
                 if frame_counter % PROCESS_EVERY_N_FRAMES == 0:
                     try:
+                        previous_faces = last_faces
                         last_faces = face_app.get(frame)
                         now = time.time()
                         seen_unknown_in_frame = False
 
                         for face in last_faces:
                             name, score = recognize_face(face)
+
+                            if name == "Unknown":
+                                current_box = face.bbox.astype(int)
+                                for previous_face in previous_faces:
+                                    previous_name = getattr(previous_face, "recognized_name", "Unknown")
+                                    if previous_name != "Unknown" and boxes_overlap(
+                                        current_box,
+                                        previous_face.bbox.astype(int),
+                                    ):
+                                        name = previous_name
+                                        score = getattr(previous_face, "recognition_score", score)
+                                        break
+
                             face.recognized_name = name
                             face.recognition_score = score
                             if name == "Unknown":
@@ -409,11 +438,9 @@ def camera_worker():
                         elif unknown_present and now - unknown_last_seen >= UNKNOWN_GONE_CLEARANCE:
                             presence_duration = unknown_last_seen - unknown_first_seen
                             if presence_duration >= MIN_UNKNOWN_PRESENCE:
-                                if now - last_unknown_alert > UNKNOWN_ALERT_COOLDOWN:
-                                    print("[ALERT] Unknown person detected (left the frame)!")
-                                    camera_status = "Unknown person detected"
-                                    last_unknown_alert = now
-                                    push_alert("Unknown person detected at MAIN GATE 01")
+                                print("[ALERT] Unknown person detected (left the frame)!")
+                                camera_status = "Unknown person detected"
+                                push_alert("Unknown person detected at MAIN GATE 01")
                             unknown_present = False
                             unknown_first_seen = 0.0
                             unknown_last_seen = 0.0
@@ -579,6 +606,21 @@ def main():
     print("=" * 60)
     print(" ALCON CAMERA 1 - FACE RECOGNITION (Socket.IO API mode)")
     print("=" * 60)
+
+    cred = credentials.Certificate("./pythonai.json")
+    firebase_admin.initialize_app(cred)
+
+    message = messaging.Message(
+        notification=messaging.Notification(
+            title="Unknown Person Detected",
+            body="A person not in the known database has been detected."
+        ),
+        topic="all_devices"
+    )
+
+    response = messaging.send(message)
+
+    print(response)
 
     initialize_face_model()
     load_known_faces()

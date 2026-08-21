@@ -10,3 +10,4 @@ flask-cors==5.0.0
 flask-socketio==5.4.1
 python-socketio==5.11.4
 eventlet==0.37.0
+firebase-admin
