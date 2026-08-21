@@ -350,6 +350,19 @@ def push_alert(message):
     # notify any connected React Native clients immediately
     socketio.emit("face_alert", entry)
 
+    try:
+        firebase_message = messaging.Message(
+            notification=messaging.Notification(
+                title="Unknown Person Detected",
+                body=message,
+            ),
+            topic="all_devices",
+        )
+        response = messaging.send(firebase_message)
+        print(f"[INFO] Firebase notification sent: {response}")
+    except Exception as e:
+        print(f"[ERROR] Firebase notification failed: {e}")
+
 
 # ============================================================
 # CAMERA WORKER
@@ -609,18 +622,6 @@ def main():
 
     cred = credentials.Certificate("./pythonai.json")
     firebase_admin.initialize_app(cred)
-
-    message = messaging.Message(
-        notification=messaging.Notification(
-            title="Unknown Person Detected",
-            body="A person not in the known database has been detected."
-        ),
-        topic="all_devices"
-    )
-
-    response = messaging.send(message)
-
-    print(response)
 
     initialize_face_model()
     load_known_faces()
