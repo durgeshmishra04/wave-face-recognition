@@ -921,20 +921,6 @@ def annotate_alert_frame(frame, faces):
             cv2.LINE_AA,
         )
 
-    cv2.rectangle(
-        annotated_frame,
-        (
-            int(frame_width * ROI_LEFT),
-            int(frame_height * ROI_TOP),
-        ),
-        (
-            int(frame_width * ROI_RIGHT),
-            int(frame_height * ROI_BOTTOM),
-        ),
-        (255, 0, 0),
-        2,
-    )
-
     return annotated_frame
 
 
@@ -1119,7 +1105,7 @@ def camera_worker():
 
     known_face_memory = []
 
-    last_unknown_frame = None
+    unknown_frame_history = deque(maxlen=5)
     last_unknown_count = 0
 
     last_emit_time = 0.0
@@ -1441,9 +1427,11 @@ def camera_worker():
 
                                 unknown_first_seen = now
 
-                            last_unknown_frame = annotate_alert_frame(
-                                frame,
-                                last_faces,
+                            unknown_frame_history.append(
+                                annotate_alert_frame(
+                                    frame,
+                                    last_faces,
+                                )
                             )
                             last_unknown_count = unknown_count_in_frame
 
@@ -1495,8 +1483,8 @@ def camera_worker():
                                 push_alert(
                                     f"{last_unknown_count} unknown "
                                     "person(s) detected on Main Gate 01",
-                                    last_unknown_frame
-                                    if last_unknown_frame is not None
+                                    unknown_frame_history[0]
+                                    if unknown_frame_history
                                     else frame,
                                     "Main Gate 01"
                                 )
@@ -1508,7 +1496,7 @@ def camera_worker():
 
                             unknown_last_seen = 0.0
 
-                            last_unknown_frame = None
+                            unknown_frame_history.clear()
 
                             last_unknown_count = 0
 
