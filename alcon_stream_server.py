@@ -70,7 +70,7 @@ STREAM_MAX_WIDTH = 800          # frames resized before sending over socket
 STREAM_TARGET_FPS = 10          # frames pushed per second to clients (not the same as detection fps)
 MAX_CONSECUTIVE_READ_FAILURES = 5
 
-UNKNOWN_GONE_CLEARANCE = 0.75
+UNKNOWN_GONE_CLEARANCE = 3.0
 MIN_UNKNOWN_PRESENCE = 1.0
 
 MAX_ALERT_HISTORY = 100
@@ -337,7 +337,7 @@ def boxes_overlap(first_box, second_box):
     second_area = max(0, second_x2 - second_x1) * max(0, second_y2 - second_y1)
     union_area = first_area + second_area - intersection_area
 
-    return union_area > 0 and intersection_area / union_area >= 0.30
+    return union_area > 0 and intersection_area / union_area >= 0.10
 
 
 # ============================================================
@@ -375,6 +375,7 @@ def camera_worker():
 
     frame_counter = 0
     last_faces = []
+    known_face_memory = []
     last_emit_time = 0.0
     emit_interval = 1.0 / STREAM_TARGET_FPS
 
@@ -423,11 +424,17 @@ def camera_worker():
                         now = time.time()
                         seen_unknown_in_frame = False
 
+                        known_face_memory[:] = [
+                            remembered_face
+                            for remembered_face in known_face_memory
+                            if now - remembered_face["last_seen"] < UNKNOWN_GONE_CLEARANCE
+                        ]
+
                         for face in last_faces:
                             name, score = recognize_face(face)
+                            current_box = face.bbox.astype(int)
 
                             if name == "Unknown":
-                                current_box = face.bbox.astype(int)
                                 for previous_face in previous_faces:
                                     previous_name = getattr(previous_face, "recognized_name", "Unknown")
                                     if previous_name != "Unknown" and boxes_overlap(
@@ -438,6 +445,37 @@ def camera_worker():
                                         score = getattr(previous_face, "recognition_score", score)
                                         break
 
+                            if name == "Unknown":
+                                for remembered_face in known_face_memory:
+                                    if boxes_overlap(current_box, remembered_face["box"]):
+                                        name = remembered_face["name"]
+                                        score = remembered_face["score"]
+                                        remembered_face["box"] = current_box
+                                        remembered_face["last_seen"] = now
+                                        break
+
+                            if name != "Unknown":
+                                matching_memory = next(
+                                    (
+                                        remembered_face
+                                        for remembered_face in known_face_memory
+                                        if remembered_face["name"] == name
+                                        and boxes_overlap(current_box, remembered_face["box"])
+                                    ),
+                                    None,
+                                )
+                                if matching_memory is None:
+                                    known_face_memory.append({
+                                        "name": name,
+                                        "score": score,
+                                        "box": current_box,
+                                        "last_seen": now,
+                                    })
+                                else:
+                                    matching_memory["box"] = current_box
+                                    matching_memory["score"] = score
+                                    matching_memory["last_seen"] = now
+
                             face.recognized_name = name
                             face.recognition_score = score
                             if name == "Unknown":
@@ -447,7 +485,8 @@ def camera_worker():
                             if not unknown_present:
                                 unknown_present = True
                                 unknown_first_seen = now
-                            unknown_last_seen = now
+                            if unknown_present:
+                                unknown_last_seen = now
                         elif unknown_present and now - unknown_last_seen >= UNKNOWN_GONE_CLEARANCE:
                             presence_duration = unknown_last_seen - unknown_first_seen
                             if presence_duration >= MIN_UNKNOWN_PRESENCE:
