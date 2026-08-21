@@ -5,6 +5,8 @@ import threading
 import base64
 from pathlib import Path
 from urllib.parse import quote
+from urllib.parse import urlencode
+from urllib.request import HTTPDigestAuthHandler, HTTPPasswordMgrWithDefaultRealm, build_opener
 import sqlite3
 import json
 import hashlib
@@ -43,6 +45,7 @@ NVR_USERNAME = "admin"
 NVR_PASSWORD = os.getenv("ALCON_PASSWORD", "")
 
 RTSP_PORT = 554
+NVR_HTTP_PORT = int(os.getenv("NVR_HTTP_PORT", "80"))
 CHANNEL = 1
 SUBTYPE = 1
 RTSP_PATH = "/cam/realmonitor"
@@ -105,10 +108,15 @@ MAX_ALERT_HISTORY = 100
 
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
     "rtsp_transport;tcp|"
-    "max_delay;500000|"
-    "reorder_queue_size;64|"
-    "buffer_size;1048576|"
-    "stimeout;5000000"
+    "rtsp_flags;prefer_tcp|"
+    "max_delay;1000000|"
+    "reorder_queue_size;512|"
+    "buffer_size;4194304|"
+    "stimeout;5000000|"
+    "rw_timeout;5000000|"
+    "fflags;discardcorrupt|"
+    "err_detect;ignore_err|"
+    "flush_packets;1"
 )
 
 
@@ -191,6 +199,37 @@ def initialize_firebase():
 # ============================================================
 # RTSP URL
 # ============================================================
+
+def configure_h264_stream():
+
+    config_url = (
+        f"http://{NVR_IP}:{NVR_HTTP_PORT}/cgi-bin/configManager.cgi?"
+        + urlencode({
+            "action": "setConfig",
+            "Encode[0].MainFormat[0].Video.Codec": "H.264",
+            "Encode[0].ExtraFormat[0].Video.Codec": "H.264",
+        })
+    )
+
+    password_manager = HTTPPasswordMgrWithDefaultRealm()
+    password_manager.add_password(
+        None,
+        config_url,
+        NVR_USERNAME,
+        NVR_PASSWORD,
+    )
+    opener = build_opener(
+        HTTPDigestAuthHandler(password_manager)
+    )
+
+    try:
+        with opener.open(config_url, timeout=10) as response:
+            result = response.read().decode("utf-8", errors="replace")
+        if "OK" not in result.upper():
+            raise RuntimeError(result.strip() or "Camera rejected H.264 configuration")
+        print("[OK] Camera streams configured to H.264.")
+    except Exception as e:
+        print(f"[WARNING] Could not configure camera to H.264: {e}")
 
 def build_rtsp_url():
 
@@ -1027,19 +1066,14 @@ def camera_worker():
 
             cap = cv2.VideoCapture(
                 rtsp_url,
-                cv2.CAP_FFMPEG
+                cv2.CAP_FFMPEG,
+                [
+                    cv2.CAP_PROP_OPEN_TIMEOUT_MSEC,
+                    10000,
+                    cv2.CAP_PROP_READ_TIMEOUT_MSEC,
+                    10000,
+                ]
             )
-
-            try:
-
-                cap.set(
-                    cv2.CAP_PROP_BUFFERSIZE,
-                    1
-                )
-
-            except Exception:
-
-                pass
 
 
             if not cap.isOpened():
@@ -1958,6 +1992,8 @@ def main():
     # ----------------------------------------
     # Face model
     # ----------------------------------------
+
+    configure_h264_stream()
 
     initialize_face_model()
 
