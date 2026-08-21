@@ -99,6 +99,12 @@ MAX_CONSECUTIVE_READ_FAILURES = 5
 UNKNOWN_GONE_CLEARANCE = 3.0
 MIN_UNKNOWN_PRESENCE = 1.0
 
+# Region of interest from the camera view: the black rectangle in the image.
+ROI_LEFT = 0.18
+ROI_TOP = 0.54
+ROI_RIGHT = 0.995
+ROI_BOTTOM = 0.99
+
 MAX_ALERT_HISTORY = 100
 
 
@@ -865,6 +871,73 @@ def boxes_overlap(
     )
 
 
+def face_in_roi(face_box, frame_width, frame_height):
+
+    x1, y1, x2, y2 = face_box
+    center_x = (x1 + x2) / 2.0
+    center_y = (y1 + y2) / 2.0
+
+    return (
+        frame_width * ROI_LEFT <= center_x <= frame_width * ROI_RIGHT
+        and frame_height * ROI_TOP <= center_y <= frame_height * ROI_BOTTOM
+    )
+
+
+def annotate_alert_frame(frame, faces):
+
+    annotated_frame = frame.copy()
+    frame_height, frame_width = annotated_frame.shape[:2]
+
+    for face in faces:
+        x1, y1, x2, y2 = face.bbox.astype(int)
+        name = getattr(face, "recognized_name", "Unknown")
+        score = float(getattr(face, "recognition_score", 0.0))
+        in_roi = face_in_roi(
+            (x1, y1, x2, y2),
+            frame_width,
+            frame_height,
+        )
+
+        if not in_roi:
+            continue
+
+        color = (0, 0, 255) if name == "Unknown" else (0, 255, 0)
+        label = "Unknown" if name == "Unknown" else f"{name}  {score:.2f}"
+
+        x1 = max(0, min(x1, frame_width - 1))
+        y1 = max(0, min(y1, frame_height - 1))
+        x2 = max(0, min(x2, frame_width - 1))
+        y2 = max(0, min(y2, frame_height - 1))
+
+        cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
+        cv2.putText(
+            annotated_frame,
+            label,
+            (x1 + 5, max(20, y1 - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            color,
+            2,
+            cv2.LINE_AA,
+        )
+
+    cv2.rectangle(
+        annotated_frame,
+        (
+            int(frame_width * ROI_LEFT),
+            int(frame_height * ROI_TOP),
+        ),
+        (
+            int(frame_width * ROI_RIGHT),
+            int(frame_height * ROI_BOTTOM),
+        ),
+        (255, 0, 0),
+        2,
+    )
+
+    return annotated_frame
+
+
 # ============================================================
 # SAVE ALERT IMAGE
 # ============================================================
@@ -1047,6 +1120,7 @@ def camera_worker():
     known_face_memory = []
 
     last_unknown_frame = None
+    last_unknown_count = 0
 
     last_emit_time = 0.0
 
@@ -1166,6 +1240,7 @@ def camera_worker():
                         now = time.time()
 
                         seen_unknown_in_frame = False
+                        unknown_count_in_frame = 0
 
 
                         # ----------------------------------------
@@ -1206,6 +1281,11 @@ def camera_worker():
 
                             current_box = (
                                 face.bbox.astype(int)
+                            )
+                            face_is_in_roi = face_in_roi(
+                                current_box,
+                                frame.shape[1],
+                                frame.shape[0],
                             )
 
 
@@ -1340,11 +1420,13 @@ def camera_worker():
                             face.recognized_name = name
 
                             face.recognition_score = score
+                            face.in_roi = face_is_in_roi
 
 
-                            if name == "Unknown":
+                            if name == "Unknown" and face_is_in_roi:
 
                                 seen_unknown_in_frame = True
+                                unknown_count_in_frame += 1
 
 
                         # ----------------------------------------
@@ -1359,7 +1441,11 @@ def camera_worker():
 
                                 unknown_first_seen = now
 
-                            last_unknown_frame = frame.copy()
+                            last_unknown_frame = annotate_alert_frame(
+                                frame,
+                                last_faces,
+                            )
+                            last_unknown_count = unknown_count_in_frame
 
                             if unknown_present:
 
@@ -1407,8 +1493,8 @@ def camera_worker():
                                 # IMPORTANT:
                                 # Use current frame for alert image
                                 push_alert(
-                                    "New person detected "
-                                    "on Main Gate 01",
+                                    f"{last_unknown_count} unknown "
+                                    "person(s) detected on Main Gate 01",
                                     last_unknown_frame
                                     if last_unknown_frame is not None
                                     else frame,
@@ -1423,6 +1509,8 @@ def camera_worker():
                             unknown_last_seen = 0.0
 
                             last_unknown_frame = None
+
+                            last_unknown_count = 0
 
 
                     except Exception as e:
