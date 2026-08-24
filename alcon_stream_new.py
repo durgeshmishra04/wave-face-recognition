@@ -96,8 +96,11 @@ STREAM_MAX_WIDTH = 800
 STREAM_TARGET_FPS = 10
 MAX_CONSECUTIVE_READ_FAILURES = 5
 
-UNKNOWN_GONE_CLEARANCE = 2.0
-MIN_UNKNOWN_PRESENCE = 1.0
+UNKNOWN_GONE_CLEARANCE = 5.0
+MIN_UNKNOWN_PRESENCE = 1.5
+
+# Alert deduplication: prevent duplicate alerts within this time window (seconds)
+ALERT_DEDUP_TIME = 10.0
 
 # Region of interest from the camera view: the black rectangle in the image.
 ROI_LEFT = 0.18
@@ -158,6 +161,7 @@ face_app = None
 unknown_present = False
 unknown_first_seen = 0.0
 unknown_last_seen = 0.0
+last_alert_time = 0.0
 
 alert_history = deque(maxlen=MAX_ALERT_HISTORY)
 
@@ -874,12 +878,12 @@ def boxes_overlap(
 def face_in_roi(face_box, frame_width, frame_height):
 
     x1, y1, x2, y2 = face_box
-    center_x = (x1 + x2) / 2.0
-    center_y = (y1 + y2) / 2.0
 
     return (
-        frame_width * ROI_LEFT <= center_x <= frame_width * ROI_RIGHT
-        and frame_height * ROI_TOP <= center_y <= frame_height * ROI_BOTTOM
+        x1 >= frame_width * ROI_LEFT
+        and y1 >= frame_height * ROI_TOP
+        and x2 <= frame_width * ROI_RIGHT
+        and y2 <= frame_height * ROI_BOTTOM
     )
 
 
@@ -1219,9 +1223,19 @@ def camera_worker():
 
                         previous_faces = last_faces
 
-                        last_faces = face_app.get(
+                        detected_faces = face_app.get(
                             frame
                         )
+
+                        last_faces = [
+                            face
+                            for face in detected_faces
+                            if face_in_roi(
+                                face.bbox.astype(int),
+                                frame.shape[1],
+                                frame.shape[0],
+                            )
+                        ]
 
                         now = time.time()
 
@@ -1470,27 +1484,50 @@ def camera_worker():
                                 MIN_UNKNOWN_PRESENCE
                             ):
 
-                                print(
-                                    "[ALERT] Unknown "
-                                    "person detected "
-                                    "(left the frame)!"
-                                )
+                                # ----------------------------------------
+                                # Alert deduplication check
+                                # ----------------------------------------
 
-                                camera_status = (
-                                    "Unknown person detected"
-                                )
+                                global last_alert_time
 
+                                if (
+                                    now
+                                    -
+                                    last_alert_time
+                                    >=
+                                    ALERT_DEDUP_TIME
+                                ):
 
-                                # IMPORTANT:
-                                # Use current frame for alert image
-                                push_alert(
-                                    f"{max_unknown_count} unknown "
-                                    "person(s) detected on Main Gate 01",
-                                    unknown_frame_history[0]
-                                    if unknown_frame_history
-                                    else frame,
-                                    "Main Gate 01"
-                                )
+                                    print(
+                                        "[ALERT] Unknown "
+                                        "person detected "
+                                        "(left the frame)!"
+                                    )
+
+                                    camera_status = (
+                                        "Unknown person detected"
+                                    )
+
+                                    # IMPORTANT:
+                                    # Use current frame for alert image
+                                    push_alert(
+                                        f"{max_unknown_count} unknown "
+                                        "person(s) detected on Main Gate 01",
+                                        unknown_frame_history[0]
+                                        if unknown_frame_history
+                                        else frame,
+                                        "Main Gate 01"
+                                    )
+
+                                    last_alert_time = now
+
+                                else:
+
+                                    print(
+                                        "[INFO] Alert suppressed "
+                                        "(duplicate within "
+                                        f"{ALERT_DEDUP_TIME}s window)"
+                                    )
 
 
                             unknown_present = False
