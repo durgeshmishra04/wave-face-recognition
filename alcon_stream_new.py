@@ -96,7 +96,7 @@ STREAM_MAX_WIDTH = 800
 STREAM_TARGET_FPS = 10
 MAX_CONSECUTIVE_READ_FAILURES = 5
 
-UNKNOWN_GONE_CLEARANCE = 3.0
+UNKNOWN_GONE_CLEARANCE = 2.0
 MIN_UNKNOWN_PRESENCE = 1.0
 
 # Region of interest from the camera view: the black rectangle in the image.
@@ -1106,7 +1106,7 @@ def camera_worker():
     known_face_memory = []
 
     unknown_frame_history = deque(maxlen=5)
-    last_unknown_count = 0
+    max_unknown_count = 0
 
     last_emit_time = 0.0
 
@@ -1433,7 +1433,10 @@ def camera_worker():
                                     last_faces,
                                 )
                             )
-                            last_unknown_count = unknown_count_in_frame
+                            max_unknown_count = max(
+                                max_unknown_count,
+                                unknown_count_in_frame,
+                            )
 
                             if unknown_present:
 
@@ -1481,7 +1484,7 @@ def camera_worker():
                                 # IMPORTANT:
                                 # Use current frame for alert image
                                 push_alert(
-                                    f"{last_unknown_count} unknown "
+                                    f"{max_unknown_count} unknown "
                                     "person(s) detected on Main Gate 01",
                                     unknown_frame_history[0]
                                     if unknown_frame_history
@@ -1498,7 +1501,7 @@ def camera_worker():
 
                             unknown_frame_history.clear()
 
-                            last_unknown_count = 0
+                            max_unknown_count = 0
 
 
                     except Exception as e:
