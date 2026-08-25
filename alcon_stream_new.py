@@ -1117,6 +1117,7 @@ def camera_worker():
     unknown_frame_history = deque(maxlen=5)
     max_unknown_count = 0
     unknown_alert_sent = False
+    last_detection_log_time = 0.0
 
     last_emit_time = 0.0
 
@@ -1433,6 +1434,17 @@ def camera_worker():
 
                                 seen_unknown_in_frame = True
                                 unknown_count_in_frame += 1
+
+                        if now - last_detection_log_time >= 5.0:
+
+                            print(
+                                f"[INFO] Faces detected: "
+                                f"{len(detected_faces)}, "
+                                f"inside ROI: {len(last_faces)}, "
+                                f"unknown: {unknown_count_in_frame}"
+                            )
+
+                            last_detection_log_time = now
 
 
                         # ----------------------------------------
