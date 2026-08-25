@@ -52,7 +52,9 @@ RTSP_PATH = "/cam/realmonitor"
 
 RECOGNITION_THRESHOLD = 0.50
 PROCESS_EVERY_N_FRAMES = 2
-DET_SIZE = (640, 640)
+DET_SIZE_VALUE = int(os.getenv("DET_SIZE", "800"))
+DET_SIZE = (DET_SIZE_VALUE, DET_SIZE_VALUE)
+DET_THRESH = float(os.getenv("DET_THRESH", "0.40"))
 
 USE_GPU = os.getenv("USE_GPU", "auto").strip().lower()
 CUDA_DEVICE_ID = int(os.getenv("CUDA_DEVICE_ID", "0"))
@@ -363,7 +365,7 @@ def initialize_face_model():
             else -1
         ),
         det_size=DET_SIZE,
-        det_thresh=0.50
+        det_thresh=DET_THRESH
     )
 
     print("[OK] Face model loaded.")
@@ -879,11 +881,12 @@ def face_in_roi(face_box, frame_width, frame_height):
 
     x1, y1, x2, y2 = face_box
 
+    face_center_x = (x1 + x2) / 2
+    face_center_y = (y1 + y2) / 2
+
     return (
-        x1 >= frame_width * ROI_LEFT
-        and y1 >= frame_height * ROI_TOP
-        and x2 <= frame_width * ROI_RIGHT
-        and y2 <= frame_height * ROI_BOTTOM
+        frame_width * ROI_LEFT <= face_center_x <= frame_width * ROI_RIGHT
+        and frame_height * ROI_TOP <= face_center_y <= frame_height * ROI_BOTTOM
     )
 
 
@@ -1096,6 +1099,8 @@ def camera_worker():
 
     global camera_status
 
+    global last_alert_time
+
     global unknown_present
     global unknown_first_seen
     global unknown_last_seen
@@ -1111,6 +1116,7 @@ def camera_worker():
 
     unknown_frame_history = deque(maxlen=5)
     max_unknown_count = 0
+    unknown_alert_sent = False
 
     last_emit_time = 0.0
 
@@ -1456,6 +1462,48 @@ def camera_worker():
 
                                 unknown_last_seen = now
 
+                                if (
+                                    not unknown_alert_sent
+                                    and now - unknown_first_seen
+                                    >= MIN_UNKNOWN_PRESENCE
+                                ):
+
+                                    if (
+                                        now - last_alert_time
+                                        >= ALERT_DEDUP_TIME
+                                    ):
+
+                                        print(
+                                            "[ALERT] Unknown person "
+                                            "detected in ROI."
+                                        )
+
+                                        camera_status = (
+                                            "Unknown person detected"
+                                        )
+
+                                        push_alert(
+                                            f"{max_unknown_count} unknown "
+                                            "person(s) detected on Main "
+                                            "Gate 01",
+                                            unknown_frame_history[-1]
+                                            if unknown_frame_history
+                                            else frame,
+                                            "Main Gate 01"
+                                        )
+
+                                        last_alert_time = now
+
+                                    else:
+
+                                        print(
+                                            "[INFO] Alert suppressed "
+                                            "(duplicate within "
+                                            f"{ALERT_DEDUP_TIME}s window)"
+                                        )
+
+                                    unknown_alert_sent = True
+
 
                         # ----------------------------------------
                         # Person left frame
@@ -1471,65 +1519,6 @@ def camera_worker():
                             UNKNOWN_GONE_CLEARANCE
                         ):
 
-                            presence_duration = (
-                                unknown_last_seen
-                                -
-                                unknown_first_seen
-                            )
-
-
-                            if (
-                                presence_duration
-                                >=
-                                MIN_UNKNOWN_PRESENCE
-                            ):
-
-                                # ----------------------------------------
-                                # Alert deduplication check
-                                # ----------------------------------------
-
-                                global last_alert_time
-
-                                if (
-                                    now
-                                    -
-                                    last_alert_time
-                                    >=
-                                    ALERT_DEDUP_TIME
-                                ):
-
-                                    print(
-                                        "[ALERT] Unknown "
-                                        "person detected "
-                                        "(left the frame)!"
-                                    )
-
-                                    camera_status = (
-                                        "Unknown person detected"
-                                    )
-
-                                    # IMPORTANT:
-                                    # Use current frame for alert image
-                                    push_alert(
-                                        f"{max_unknown_count} unknown "
-                                        "person(s) detected on Main Gate 01",
-                                        unknown_frame_history[0]
-                                        if unknown_frame_history
-                                        else frame,
-                                        "Main Gate 01"
-                                    )
-
-                                    last_alert_time = now
-
-                                else:
-
-                                    print(
-                                        "[INFO] Alert suppressed "
-                                        "(duplicate within "
-                                        f"{ALERT_DEDUP_TIME}s window)"
-                                    )
-
-
                             unknown_present = False
 
                             unknown_first_seen = 0.0
@@ -1539,6 +1528,8 @@ def camera_worker():
                             unknown_frame_history.clear()
 
                             max_unknown_count = 0
+
+                            unknown_alert_sent = False
 
 
                     except Exception as e:
