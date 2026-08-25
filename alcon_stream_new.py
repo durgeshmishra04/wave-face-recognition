@@ -55,6 +55,9 @@ PROCESS_EVERY_N_FRAMES = 2
 DET_SIZE_VALUE = int(os.getenv("DET_SIZE", "800"))
 DET_SIZE = (DET_SIZE_VALUE, DET_SIZE_VALUE)
 DET_THRESH = float(os.getenv("DET_THRESH", "0.40"))
+UNKNOWN_FACE_MIN_SCORE = float(
+    os.getenv("UNKNOWN_FACE_MIN_SCORE", "0.60")
+)
 
 USE_GPU = os.getenv("USE_GPU", "auto").strip().lower()
 CUDA_DEVICE_ID = int(os.getenv("CUDA_DEVICE_ID", "0"))
@@ -1429,8 +1432,17 @@ def camera_worker():
                             face.recognition_score = score
                             face.in_roi = face_is_in_roi
 
+                            face_detection_score = float(
+                                getattr(face, "det_score", 0.0)
+                            )
 
-                            if name == "Unknown" and face_is_in_roi:
+
+                            if (
+                                name == "Unknown"
+                                and face_is_in_roi
+                                and face_detection_score
+                                >= UNKNOWN_FACE_MIN_SCORE
+                            ):
 
                                 seen_unknown_in_frame = True
                                 unknown_count_in_frame += 1
