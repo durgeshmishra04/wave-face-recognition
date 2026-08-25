@@ -1,6 +1,6 @@
 opencv-python==4.10.0.84
 numpy==1.26.4
-onnxruntime==1.19.2
+
 # If you have an NVIDIA GPU + CUDA installed, use this instead of onnxruntime:
 # onnxruntime-gpu==1.19.2
 insightface==0.7.3
@@ -12,3 +12,11 @@ flask-socketio==5.4.1
 python-socketio==5.11.4
 eventlet==0.37.0
 firebase-admin
+
+onnxruntime-gpu==1.29.0
+
+nvidia-cuda-runtime==13.3.29
+nvidia-cuda-nvrtc==13.3.33
+nvidia-cublas==13.6.1.10
+nvidia-cudnn-cu13==9.24.0.43
+nvidia-nvjitlink==13.3.33
