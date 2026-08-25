@@ -21,6 +21,11 @@ import cv2
 import numpy as np
 import onnxruntime as ort
 
+try:
+    from ultralytics import YOLO
+except ImportError:
+    YOLO = None
+
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
@@ -58,6 +63,9 @@ DET_THRESH = float(os.getenv("DET_THRESH", "0.40"))
 UNKNOWN_FACE_MIN_SCORE = float(
     os.getenv("UNKNOWN_FACE_MIN_SCORE", "0.60")
 )
+PERSON_MODEL = os.getenv("PERSON_MODEL", "yolo11n.pt")
+PERSON_CONFIDENCE = float(os.getenv("PERSON_CONFIDENCE", "0.45"))
+PERSON_IOU = float(os.getenv("PERSON_IOU", "0.45"))
 
 USE_GPU = os.getenv("USE_GPU", "auto").strip().lower()
 CUDA_DEVICE_ID = int(os.getenv("CUDA_DEVICE_ID", "0"))
@@ -108,7 +116,7 @@ MIN_UNKNOWN_PRESENCE = 1.5
 ALERT_DEDUP_TIME = 10.0
 
 # Region of interest from the camera view: the black rectangle in the image.
-ROI_LEFT = 0.18
+ROI_LEFT = float(os.getenv("ROI_LEFT", "0.10"))
 ROI_TOP = 0.54
 ROI_RIGHT = 0.995
 ROI_BOTTOM = 0.99
@@ -162,6 +170,7 @@ camera_status = "Starting..."
 
 known_embeddings = {}
 face_app = None
+person_detector = None
 
 unknown_present = False
 unknown_first_seen = 0.0
@@ -348,6 +357,19 @@ def get_onnx_providers():
 def initialize_face_model():
 
     global face_app
+    global person_detector
+
+    if YOLO is None:
+        raise RuntimeError(
+            "Person detection requires ultralytics. "
+            "Install dependencies from requirements.txt."
+        )
+
+    print(
+        f"[INFO] Loading person detector: {PERSON_MODEL}..."
+    )
+    person_detector = YOLO(PERSON_MODEL)
+    print("[OK] Person detector loaded.")
 
     providers = get_onnx_providers()
 
@@ -880,6 +902,20 @@ def boxes_overlap(
     )
 
 
+def face_inside_person(face_box, person_box):
+
+    face_x1, face_y1, face_x2, face_y2 = face_box
+    person_x1, person_y1, person_x2, person_y2 = person_box
+
+    face_center_x = (face_x1 + face_x2) / 2
+    face_center_y = (face_y1 + face_y2) / 2
+
+    return (
+        person_x1 <= face_center_x <= person_x2
+        and person_y1 <= face_center_y <= person_y2
+    )
+
+
 def face_in_roi(face_box, frame_width, frame_height):
 
     x1, y1, x2, y2 = face_box
@@ -891,6 +927,28 @@ def face_in_roi(face_box, frame_width, frame_height):
         frame_width * ROI_LEFT <= face_center_x <= frame_width * ROI_RIGHT
         and frame_height * ROI_TOP <= face_center_y <= frame_height * ROI_BOTTOM
     )
+
+
+def detect_person_boxes(frame):
+
+    if person_detector is None:
+        raise RuntimeError("Person detector is not initialized.")
+
+    results = person_detector.predict(
+        frame,
+        classes=[0],
+        conf=PERSON_CONFIDENCE,
+        iou=PERSON_IOU,
+        verbose=False,
+    )
+
+    if not results or results[0].boxes is None:
+        return []
+
+    return [
+        box.astype(int)
+        for box in results[0].boxes.xyxy.cpu().numpy()
+    ]
 
 
 def annotate_alert_frame(frame, faces):
@@ -1233,14 +1291,25 @@ def camera_worker():
 
                         previous_faces = last_faces
 
-                        detected_faces = face_app.get(
-                            frame
+                        person_boxes = detect_person_boxes(frame)
+
+                        detected_faces = (
+                            face_app.get(frame)
+                            if person_boxes
+                            else []
                         )
 
                         last_faces = [
                             face
                             for face in detected_faces
-                            if face_in_roi(
+                            if any(
+                                face_inside_person(
+                                    face.bbox.astype(int),
+                                    person_box,
+                                )
+                                for person_box in person_boxes
+                            )
+                            and face_in_roi(
                                 face.bbox.astype(int),
                                 frame.shape[1],
                                 frame.shape[0],
@@ -1452,6 +1521,7 @@ def camera_worker():
                             print(
                                 f"[INFO] Faces detected: "
                                 f"{len(detected_faces)}, "
+                                f"persons: {len(person_boxes)}, "
                                 f"inside ROI: {len(last_faces)}, "
                                 f"unknown: {unknown_count_in_frame}"
                             )
