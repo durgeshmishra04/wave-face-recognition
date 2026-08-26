@@ -1011,7 +1011,17 @@ def detect_vehicle_boxes(frame):
         results[0].boxes.cls.cpu().numpy(),
         results[0].boxes.conf.cpu().numpy(),
     ):
-        class_name = names[int(class_id)]
+        class_name = str(names[int(class_id)]).strip().lower()
+        class_name = class_name.replace("-", " ").replace("_", " ")
+
+        if class_name in {"motorcycle", "motorbike", "two wheeler"}:
+            class_name = "motorcycle"
+        elif class_name in {"car", "bus", "truck", "four wheeler"}:
+            class_name = (
+                "car"
+                if class_name == "four wheeler"
+                else class_name
+            )
 
         if (
             class_name not in TWO_WHEELER_CLASSES
@@ -1619,6 +1629,45 @@ def camera_worker():
                                 seen_unknown_in_frame = True
                                 unknown_count_in_frame += 1
 
+                        roi_person_boxes = [
+                            person_box
+                            for person_box in person_boxes
+                            if face_in_roi(
+                                person_box,
+                                frame.shape[1],
+                                frame.shape[0],
+                            )
+                        ]
+                        known_person_boxes = [
+                            person_box
+                            for person_box in roi_person_boxes
+                            if any(
+                                getattr(
+                                    face,
+                                    "recognized_name",
+                                    "Unknown"
+                                ) != "Unknown"
+                                and face_inside_person(
+                                    face.bbox.astype(int),
+                                    person_box,
+                                )
+                                for face in last_faces
+                            )
+                        ]
+                        unmatched_person_count = max(
+                            0,
+                            len(roi_person_boxes)
+                            -
+                            len(known_person_boxes)
+                        )
+
+                        if unmatched_person_count:
+                            seen_unknown_in_frame = True
+                            unknown_count_in_frame = max(
+                                unknown_count_in_frame,
+                                unmatched_person_count,
+                            )
+
                         if now - last_detection_log_time >= 5.0:
 
                             known_count_in_frame = sum(
@@ -1640,6 +1689,12 @@ def camera_worker():
                                 for vehicle in last_vehicles
                                 if vehicle["vehicle_type"] == "four_wheeler"
                             )
+                            vehicle_labels = ", ".join(
+                                f"{vehicle['vehicle_type']}"
+                                f" ({vehicle['class_name']}, "
+                                f"{vehicle['confidence']:.2f})"
+                                for vehicle in last_vehicles
+                            ) or "none"
 
                             print(
                                 f"[INFO] Faces detected: "
@@ -1649,8 +1704,18 @@ def camera_worker():
                                 f"known: {known_count_in_frame}, "
                                 f"unknown: {unknown_count_in_frame}, "
                                 f"two_wheeler: {two_wheeler_count}, "
-                                f"four_wheeler: {four_wheeler_count}"
+                                f"four_wheeler: {four_wheeler_count}, "
+                                f"vehicles: {vehicle_labels}"
                             )
+
+                            for vehicle in last_vehicles:
+                                print(
+                                    f"[VEHICLE] Vehicle detected: "
+                                    f"{vehicle['vehicle_type']} "
+                                    f"({vehicle['class_name']}), "
+                                    f"confidence: "
+                                    f"{vehicle['confidence']:.2f}"
+                                )
 
                             last_detection_log_time = now
 
@@ -2034,6 +2099,7 @@ def camera_worker():
                         x2 = max(0, min(int(x2), width - 1))
                         y2 = max(0, min(int(y2), height - 1))
                         label = (
+                            f"Vehicle detected: "
                             f"{vehicle['vehicle_type']} "
                             f"{vehicle['confidence']:.2f}"
                         )
