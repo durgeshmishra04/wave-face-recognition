@@ -1745,6 +1745,11 @@ def camera_worker():
                             -
                             len(known_person_boxes)
                         )
+                        unknown_vehicle_person_detected = any(
+                            person_box in vehicle_person_boxes
+                            and person_box not in known_person_boxes
+                            for person_box in roi_person_boxes
+                        )
 
                         if unmatched_person_count:
                             seen_unknown_in_frame = True
@@ -1849,8 +1854,11 @@ def camera_worker():
 
                                 if (
                                     not unknown_alert_sent
-                                    and now - unknown_first_seen
-                                    >= MIN_UNKNOWN_PRESENCE
+                                    and (
+                                        unknown_vehicle_person_detected
+                                        or now - unknown_first_seen
+                                        >= MIN_UNKNOWN_PRESENCE
+                                    )
                                 ):
 
                                     if (
