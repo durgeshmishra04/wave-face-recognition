@@ -1115,14 +1115,6 @@ def annotate_alert_frame(frame, faces):
         x1, y1, x2, y2 = face.bbox.astype(int)
         name = getattr(face, "recognized_name", "Unknown")
         score = float(getattr(face, "recognition_score", 0.0))
-        in_roi = face_in_roi(
-            (x1, y1, x2, y2),
-            frame_width,
-            frame_height,
-        )
-
-        if not in_roi:
-            continue
 
         color = (0, 0, 255) if name == "Unknown" else (0, 255, 0)
         label = "Unknown" if name == "Unknown" else f"{name}  {score:.2f}"
