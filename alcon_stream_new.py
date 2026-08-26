@@ -1617,12 +1617,35 @@ def camera_worker():
 
                         if now - last_detection_log_time >= 5.0:
 
+                            known_count_in_frame = sum(
+                                1
+                                for face in last_faces
+                                if getattr(
+                                    face,
+                                    "recognized_name",
+                                    "Unknown"
+                                ) != "Unknown"
+                            )
+                            two_wheeler_count = sum(
+                                1
+                                for vehicle in last_vehicles
+                                if vehicle["vehicle_type"] == "two_wheeler"
+                            )
+                            four_wheeler_count = sum(
+                                1
+                                for vehicle in last_vehicles
+                                if vehicle["vehicle_type"] == "four_wheeler"
+                            )
+
                             print(
                                 f"[INFO] Faces detected: "
                                 f"{len(detected_faces)}, "
                                 f"persons: {len(person_boxes)}, "
                                 f"inside ROI: {len(last_faces)}, "
-                                f"unknown: {unknown_count_in_frame}"
+                                f"known: {known_count_in_frame}, "
+                                f"unknown: {unknown_count_in_frame}, "
+                                f"two_wheeler: {two_wheeler_count}, "
+                                f"four_wheeler: {four_wheeler_count}"
                             )
 
                             last_detection_log_time = now
