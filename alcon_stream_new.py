@@ -1467,6 +1467,18 @@ def camera_worker():
                                 )
                             ]
 
+                        vehicle_person_boxes = [
+                            person_box
+                            for person_box in person_boxes
+                            if any(
+                                boxes_overlap(
+                                    person_box,
+                                    vehicle["box"],
+                                )
+                                for vehicle in last_vehicles
+                            )
+                        ]
+
                         detected_faces = (
                             face_app.get(frame)
                             if person_boxes
@@ -1483,10 +1495,19 @@ def camera_worker():
                                 )
                                 for person_box in person_boxes
                             )
-                            and face_in_roi(
-                                face.bbox.astype(int),
-                                frame.shape[1],
-                                frame.shape[0],
+                            and (
+                                face_in_roi(
+                                    face.bbox.astype(int),
+                                    frame.shape[1],
+                                    frame.shape[0],
+                                )
+                                or any(
+                                    face_inside_person(
+                                        face.bbox.astype(int),
+                                        person_box,
+                                    )
+                                    for person_box in vehicle_person_boxes
+                                )
                             )
                         ]
 
@@ -1693,10 +1714,13 @@ def camera_worker():
                         roi_person_boxes = [
                             person_box
                             for person_box in person_boxes
-                            if face_in_roi(
-                                person_box,
-                                frame.shape[1],
-                                frame.shape[0],
+                            if (
+                                face_in_roi(
+                                    person_box,
+                                    frame.shape[1],
+                                    frame.shape[0],
+                                )
+                                or person_box in vehicle_person_boxes
                             )
                         ]
                         known_person_boxes = [
