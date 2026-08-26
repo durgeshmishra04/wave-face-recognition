@@ -480,6 +480,67 @@ def _ensure_table(conn):
         """
     )
 
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS detection_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            detected_at REAL NOT NULL,
+            known_count INTEGER NOT NULL DEFAULT 0,
+            unknown_count INTEGER NOT NULL DEFAULT 0,
+            two_wheeler_count INTEGER NOT NULL DEFAULT 0,
+            four_wheeler_count INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+
+
+def _save_detection_event(
+    known_count,
+    unknown_count,
+    two_wheeler_count,
+    four_wheeler_count,
+    detected_at
+):
+
+    conn = _open_db()
+
+    try:
+
+        _ensure_table(conn)
+
+        conn.execute(
+            """
+            INSERT INTO detection_events
+            (
+                detected_at,
+                known_count,
+                unknown_count,
+                two_wheeler_count,
+                four_wheeler_count
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                detected_at,
+                known_count,
+                unknown_count,
+                two_wheeler_count,
+                four_wheeler_count
+            )
+        )
+
+        conn.commit()
+
+    except Exception as e:
+
+        print(
+            f"[ERROR] Detection event database save failed: {e}"
+        )
+
+    finally:
+
+        conn.close()
+
 
 def _compute_fingerprint(image_paths):
 
@@ -1689,6 +1750,21 @@ def camera_worker():
                                 for vehicle in last_vehicles
                                 if vehicle["vehicle_type"] == "four_wheeler"
                             )
+
+                            if (
+                                known_count_in_frame
+                                or unknown_count_in_frame
+                                or two_wheeler_count
+                                or four_wheeler_count
+                            ):
+                                _save_detection_event(
+                                    known_count_in_frame,
+                                    unknown_count_in_frame,
+                                    two_wheeler_count,
+                                    four_wheeler_count,
+                                    now
+                                )
+
                             vehicle_labels = ", ".join(
                                 f"{vehicle['vehicle_type']}"
                                 f" ({vehicle['class_name']}, "
