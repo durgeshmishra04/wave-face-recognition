@@ -69,7 +69,7 @@ PERSON_IOU = float(os.getenv("PERSON_IOU", "0.45"))
 
 USE_GPU = os.getenv("USE_GPU", "auto").strip().lower()
 CUDA_DEVICE_ID = int(os.getenv("CUDA_DEVICE_ID", "0"))
-VEHICLE_MODEL_PATH = "yolo26n.pt"
+VEHICLE_MODEL_PATH = "yolo26M.pt"
 VEHICLE_CONFIDENCE = 0.35
 VEHICLE_DEVICE = f"cuda:{CUDA_DEVICE_ID}"
 TWO_WHEELER_CLASSES = {
