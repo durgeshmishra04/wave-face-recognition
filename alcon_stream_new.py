@@ -132,6 +132,10 @@ ROI_LEFT = float(os.getenv("ROI_LEFT", "0.10"))
 ROI_TOP = 0.54
 ROI_RIGHT = 0.995
 ROI_BOTTOM = 0.99
+VEHICLE_ROI_LEFT = float(os.getenv("VEHICLE_ROI_LEFT", "0.00"))
+VEHICLE_ROI_TOP = float(os.getenv("VEHICLE_ROI_TOP", "0.35"))
+VEHICLE_ROI_RIGHT = float(os.getenv("VEHICLE_ROI_RIGHT", "1.00"))
+VEHICLE_ROI_BOTTOM = float(os.getenv("VEHICLE_ROI_BOTTOM", "1.00"))
 
 MAX_ALERT_HISTORY = 100
 
@@ -957,8 +961,8 @@ def vehicle_in_roi(vehicle_box, frame_width, frame_height):
     vehicle_center_y = (y1 + y2) / 2
 
     return (
-        frame_width * ROI_LEFT <= vehicle_center_x <= frame_width * ROI_RIGHT
-        and frame_height * ROI_TOP <= vehicle_center_y <= frame_height * ROI_BOTTOM
+        frame_width * VEHICLE_ROI_LEFT <= vehicle_center_x <= frame_width * VEHICLE_ROI_RIGHT
+        and frame_height * VEHICLE_ROI_TOP <= vehicle_center_y <= frame_height * VEHICLE_ROI_BOTTOM
     )
 
 
