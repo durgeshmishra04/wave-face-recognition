@@ -69,6 +69,18 @@ PERSON_IOU = float(os.getenv("PERSON_IOU", "0.45"))
 
 USE_GPU = os.getenv("USE_GPU", "auto").strip().lower()
 CUDA_DEVICE_ID = int(os.getenv("CUDA_DEVICE_ID", "0"))
+VEHICLE_MODEL_PATH = "yolo26n.pt"
+VEHICLE_CONFIDENCE = 0.35
+VEHICLE_DEVICE = f"cuda:{CUDA_DEVICE_ID}"
+TWO_WHEELER_CLASSES = {
+    "motorcycle"
+}
+FOUR_WHEELER_CLASSES = {
+    "car",
+    "bus",
+    "truck"
+}
+VEHICLE_PROCESS_EVERY_N_FRAMES = 2
 
 KNOWN_FACES_DIR = Path("known_faces")
 
@@ -171,6 +183,7 @@ camera_status = "Starting..."
 known_embeddings = {}
 face_app = None
 person_detector = None
+vehicle_detector = None
 
 unknown_present = False
 unknown_first_seen = 0.0
@@ -358,6 +371,7 @@ def initialize_face_model():
 
     global face_app
     global person_detector
+    global vehicle_detector
 
     if YOLO is None:
         raise RuntimeError(
@@ -392,6 +406,12 @@ def initialize_face_model():
         det_size=DET_SIZE,
         det_thresh=DET_THRESH
     )
+
+    print(
+        f"[INFO] Loading vehicle detector: {VEHICLE_MODEL_PATH}..."
+    )
+    vehicle_detector = YOLO(VEHICLE_MODEL_PATH)
+    print("[OK] Vehicle detector loaded.")
 
     print("[OK] Face model loaded.")
 
@@ -929,6 +949,19 @@ def face_in_roi(face_box, frame_width, frame_height):
     )
 
 
+def vehicle_in_roi(vehicle_box, frame_width, frame_height):
+
+    x1, y1, x2, y2 = vehicle_box
+
+    vehicle_center_x = (x1 + x2) / 2
+    vehicle_center_y = (y1 + y2) / 2
+
+    return (
+        frame_width * ROI_LEFT <= vehicle_center_x <= frame_width * ROI_RIGHT
+        and frame_height * ROI_TOP <= vehicle_center_y <= frame_height * ROI_BOTTOM
+    )
+
+
 def detect_person_boxes(frame):
 
     if person_detector is None:
@@ -949,6 +982,53 @@ def detect_person_boxes(frame):
         box.astype(int)
         for box in results[0].boxes.xyxy.cpu().numpy()
     ]
+
+
+def detect_vehicle_boxes(frame):
+
+    if vehicle_detector is None:
+        raise RuntimeError("Vehicle detector is not initialized.")
+
+    results = vehicle_detector.predict(
+        frame,
+        conf=VEHICLE_CONFIDENCE,
+        device=VEHICLE_DEVICE,
+        verbose=False,
+    )
+
+    if not results or results[0].boxes is None:
+        return []
+
+    names = results[0].names
+    vehicles = []
+
+    for box, class_id, confidence in zip(
+        results[0].boxes.xyxy.cpu().numpy(),
+        results[0].boxes.cls.cpu().numpy(),
+        results[0].boxes.conf.cpu().numpy(),
+    ):
+        class_name = names[int(class_id)]
+
+        if (
+            class_name not in TWO_WHEELER_CLASSES
+            and class_name not in FOUR_WHEELER_CLASSES
+        ):
+            continue
+
+        vehicle_type = (
+            "two_wheeler"
+            if class_name in TWO_WHEELER_CLASSES
+            else "four_wheeler"
+        )
+
+        vehicles.append({
+            "box": box.astype(int),
+            "class_name": class_name,
+            "vehicle_type": vehicle_type,
+            "confidence": float(confidence),
+        })
+
+    return vehicles
 
 
 def annotate_alert_frame(frame, faces):
@@ -1172,6 +1252,7 @@ def camera_worker():
     frame_counter = 0
 
     last_faces = []
+    last_vehicles = []
 
     known_face_memory = []
 
@@ -1274,6 +1355,7 @@ def camera_worker():
                 frame_counter += 1
 
                 faces_payload = []
+                vehicles_payload = []
 
 
                 # ------------------------------------------------
@@ -1292,6 +1374,23 @@ def camera_worker():
                         previous_faces = last_faces
 
                         person_boxes = detect_person_boxes(frame)
+
+                        if (
+                            frame_counter
+                            %
+                            VEHICLE_PROCESS_EVERY_N_FRAMES
+                            == 0
+                        ):
+                            detected_vehicles = detect_vehicle_boxes(frame)
+                            last_vehicles = [
+                                vehicle
+                                for vehicle in detected_vehicles
+                                if vehicle_in_roi(
+                                    vehicle["box"],
+                                    frame.shape[1],
+                                    frame.shape[0],
+                                )
+                            ]
 
                         detected_faces = (
                             face_app.get(frame)
@@ -1640,6 +1739,21 @@ def camera_worker():
 
                 height, width = frame.shape[:2]
 
+                for vehicle in last_vehicles:
+                    x1, y1, x2, y2 = vehicle["box"]
+                    vehicles_payload.append(
+                        {
+                            "type": vehicle["vehicle_type"],
+                            "class_name": vehicle["class_name"],
+                            "confidence": round(vehicle["confidence"], 3),
+                            "box": {
+                                "x1": int(max(0, min(x1, width - 1))),
+                                "y1": int(max(0, min(y1, height - 1))),
+                                "x2": int(max(0, min(x2, width - 1))),
+                                "y2": int(max(0, min(y2, height - 1))),
+                            },
+                        }
+                    )
 
                 for face in last_faces:
 
@@ -1886,6 +2000,41 @@ def camera_worker():
                         )
 
 
+                    for vehicle in last_vehicles:
+                        x1, y1, x2, y2 = vehicle["box"]
+                        x1 = max(0, min(int(x1), width - 1))
+                        y1 = max(0, min(int(y1), height - 1))
+                        x2 = max(0, min(int(x2), width - 1))
+                        y2 = max(0, min(int(y2), height - 1))
+                        label = (
+                            f"{vehicle['vehicle_type']} "
+                            f"{vehicle['confidence']:.2f}"
+                        )
+                        color = (
+                            (255, 165, 0)
+                            if vehicle["vehicle_type"] == "two_wheeler"
+                            else (255, 0, 0)
+                        )
+
+                        cv2.rectangle(
+                            send_frame,
+                            (x1, y1),
+                            (x2, y2),
+                            color,
+                            2
+                        )
+                        cv2.putText(
+                            send_frame,
+                            label,
+                            (x1 + 5, max(20, y1 - 8)),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.65,
+                            color,
+                            2,
+                            cv2.LINE_AA
+                        )
+
+
                     # --------------------------------------------
                     # Resize
                     # --------------------------------------------
@@ -1957,6 +2106,9 @@ def camera_worker():
 
                                 "faces":
                                     faces_payload,
+
+                                "vehicles":
+                                    vehicles_payload,
 
                                 "status":
                                     camera_status,
