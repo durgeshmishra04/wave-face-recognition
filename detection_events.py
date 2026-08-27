@@ -22,6 +22,7 @@ class DetectionEventManager:
         self.firebase_topic = firebase_topic
         self.dedup_seconds = dedup_seconds
         self.last_seen = {}
+        self.active_vehicle_events = {}
         try:
             self.person_ids = json.loads(os.getenv("PERSON_IDS_JSON", "{}"))
         except json.JSONDecodeError:
@@ -42,6 +43,46 @@ class DetectionEventManager:
         previous = self.last_seen.get(key, 0.0)
         self.last_seen[key] = now
         return now - previous >= self.dedup_seconds
+
+    def _is_new_vehicle(self, vehicle, now):
+        vehicle_key = (
+            vehicle["vehicle_type"],
+            vehicle["class_name"],
+        )
+        box = vehicle["box"]
+        center = (
+            (int(box[0]) + int(box[2])) / 2,
+            (int(box[1]) + int(box[3])) / 2,
+        )
+
+        for active_key, active in list(self.active_vehicle_events.items()):
+            if now - active["last_seen"] >= self.dedup_seconds:
+                del self.active_vehicle_events[active_key]
+                continue
+            if active["vehicle_key"] != vehicle_key:
+                continue
+            distance = (
+                (center[0] - active["center"][0]) ** 2
+                + (center[1] - active["center"][1]) ** 2
+            ) ** 0.5
+            if distance <= max(
+                100,
+                max(
+                    int(box[2]) - int(box[0]),
+                    int(box[3]) - int(box[1]),
+                ),
+            ):
+                active["center"] = center
+                active["last_seen"] = now
+                return False
+
+        event_key = (vehicle_key, len(self.active_vehicle_events))
+        self.active_vehicle_events[event_key] = {
+            "vehicle_key": vehicle_key,
+            "center": center,
+            "last_seen": now,
+        }
+        return True
 
     def _notify(self, event, image_url):
         title = event["title"]
@@ -157,10 +198,9 @@ class DetectionEventManager:
 
         for vehicle in vehicles:
             box = tuple(int(value) for value in vehicle["box"])
-            vehicle_type = vehicle["vehicle_type"]
-            key = ("vehicle", vehicle_type, vehicle["class_name"], box[0] // 50, box[1] // 50)
-            if not self._is_new_event(key, detected_at):
+            if not self._is_new_vehicle(vehicle, detected_at):
                 continue
+            vehicle_type = vehicle["vehicle_type"]
             title = (
                 "Two Wheeler Detected"
                 if vehicle_type == "two_wheeler"
