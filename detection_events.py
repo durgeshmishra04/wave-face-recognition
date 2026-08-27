@@ -22,6 +22,7 @@ class DetectionEventManager:
         self.firebase_topic = firebase_topic
         self.dedup_seconds = dedup_seconds
         self.last_seen = {}
+        self.active_person_events = {}
         self.active_vehicle_events = {}
         try:
             self.person_ids = json.loads(os.getenv("PERSON_IDS_JSON", "{}"))
@@ -79,6 +80,42 @@ class DetectionEventManager:
         event_key = (vehicle_key, len(self.active_vehicle_events))
         self.active_vehicle_events[event_key] = {
             "vehicle_key": vehicle_key,
+            "center": center,
+            "last_seen": now,
+        }
+        return True
+
+    def _is_new_person(self, event_type, name, box, now):
+        person_key = (event_type, name)
+        center = (
+            (int(box[0]) + int(box[2])) / 2,
+            (int(box[1]) + int(box[3])) / 2,
+        )
+
+        for active_key, active in list(self.active_person_events.items()):
+            if now - active["last_seen"] >= self.dedup_seconds:
+                del self.active_person_events[active_key]
+                continue
+            if active["person_key"] != person_key:
+                continue
+            distance = (
+                (center[0] - active["center"][0]) ** 2
+                + (center[1] - active["center"][1]) ** 2
+            ) ** 0.5
+            if distance <= max(
+                100,
+                max(
+                    int(box[2]) - int(box[0]),
+                    int(box[3]) - int(box[1]),
+                ),
+            ):
+                active["center"] = center
+                active["last_seen"] = now
+                return False
+
+        event_key = (person_key, len(self.active_person_events))
+        self.active_person_events[event_key] = {
+            "person_key": person_key,
             "center": center,
             "last_seen": now,
         }
@@ -176,8 +213,7 @@ class DetectionEventManager:
             confidence = float(getattr(face, "recognition_score", 0.0))
             box = tuple(int(value) for value in face.bbox)
             event_type = "known_person" if name != "Unknown" else "unknown_person"
-            key = (event_type, name, box[0] // 40, box[1] // 40)
-            if not self._is_new_event(key, detected_at):
+            if not self._is_new_person(event_type, name, box, detected_at):
                 continue
             event = {
                 "detected_at": detected_at,
