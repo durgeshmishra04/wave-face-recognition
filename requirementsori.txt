@@ -1,6 +1,0 @@
-flask
-opencv-python
-numpy
-insightface
-onnxruntime-gpu[cuda,cudnn]>=1.27
-python-dotenv

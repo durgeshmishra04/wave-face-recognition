@@ -32,6 +32,8 @@ from flask_cors import CORS
 from flask_socketio import SocketIO
 
 from insightface.app import FaceAnalysis
+from detection_database import DetectionDatabase
+from detection_events import DetectionEventManager
 
 
 # ============================================================
@@ -188,6 +190,7 @@ known_embeddings = {}
 face_app = None
 person_detector = None
 vehicle_detector = None
+detection_events = None
 
 unknown_present = False
 unknown_first_seen = 0.0
@@ -429,11 +432,15 @@ DB_FILENAME = (
     "known_faces.db"
 )
 
+detection_database = DetectionDatabase(DB_FILENAME)
+
 
 def normalize_embedding(embedding):
 
     embedding = np.asarray(
         embedding,
+
+        
         dtype=np.float32
     )
 
@@ -1299,6 +1306,20 @@ def push_alert(
         )
 
 
+def initialize_detection_events():
+
+    global detection_events
+
+    detection_events = DetectionEventManager(
+        database=detection_database,
+        image_dir=ALERT_IMAGE_DIR,
+        public_base_url=PUBLIC_BASE_URL,
+        socketio=socketio,
+        firebase_topic=FCM_TOPIC,
+        dedup_seconds=ALERT_DEDUP_TIME,
+    )
+
+
 # ============================================================
 # CAMERA WORKER
 # ============================================================
@@ -1867,14 +1888,9 @@ def camera_worker():
                                             "Unknown person detected"
                                         )
 
-                                        push_alert(
-                                            f"{max_unknown_count} unknown "
-                                            "person(s) detected on Main "
-                                            "Gate 01",
-                                            unknown_frame_history[-1]
-                                            if unknown_frame_history
-                                            else frame,
-                                            "Main Gate 01"
+                                        print(
+                                            "[INFO] Unknown event will be "
+                                            "saved by the detection manager."
                                         )
 
                                         last_alert_time = now
@@ -2228,6 +2244,16 @@ def camera_worker():
                         )
 
 
+                    if detection_events is not None:
+                        detection_events.process_frame(
+                            frame=send_frame,
+                            faces=last_faces,
+                            vehicles=last_vehicles,
+                            gate_name="Main Gate 01",
+                            detected_at=now,
+                        )
+
+
                     # --------------------------------------------
                     # Resize
                     # --------------------------------------------
@@ -2366,6 +2392,74 @@ def api_status():
 
 
 @app.route(
+    "/api/mobile",
+    methods=["GET"]
+)
+def api_mobile():
+    """Return the stable, combined response used by the Android app."""
+    limit = request.args.get(
+        "limit",
+        default=50,
+        type=int
+    )
+    limit = max(1, min(limit, 500))
+    include_snapshot = request.args.get(
+        "include_snapshot",
+        default="true"
+    ).lower() in {"1", "true", "yes"}
+
+    detections = detection_database.latest(limit)
+    alert_limit = min(limit, len(alert_history))
+    alerts = list(alert_history)[-alert_limit:]
+    alerts.reverse()
+
+    gates = sorted({
+        item["gate"]
+        for item in detections
+        if item.get("gate")
+    } | {"Main Gate 01"})
+
+    snapshot = None
+    if include_snapshot:
+        with latest_frame_lock:
+            frame = latest_annotated_frame
+        if frame is not None:
+            snapshot = {
+                "mime_type": "image/jpeg",
+                "base64": base64.b64encode(frame).decode("utf-8"),
+            }
+
+    return jsonify(
+        {
+            "success": True,
+            "version": 1,
+            "data": {
+                "status": camera_status,
+                "connected_clients": connected_clients,
+                "known_faces_count": len(known_embeddings),
+                "people": sorted(known_embeddings.keys()),
+                "alerts": alerts,
+                "detections": detections,
+                "snapshot": snapshot,
+            },
+            "options": {
+                "gates": gates,
+                "people": sorted(known_embeddings.keys()),
+                "detection_types": [
+                    "known_person",
+                    "unknown_person",
+                    "vehicle",
+                ],
+                "vehicle_types": [
+                    "two_wheeler",
+                    "four_wheeler",
+                ],
+            },
+        }
+    )
+
+
+@app.route(
     "/api/known-faces",
     methods=["GET"]
 )
@@ -2402,6 +2496,25 @@ def api_alerts():
     return jsonify(
         {
             "alerts": items
+        }
+    )
+
+
+@app.route(
+    "/api/detections",
+    methods=["GET"]
+)
+def api_detections():
+
+    limit = request.args.get(
+        "limit",
+        default=50,
+        type=int
+    )
+
+    return jsonify(
+        {
+            "detections": detection_database.latest(limit)
         }
     )
 
@@ -2550,6 +2663,7 @@ def main():
     configure_h264_stream()
 
     initialize_face_model()
+    initialize_detection_events()
 
 
     # ----------------------------------------
