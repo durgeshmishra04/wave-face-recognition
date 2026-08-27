@@ -195,11 +195,7 @@ class DetectionEventManager:
         return records
 
     def _vehicle_key(self, vehicle):
-        vehicle_key = (
-            vehicle["vehicle_type"],
-            vehicle["class_name"],
-        )
-        return vehicle_key
+        return vehicle["vehicle_type"]
 
     def _notify(self, event, image_url):
         title = event["title"]
