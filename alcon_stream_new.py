@@ -1345,6 +1345,7 @@ def camera_worker():
     known_face_memory = []
 
     unknown_frame_history = deque(maxlen=5)
+    alert_frame_history = deque(maxlen=5)
     max_unknown_count = 0
     unknown_alert_sent = False
     last_detection_log_time = 0.0
@@ -1920,6 +1921,18 @@ def camera_worker():
                             UNKNOWN_GONE_CLEARANCE
                         ):
 
+                            if unknown_alert_sent:
+                                exit_frame = (
+                                    alert_frame_history[0]
+                                    if alert_frame_history
+                                    else frame
+                                )
+                                push_alert(
+                                    "Unknown person left Main Gate 01 ROI",
+                                    exit_frame,
+                                    "Main Gate 01",
+                                )
+
                             unknown_present = False
 
                             unknown_first_seen = 0.0
@@ -2245,12 +2258,18 @@ def camera_worker():
 
 
                     if detection_events is not None:
+                        alert_frame_history.append(send_frame.copy())
                         detection_events.process_frame(
                             frame=send_frame,
                             faces=last_faces,
                             vehicles=last_vehicles,
                             gate_name="Main Gate 01",
                             detected_at=now,
+                            alert_frame=(
+                                alert_frame_history[0]
+                                if alert_frame_history
+                                else send_frame
+                            ),
                         )
 
 

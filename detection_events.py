@@ -174,8 +174,12 @@ class DetectionEventManager:
             )
         )
 
-    def _record(self, frame, event, notify):
-        image_frame = frame.copy()
+    def _record(self, frame, event, notify, alert_frame=None):
+        image_frame = (
+            alert_frame.copy()
+            if notify and alert_frame is not None
+            else frame.copy()
+        )
         if event["detection_type"] in {"known_person", "unknown_person"}:
             self._draw_person_label(image_frame, event)
         elif event["detection_type"] == "vehicle":
@@ -233,7 +237,15 @@ class DetectionEventManager:
             cv2.LINE_AA,
         )
 
-    def process_frame(self, frame, faces, vehicles, gate_name, detected_at):
+    def process_frame(
+        self,
+        frame,
+        faces,
+        vehicles,
+        gate_name,
+        detected_at,
+        alert_frame=None,
+    ):
         records = []
         for face in faces:
             name = getattr(face, "recognized_name", "Unknown")
@@ -259,7 +271,14 @@ class DetectionEventManager:
                 "title": "Known Person Detected" if name != "Unknown" else "Unknown Person Detected",
                 "message": f"{name} detected at {gate_name}",
             }
-            records.append(self._record(frame, event, name == "Unknown"))
+            records.append(
+                self._record(
+                    frame,
+                    event,
+                    name == "Unknown",
+                    alert_frame,
+                )
+            )
 
         for vehicle in vehicles:
             box = tuple(int(value) for value in vehicle["box"])
@@ -282,5 +301,5 @@ class DetectionEventManager:
                 "title": title,
                 "message": f"{title} at {gate_name}",
             }
-            records.append(self._record(frame, event, True))
+            records.append(self._record(frame, event, True, alert_frame))
         return records
