@@ -1060,13 +1060,33 @@ def vehicle_in_roi(vehicle_box, frame_width, frame_height):
 
     x1, y1, x2, y2 = vehicle_box
 
-    vehicle_center_x = (x1 + x2) / 2
-    vehicle_center_y = (y1 + y2) / 2
+    vehicle_center_x = (x1 + x2) / 2.0
+    vehicle_center_y = (y1 + y2) / 2.0
+    vehicle_bottom_y = float(y2)
 
-    return (
-        frame_width * VEHICLE_ROI_LEFT <= vehicle_center_x <= frame_width * VEHICLE_ROI_RIGHT
-        and frame_height * VEHICLE_ROI_TOP <= vehicle_center_y <= frame_height * VEHICLE_ROI_BOTTOM
+    poly_px = (
+        PERSON_ROI_POLYGON
+        * np.array([frame_width, frame_height], dtype=np.float32)
+    ).astype(np.int32)
+
+    in_center = (
+        cv2.pointPolygonTest(
+            poly_px,
+            (float(vehicle_center_x), float(vehicle_center_y)),
+            False,
+        )
+        >= 0
     )
+    in_bottom = (
+        cv2.pointPolygonTest(
+            poly_px,
+            (float(vehicle_center_x), vehicle_bottom_y),
+            False,
+        )
+        >= 0
+    )
+
+    return in_center or in_bottom
 
 
 def detect_person_boxes(frame):
