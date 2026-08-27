@@ -131,8 +131,20 @@ class DetectionEventManager:
         records = []
         remaining = []
         expired = []
+        unknown_tracks = [
+            track
+            for track in tracks
+            if track["event"]["detection_type"] == "unknown_person"
+        ]
+        unknown_group_expired = bool(unknown_tracks) and (
+            now - max(track["last_seen"] for track in unknown_tracks)
+            >= self.dedup_seconds
+        )
         for track in tracks:
-            if now - track["last_seen"] >= self.dedup_seconds:
+            is_unknown = track["event"]["detection_type"] == "unknown_person"
+            if is_unknown and unknown_group_expired:
+                expired.append(track)
+            elif now - track["last_seen"] >= self.dedup_seconds:
                 expired.append(track)
             else:
                 remaining.append(track)
