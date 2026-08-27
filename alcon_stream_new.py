@@ -71,7 +71,7 @@ PERSON_IOU = float(os.getenv("PERSON_IOU", "0.45"))
 
 USE_GPU = os.getenv("USE_GPU", "auto").strip().lower()
 CUDA_DEVICE_ID = int(os.getenv("CUDA_DEVICE_ID", "0"))
-VEHICLE_MODEL_PATH = "yolo26m.pt"
+VEHICLE_MODEL_PATH = "yolo26l.pt"
 VEHICLE_CONFIDENCE = 0.35
 VEHICLE_DEVICE = f"cuda:{CUDA_DEVICE_ID}"
 TWO_WHEELER_CLASSES = {
@@ -130,11 +130,25 @@ MIN_UNKNOWN_PRESENCE = 1.5
 ALERT_DEDUP_TIME = 10.0
 EXIT_FRAME_OFFSET = int(os.getenv("EXIT_FRAME_OFFSET", "5"))
 
-# Region of interest from the camera view: the black rectangle in the image.
+# Region of interest for Person and Face Detection: defined by the custom polygon
 ROI_LEFT = float(os.getenv("ROI_LEFT", "0.10"))
 ROI_TOP = 0.54
 ROI_RIGHT = 0.995
 ROI_BOTTOM = 0.99
+PERSON_ROI_POLYGON = np.array(
+    [
+        [0.098, 1.000],
+        [0.149, 0.796],
+        [0.195, 0.574],
+        [0.265, 0.530],
+        [0.450, 0.556],
+        [0.700, 0.556],
+        [0.850, 0.613],
+        [0.912, 0.617],
+        [0.951, 1.000],
+    ],
+    dtype=np.float32,
+)
 VEHICLE_ROI_LEFT = float(os.getenv("VEHICLE_ROI_LEFT", "0.00"))
 VEHICLE_ROI_TOP = float(os.getenv("VEHICLE_ROI_TOP", "0.35"))
 VEHICLE_ROI_RIGHT = float(os.getenv("VEHICLE_ROI_RIGHT", "1.00"))
@@ -1013,13 +1027,33 @@ def face_in_roi(face_box, frame_width, frame_height):
 
     x1, y1, x2, y2 = face_box
 
-    face_center_x = (x1 + x2) / 2
-    face_center_y = (y1 + y2) / 2
+    face_center_x = (x1 + x2) / 2.0
+    face_center_y = (y1 + y2) / 2.0
+    face_bottom_y = float(y2)
 
-    return (
-        frame_width * ROI_LEFT <= face_center_x <= frame_width * ROI_RIGHT
-        and frame_height * ROI_TOP <= face_center_y <= frame_height * ROI_BOTTOM
+    poly_px = (
+        PERSON_ROI_POLYGON
+        * np.array([frame_width, frame_height], dtype=np.float32)
+    ).astype(np.int32)
+
+    in_center = (
+        cv2.pointPolygonTest(
+            poly_px,
+            (float(face_center_x), float(face_center_y)),
+            False,
+        )
+        >= 0
     )
+    in_bottom = (
+        cv2.pointPolygonTest(
+            poly_px,
+            (float(face_center_x), face_bottom_y),
+            False,
+        )
+        >= 0
+    )
+
+    return in_center or in_bottom
 
 
 def vehicle_in_roi(vehicle_box, frame_width, frame_height):
