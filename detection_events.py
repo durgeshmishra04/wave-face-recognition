@@ -56,29 +56,13 @@ class DetectionEventManager:
             (int(box[1]) + int(box[3])) / 2,
         )
 
-        for active_key, active in list(self.active_vehicle_events.items()):
-            if now - active["last_seen"] >= self.dedup_seconds:
-                del self.active_vehicle_events[active_key]
-                continue
-            if active["vehicle_key"] != vehicle_key:
-                continue
-            distance = (
-                (center[0] - active["center"][0]) ** 2
-                + (center[1] - active["center"][1]) ** 2
-            ) ** 0.5
-            if distance <= max(
-                100,
-                max(
-                    int(box[2]) - int(box[0]),
-                    int(box[3]) - int(box[1]),
-                ),
-            ):
-                active["center"] = center
-                active["last_seen"] = now
-                return False
+        active = self.active_vehicle_events.get(vehicle_key)
+        if active is not None and now - active["last_seen"] < self.dedup_seconds:
+            active["center"] = center
+            active["last_seen"] = now
+            return False
 
-        event_key = (vehicle_key, len(self.active_vehicle_events))
-        self.active_vehicle_events[event_key] = {
+        self.active_vehicle_events[vehicle_key] = {
             "vehicle_key": vehicle_key,
             "center": center,
             "last_seen": now,
@@ -92,29 +76,13 @@ class DetectionEventManager:
             (int(box[1]) + int(box[3])) / 2,
         )
 
-        for active_key, active in list(self.active_person_events.items()):
-            if now - active["last_seen"] >= self.dedup_seconds:
-                del self.active_person_events[active_key]
-                continue
-            if active["person_key"] != person_key:
-                continue
-            distance = (
-                (center[0] - active["center"][0]) ** 2
-                + (center[1] - active["center"][1]) ** 2
-            ) ** 0.5
-            if distance <= max(
-                100,
-                max(
-                    int(box[2]) - int(box[0]),
-                    int(box[3]) - int(box[1]),
-                ),
-            ):
-                active["center"] = center
-                active["last_seen"] = now
-                return False
+        active = self.active_person_events.get(person_key)
+        if active is not None and now - active["last_seen"] < self.dedup_seconds:
+            active["center"] = center
+            active["last_seen"] = now
+            return False
 
-        event_key = (person_key, len(self.active_person_events))
-        self.active_person_events[event_key] = {
+        self.active_person_events[person_key] = {
             "person_key": person_key,
             "center": center,
             "last_seen": now,
