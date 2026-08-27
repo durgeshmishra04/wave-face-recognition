@@ -13,7 +13,7 @@ from detection_database import DetectionDatabase
 class DetectionEventManager:
 
     def __init__(self, database, image_dir, public_base_url, socketio,
-                 firebase_topic, dedup_seconds=10.0):
+                 firebase_topic, dedup_seconds=10.0, exit_frame_offset=5):
         self.database = database
         self.image_dir = Path(image_dir)
         self.image_dir.mkdir(parents=True, exist_ok=True)
@@ -21,9 +21,9 @@ class DetectionEventManager:
         self.socketio = socketio
         self.firebase_topic = firebase_topic
         self.dedup_seconds = dedup_seconds
-        self.last_seen = {}
-        self.active_person_events = {}
-        self.active_vehicle_events = {}
+        self.exit_frame_offset = max(0, int(exit_frame_offset))
+        self.active_person_events = []
+        self.active_vehicle_events = []
         try:
             self.person_ids = json.loads(os.getenv("PERSON_IDS_JSON", "{}"))
         except json.JSONDecodeError:
@@ -40,113 +40,139 @@ class DetectionEventManager:
             raise RuntimeError("Could not save detection image")
         return f"{self.public_base_url}/alerts/{filename}"
 
-    def _is_new_event(self, key, now):
-        previous = self.last_seen.get(key, 0.0)
-        self.last_seen[key] = now
-        return now - previous >= self.dedup_seconds
+    def _center(self, box):
+        return (
+            (int(box[0]) + int(box[2])) / 2,
+            (int(box[1]) + int(box[3])) / 2,
+        )
 
-    def _is_new_vehicle(self, vehicle, now):
+    def _match_track(self, tracks, key, box):
+        center = self._center(box)
+        best_track = None
+        best_distance = None
+        for track in tracks:
+            if track["key"] != key:
+                continue
+            distance = (
+                (center[0] - track["center"][0]) ** 2
+                + (center[1] - track["center"][1]) ** 2
+            ) ** 0.5
+            threshold = max(
+                100,
+                int(max(
+                    int(box[2]) - int(box[0]),
+                    int(box[3]) - int(box[1]),
+                )),
+            )
+            if distance <= threshold and (
+                best_distance is None or distance < best_distance
+            ):
+                best_track = track
+                best_distance = distance
+        return best_track
+
+    def _update_track(self, tracks, key, box, event, frame, now):
+        track = self._match_track(tracks, key, box)
+        if track is None:
+            track = {
+                "key": key,
+                "event": event.copy(),
+                "center": self._center(box),
+                "last_box": box,
+                "last_seen": now,
+                "frames": [],
+            }
+            tracks.append(track)
+        track["event"] = event.copy()
+        track["center"] = self._center(box)
+        track["last_box"] = box
+        track["last_seen"] = now
+        track["frames"].append(frame.copy())
+        max_frames = self.exit_frame_offset + 1
+        if len(track["frames"]) > max_frames:
+            del track["frames"][:-max_frames]
+
+    def _clear_unknown_near(self, box):
+        center = self._center(box)
+        remaining = []
+        for track in self.active_person_events:
+            if track["key"] != "unknown_person":
+                remaining.append(track)
+                continue
+            distance = (
+                (center[0] - track["center"][0]) ** 2
+                + (center[1] - track["center"][1]) ** 2
+            ) ** 0.5
+            threshold = max(
+                100,
+                int(max(
+                    int(box[2]) - int(box[0]),
+                    int(box[3]) - int(box[1]),
+                )),
+            )
+            if distance > threshold:
+                remaining.append(track)
+        self.active_person_events[:] = remaining
+
+    def _finalize_track(self, track):
+        event = track["event"].copy()
+        frames = track["frames"]
+        frame_index = max(0, len(frames) - 1 - self.exit_frame_offset)
+        alert_frame = frames[frame_index] if frames else None
+        notify = event["detection_type"] != "known_person"
+        return self._record(None, event, notify, alert_frame)
+
+    def _finalize_missing(self, tracks, now):
+        records = []
+        remaining = []
+        expired = []
+        for track in tracks:
+            if now - track["last_seen"] >= self.dedup_seconds:
+                expired.append(track)
+            else:
+                remaining.append(track)
+        tracks[:] = remaining
+
+        unknown_tracks = [
+            track
+            for track in expired
+            if track["event"]["detection_type"] == "unknown_person"
+        ]
+        other_tracks = [
+            track
+            for track in expired
+            if track["event"]["detection_type"] != "unknown_person"
+        ]
+
+        if unknown_tracks:
+            event = unknown_tracks[0]["event"].copy()
+            count = len(unknown_tracks)
+            event["person_id"] = None
+            event["person_name"] = f"{count} Unknown Persons"
+            event["unknown_count"] = count
+            event["title"] = f"{count} Unknown Persons Detected"
+            event["message"] = (
+                f"{count} unknown person"
+                f"{'s' if count != 1 else ''} detected at {event['gate_name']}"
+            )
+            event["box"] = unknown_tracks[0]["last_box"]
+            frames = unknown_tracks[0]["frames"]
+            frame_index = max(0, len(frames) - 1 - self.exit_frame_offset)
+            alert_frame = frames[frame_index] if frames else None
+            records.append(self._record(None, event, True, alert_frame))
+
+        records.extend(
+            self._finalize_track(track)
+            for track in other_tracks
+        )
+        return records
+
+    def _vehicle_key(self, vehicle):
         vehicle_key = (
             vehicle["vehicle_type"],
             vehicle["class_name"],
         )
-        box = vehicle["box"]
-        center = (
-            (int(box[0]) + int(box[2])) / 2,
-            (int(box[1]) + int(box[3])) / 2,
-        )
-
-        for active_key, active in list(self.active_vehicle_events.items()):
-            if now - active["last_seen"] >= self.dedup_seconds:
-                del self.active_vehicle_events[active_key]
-                continue
-            if active["vehicle_key"] != vehicle_key:
-                continue
-            distance = (
-                (center[0] - active["center"][0]) ** 2
-                + (center[1] - active["center"][1]) ** 2
-            ) ** 0.5
-            if distance <= max(
-                100,
-                int(max(
-                    int(box[2]) - int(box[0]),
-                    int(box[3]) - int(box[1]),
-                )),
-            ):
-                active["center"] = center
-                active["last_seen"] = now
-                return False
-
-        event_key = (vehicle_key, id(box))
-        self.active_vehicle_events[event_key] = {
-            "vehicle_key": vehicle_key,
-            "center": center,
-            "last_seen": now,
-        }
-        return True
-
-    def _is_new_person(self, event_type, name, box, now):
-        center = (
-            (int(box[0]) + int(box[2])) / 2,
-            (int(box[1]) + int(box[3])) / 2,
-        )
-
-        if event_type == "unknown_person":
-            for active_key, active in list(self.active_person_events.items()):
-                if now - active["last_seen"] >= self.dedup_seconds:
-                    del self.active_person_events[active_key]
-                    continue
-                distance = (
-                    (center[0] - active["center"][0]) ** 2
-                    + (center[1] - active["center"][1]) ** 2
-                ) ** 0.5
-                if active["person_key"] == event_type and distance <= max(
-                    100,
-                    int(max(
-                        int(box[2]) - int(box[0]),
-                        int(box[3]) - int(box[1]),
-                    )),
-                ):
-                    active["center"] = center
-                    active["last_seen"] = now
-                    return False
-            person_key = event_type
-        else:
-            person_key = (event_type, name)
-            active = self.active_person_events.get(person_key)
-            if active is not None and now - active["last_seen"] < self.dedup_seconds:
-                active["center"] = center
-                active["last_seen"] = now
-                return False
-
-        event_key = (person_key, id(box)) if event_type == "unknown_person" else person_key
-        self.active_person_events[event_key] = {
-            "person_key": person_key,
-            "center": center,
-            "last_seen": now,
-        }
-        return True
-
-    def _clear_unknown_near(self, box, now):
-        center = (
-            (int(box[0]) + int(box[2])) / 2,
-            (int(box[1]) + int(box[3])) / 2,
-        )
-        for active_key, active in list(self.active_person_events.items()):
-            if active["person_key"] != "unknown_person":
-                continue
-            distance = (
-                (center[0] - active["center"][0]) ** 2
-                + (center[1] - active["center"][1]) ** 2
-            ) ** 0.5
-            if distance <= max(
-                100,
-                int(max(
-                    int(box[2]) - int(box[0]),
-                    int(box[3]) - int(box[1]),
-                )),
-            ):
-                del self.active_person_events[active_key]
+        return vehicle_key
 
     def _notify(self, event, image_url):
         title = event["title"]
@@ -159,6 +185,7 @@ class DetectionEventManager:
                     body=message,
                     image=image_url or None,
                 ),
+                android=messaging.AndroidConfig(priority="high"),
                 data={
                     "type": event["detection_type"],
                     "notification_id": notification_id,
@@ -175,15 +202,15 @@ class DetectionEventManager:
         )
 
     def _record(self, frame, event, notify, alert_frame=None):
-        image_frame = (
-            alert_frame.copy()
-            if notify and alert_frame is not None
-            else frame.copy()
-        )
-        if event["detection_type"] in {"known_person", "unknown_person"}:
-            self._draw_person_label(image_frame, event)
-        elif event["detection_type"] == "vehicle":
-            self._draw_vehicle_label(image_frame, event)
+        image_source = alert_frame if alert_frame is not None else frame
+        if image_source is None:
+            return None
+        image_frame = image_source.copy()
+        if alert_frame is None:
+            if event["detection_type"] in {"known_person", "unknown_person"}:
+                self._draw_person_label(image_frame, event)
+            elif event["detection_type"] == "vehicle":
+                self._draw_vehicle_label(image_frame, event)
 
         image_url = self._save_image(image_frame)
         event["image_url"] = image_url
@@ -246,16 +273,21 @@ class DetectionEventManager:
         detected_at,
         alert_frame=None,
     ):
-        records = []
+        records = self._finalize_missing(
+            self.active_person_events,
+            detected_at,
+        )
+        records.extend(
+            self._finalize_missing(
+                self.active_vehicle_events,
+                detected_at,
+            )
+        )
         for face in faces:
             name = getattr(face, "recognized_name", "Unknown")
             confidence = float(getattr(face, "recognition_score", 0.0))
             box = tuple(int(value) for value in face.bbox)
             event_type = "known_person" if name != "Unknown" else "unknown_person"
-            if event_type == "known_person":
-                self._clear_unknown_near(box, detected_at)
-            if not self._is_new_person(event_type, name, box, detected_at):
-                continue
             event = {
                 "detected_at": detected_at,
                 "detection_type": event_type,
@@ -271,19 +303,19 @@ class DetectionEventManager:
                 "title": "Known Person Detected" if name != "Unknown" else "Unknown Person Detected",
                 "message": f"{name} detected at {gate_name}",
             }
-            records.append(
-                self._record(
-                    frame,
-                    event,
-                    name == "Unknown",
-                    alert_frame,
-                )
+            if event_type == "known_person":
+                self._clear_unknown_near(box)
+            self._update_track(
+                self.active_person_events,
+                (event_type, name) if event_type == "known_person" else event_type,
+                box,
+                event,
+                alert_frame if alert_frame is not None else frame,
+                detected_at,
             )
 
         for vehicle in vehicles:
             box = tuple(int(value) for value in vehicle["box"])
-            if not self._is_new_vehicle(vehicle, detected_at):
-                continue
             vehicle_type = vehicle["vehicle_type"]
             title = (
                 "Two Wheeler Detected"
@@ -301,5 +333,12 @@ class DetectionEventManager:
                 "title": title,
                 "message": f"{title} at {gate_name}",
             }
-            records.append(self._record(frame, event, True, alert_frame))
+            self._update_track(
+                self.active_vehicle_events,
+                self._vehicle_key(vehicle),
+                box,
+                event,
+                alert_frame if alert_frame is not None else frame,
+                detected_at,
+            )
         return records
