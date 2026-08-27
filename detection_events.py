@@ -56,13 +56,29 @@ class DetectionEventManager:
             (int(box[1]) + int(box[3])) / 2,
         )
 
-        active = self.active_vehicle_events.get(vehicle_key)
-        if active is not None and now - active["last_seen"] < self.dedup_seconds:
-            active["center"] = center
-            active["last_seen"] = now
-            return False
+        for active_key, active in list(self.active_vehicle_events.items()):
+            if now - active["last_seen"] >= self.dedup_seconds:
+                del self.active_vehicle_events[active_key]
+                continue
+            if active["vehicle_key"] != vehicle_key:
+                continue
+            distance = (
+                (center[0] - active["center"][0]) ** 2
+                + (center[1] - active["center"][1]) ** 2
+            ) ** 0.5
+            if distance <= max(
+                100,
+                int(max(
+                    int(box[2]) - int(box[0]),
+                    int(box[3]) - int(box[1]),
+                )),
+            ):
+                active["center"] = center
+                active["last_seen"] = now
+                return False
 
-        self.active_vehicle_events[vehicle_key] = {
+        event_key = (vehicle_key, id(box))
+        self.active_vehicle_events[event_key] = {
             "vehicle_key": vehicle_key,
             "center": center,
             "last_seen": now,
@@ -70,24 +86,67 @@ class DetectionEventManager:
         return True
 
     def _is_new_person(self, event_type, name, box, now):
-        person_key = (event_type, name)
         center = (
             (int(box[0]) + int(box[2])) / 2,
             (int(box[1]) + int(box[3])) / 2,
         )
 
-        active = self.active_person_events.get(person_key)
-        if active is not None and now - active["last_seen"] < self.dedup_seconds:
-            active["center"] = center
-            active["last_seen"] = now
-            return False
+        if event_type == "unknown_person":
+            for active_key, active in list(self.active_person_events.items()):
+                if now - active["last_seen"] >= self.dedup_seconds:
+                    del self.active_person_events[active_key]
+                    continue
+                distance = (
+                    (center[0] - active["center"][0]) ** 2
+                    + (center[1] - active["center"][1]) ** 2
+                ) ** 0.5
+                if active["person_key"] == event_type and distance <= max(
+                    100,
+                    int(max(
+                        int(box[2]) - int(box[0]),
+                        int(box[3]) - int(box[1]),
+                    )),
+                ):
+                    active["center"] = center
+                    active["last_seen"] = now
+                    return False
+            person_key = event_type
+        else:
+            person_key = (event_type, name)
+            active = self.active_person_events.get(person_key)
+            if active is not None and now - active["last_seen"] < self.dedup_seconds:
+                active["center"] = center
+                active["last_seen"] = now
+                return False
 
-        self.active_person_events[person_key] = {
+        event_key = (person_key, id(box)) if event_type == "unknown_person" else person_key
+        self.active_person_events[event_key] = {
             "person_key": person_key,
             "center": center,
             "last_seen": now,
         }
         return True
+
+    def _clear_unknown_near(self, box, now):
+        center = (
+            (int(box[0]) + int(box[2])) / 2,
+            (int(box[1]) + int(box[3])) / 2,
+        )
+        for active_key, active in list(self.active_person_events.items()):
+            if active["person_key"] != "unknown_person":
+                continue
+            distance = (
+                (center[0] - active["center"][0]) ** 2
+                + (center[1] - active["center"][1]) ** 2
+            ) ** 0.5
+            if distance <= max(
+                100,
+                int(max(
+                    int(box[2]) - int(box[0]),
+                    int(box[3]) - int(box[1]),
+                )),
+            ):
+                del self.active_person_events[active_key]
 
     def _notify(self, event, image_url):
         title = event["title"]
@@ -181,6 +240,8 @@ class DetectionEventManager:
             confidence = float(getattr(face, "recognition_score", 0.0))
             box = tuple(int(value) for value in face.bbox)
             event_type = "known_person" if name != "Unknown" else "unknown_person"
+            if event_type == "known_person":
+                self._clear_unknown_near(box, detected_at)
             if not self._is_new_person(event_type, name, box, detected_at):
                 continue
             event = {
