@@ -87,7 +87,10 @@ class DetectionEventManager:
         track["center"] = self._center(box)
         track["last_box"] = box
         track["last_seen"] = now
-        track["frames"].append(frame.copy())
+        track["frames"].append({
+            "frame": frame.copy(),
+            "event": event.copy(),
+        })
         max_frames = self.exit_frame_offset + 1
         if len(track["frames"]) > max_frames:
             del track["frames"][:-max_frames]
@@ -118,9 +121,11 @@ class DetectionEventManager:
         event = track["event"].copy()
         frames = track["frames"]
         frame_index = max(0, len(frames) - 1 - self.exit_frame_offset)
-        alert_frame = frames[frame_index] if frames else None
+        selected = frames[frame_index] if frames else None
+        alert_frame = selected["frame"] if selected else None
+        annotation_event = selected["event"] if selected else event
         notify = event["detection_type"] != "known_person"
-        return self._record(None, event, notify, alert_frame)
+        return self._record(None, event, notify, alert_frame, annotation_event)
 
     def _finalize_missing(self, tracks, now):
         records = []
@@ -158,8 +163,18 @@ class DetectionEventManager:
             event["box"] = unknown_tracks[0]["last_box"]
             frames = unknown_tracks[0]["frames"]
             frame_index = max(0, len(frames) - 1 - self.exit_frame_offset)
-            alert_frame = frames[frame_index] if frames else None
-            records.append(self._record(None, event, True, alert_frame))
+            selected = frames[frame_index] if frames else None
+            alert_frame = selected["frame"] if selected else None
+            annotation_event = selected["event"] if selected else event
+            records.append(
+                self._record(
+                    None,
+                    event,
+                    True,
+                    alert_frame,
+                    annotation_event,
+                )
+            )
 
         records.extend(
             self._finalize_track(track)
@@ -201,16 +216,26 @@ class DetectionEventManager:
             )
         )
 
-    def _record(self, frame, event, notify, alert_frame=None):
+    def _record(
+        self,
+        frame,
+        event,
+        notify,
+        alert_frame=None,
+        annotation_event=None,
+    ):
         image_source = alert_frame if alert_frame is not None else frame
         if image_source is None:
             return None
         image_frame = image_source.copy()
-        if alert_frame is None:
-            if event["detection_type"] in {"known_person", "unknown_person"}:
-                self._draw_person_label(image_frame, event)
-            elif event["detection_type"] == "vehicle":
-                self._draw_vehicle_label(image_frame, event)
+        annotation_event = annotation_event or event
+        if annotation_event["detection_type"] in {
+            "known_person",
+            "unknown_person",
+        }:
+            self._draw_person_label(image_frame, annotation_event)
+        elif annotation_event["detection_type"] == "vehicle":
+            self._draw_vehicle_label(image_frame, annotation_event)
 
         image_url = self._save_image(image_frame)
         event["image_url"] = image_url
