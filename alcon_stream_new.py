@@ -1407,8 +1407,9 @@ def camera_worker():
     frame_counter = 0
 
     last_faces = []
-    # Person-sized event detections include people whose face is temporarily
-    # unavailable, so they still get one ROI entry/exit event.
+    # The person detector only gates face recognition. Final person events
+    # require an InsightFace human-face detection, preventing animals or other
+    # YOLO person false positives from becoming unknown-person alerts.
     last_event_people = []
     last_vehicles = []
 
@@ -1835,34 +1836,34 @@ def camera_worker():
                                 ),
                                 None,
                             )
-                            last_event_people.append(
-                                SimpleNamespace(
-                                    bbox=np.array(person_box),
-                                    annotation_box=(
-                                        tuple(
+                            if matched_face is not None:
+                                last_event_people.append(
+                                    SimpleNamespace(
+                                        # Keep the body box only for stable
+                                        # tracking; API/Firebase annotations
+                                        # use annotation_box (the face) only.
+                                        bbox=np.array(person_box),
+                                        annotation_box=tuple(
                                             int(value)
                                             for value in matched_face.bbox
-                                        )
-                                        if matched_face is not None
-                                        else None
-                                    ),
-                                    recognized_name=getattr(
-                                        matched_face,
-                                        "recognized_name",
-                                        "Unknown",
-                                    ),
-                                    recognition_score=float(getattr(
-                                        matched_face,
-                                        "recognition_score",
-                                        0.0,
-                                    )),
-                                    person_id=getattr(
-                                        matched_face,
-                                        "person_id",
-                                        None,
-                                    ),
+                                        ),
+                                        recognized_name=getattr(
+                                            matched_face,
+                                            "recognized_name",
+                                            "Unknown",
+                                        ),
+                                        recognition_score=float(getattr(
+                                            matched_face,
+                                            "recognition_score",
+                                            0.0,
+                                        )),
+                                        person_id=getattr(
+                                            matched_face,
+                                            "person_id",
+                                            None,
+                                        ),
+                                    )
                                 )
-                            )
                         unmatched_person_count = max(
                             0,
                             len(roi_person_boxes)
