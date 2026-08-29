@@ -78,12 +78,20 @@ class DetectionEventManager:
 
     @staticmethod
     def _draw_event(frame, event):
-        x1, y1, x2, y2 = event["box"]
         if event["detection_type"] == "vehicle":
+            x1, y1, x2, y2 = event["box"]
             label, color = f"{event['vehicle_type'].replace('_', ' ').title()} | {event['vehicle_class']} | {event['confidence']:.2f}", (255, 165, 0)
         elif event["detection_type"] == "known_person":
+            # The person-model box is tracking-only. Only a face box may be
+            # rendered on the image exposed to API/Firebase/Android.
+            if not event.get("annotation_box"):
+                return
+            x1, y1, x2, y2 = event["annotation_box"]
             label, color = f"KNOWN | {event['person_name']} | ID: {event.get('person_id') or 'N/A'} | {event['confidence']:.2f}", (0, 255, 0)
         else:
+            if not event.get("annotation_box"):
+                return
+            x1, y1, x2, y2 = event["annotation_box"]
             count = event.get("unknown_count", 1)
             label, color = ("UNKNOWN" if count == 1 else f"UNKNOWN PERSONS: {count}"), (0, 0, 255)
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
@@ -130,7 +138,7 @@ class DetectionEventManager:
     def _person_event(self, face, gate_name, now):
         name, confidence = getattr(face, "recognized_name", "Unknown"), float(getattr(face, "recognition_score", 0.0))
         known = name != "Unknown"
-        return {"detected_at": now, "detection_type": "known_person" if known else "unknown_person", "person_id": getattr(face, "person_id", None) or self.person_ids.get(name), "person_name": name, "confidence": confidence, "gate_name": gate_name, "box": tuple(int(v) for v in face.bbox), "title": "Known Person Detected" if known else "Unknown Person Detected", "message": f"{name} detected at {gate_name}"}
+        return {"detected_at": now, "detection_type": "known_person" if known else "unknown_person", "person_id": getattr(face, "person_id", None) or self.person_ids.get(name), "person_name": name, "confidence": confidence, "gate_name": gate_name, "box": tuple(int(v) for v in face.bbox), "annotation_box": getattr(face, "annotation_box", None), "title": "Known Person Detected" if known else "Unknown Person Detected", "message": f"{name} detected at {gate_name}"}
 
     def _publish_unknowns(self, unknowns, gate_name, now):
         track, chosen = unknowns[0]

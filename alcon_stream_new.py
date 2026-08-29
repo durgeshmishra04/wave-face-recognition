@@ -1837,6 +1837,14 @@ def camera_worker():
                             last_event_people.append(
                                 SimpleNamespace(
                                     bbox=np.array(person_box),
+                                    annotation_box=(
+                                        tuple(
+                                            int(value)
+                                            for value in matched_face.bbox
+                                        )
+                                        if matched_face is not None
+                                        else None
+                                    ),
                                     recognized_name=getattr(
                                         matched_face,
                                         "recognized_name",
