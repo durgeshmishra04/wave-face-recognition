@@ -23,6 +23,9 @@ class DetectionEventManager:
         self.exit_frame_offset = max(0, int(exit_frame_offset))
         self.active_person_events = []
         self.active_vehicle_events = []
+        # Unknown people in one concurrent ROI visit are deliberately held
+        # until the final member exits, then emitted as a single group event.
+        self.pending_unknown_exits = []
         try:
             self.person_ids = json.loads(os.getenv("PERSON_IDS_JSON", "{}"))
         except json.JSONDecodeError:
@@ -175,8 +178,26 @@ class DetectionEventManager:
                 })
         people = self._finalize_expired(self.active_person_events, detected_at)
         vehicles = self._finalize_expired(self.active_vehicle_events, detected_at)
-        unknowns = [(track, chosen) for track, chosen in people if not track["known_detected_once"]]
-        records = [self._publish_unknowns(unknowns, gate_name, detected_at)] if unknowns else []
+        expired_unknowns = [
+            (track, chosen)
+            for track, chosen in people
+            if not track["known_detected_once"]
+        ]
+        self.pending_unknown_exits.extend(expired_unknowns)
+        unknowns_still_inside = any(
+            not track["known_detected_once"]
+            for track in self.active_person_events
+        )
+        # Do not publish when the first person leaves. Wait until every
+        # unknown track from the same ROI group has confirmed its exit.
+        records = []
+        if self.pending_unknown_exits and not unknowns_still_inside:
+            records.append(self._publish_unknowns(
+                self.pending_unknown_exits,
+                gate_name,
+                detected_at,
+            ))
+            self.pending_unknown_exits.clear()
         for track, chosen in people:
             if track["known_detected_once"]:
                 event = track["event"].copy(); event["detected_at"] = detected_at

@@ -2516,12 +2516,49 @@ def api_mobile():
         type=int
     )
     limit = max(0, limit)
+    detection_type = request.args.get("type", default="").strip().lower()
+    valid_detection_types = {
+        "known_person",
+        "unknown_person",
+        "vehicle",
+    }
+    if detection_type not in valid_detection_types:
+        detection_type = ""
     include_snapshot = request.args.get(
         "include_snapshot",
         default="true"
     ).lower() in {"1", "true", "yes"}
 
-    detections = detection_database.latest(limit)
+    # Read the persisted master history first so summary totals remain correct
+    # for every mobile installation. Filtering changes only the returned list.
+    all_detections = detection_database.latest(0)
+    detections = [
+        item
+        for item in all_detections
+        if not detection_type or item["type"] == detection_type
+    ]
+    if limit:
+        detections = detections[:limit]
+    detection_summary = {
+        "total_events": len(all_detections),
+        "known_events": sum(
+            item["type"] == "known_person"
+            for item in all_detections
+        ),
+        "unknown_events": sum(
+            item["type"] == "unknown_person"
+            for item in all_detections
+        ),
+        "unknown_people": sum(
+            int(item.get("unknown_count") or 1)
+            for item in all_detections
+            if item["type"] == "unknown_person"
+        ),
+        "vehicle_events": sum(
+            item["type"] == "vehicle"
+            for item in all_detections
+        ),
+    }
     alert_limit = len(alert_history) if limit == 0 else min(limit, len(alert_history))
     alerts = list(alert_history)[-alert_limit:]
     alerts.reverse()
@@ -2553,6 +2590,7 @@ def api_mobile():
                 "people": sorted(known_embeddings.keys()),
                 "alerts": alerts,
                 "detections": detections,
+                "detection_summary": detection_summary,
                 "snapshot": snapshot,
             },
             "options": {
