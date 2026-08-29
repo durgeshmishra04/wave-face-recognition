@@ -13,6 +13,7 @@ import hashlib
 import io
 import uuid
 from collections import deque
+from types import SimpleNamespace
 
 import firebase_admin
 from firebase_admin import credentials, messaging
@@ -84,7 +85,11 @@ FOUR_WHEELER_CLASSES = {
 }
 VEHICLE_PROCESS_EVERY_N_FRAMES = 2
 
-KNOWN_FACES_DIR = Path("known_faces")
+# Resolve this from the source file, not the process working directory. This
+# keeps known faces and finalized detection history on the same server DB even
+# when the service is started by Android deployment tooling or a scheduler.
+PROJECT_DIR = Path(__file__).resolve().parent
+KNOWN_FACES_DIR = PROJECT_DIR / "known_faces"
 
 HOST = "0.0.0.0"
 PORT = 5000
@@ -95,7 +100,9 @@ PORT = 5000
 # ============================================================
 
 # Images will be saved here
-ALERT_IMAGE_DIR = Path("alert_images")
+# Keep event images beside the application so image_url records remain valid
+# for every mobile login, independent of the process working directory.
+ALERT_IMAGE_DIR = PROJECT_DIR / "alert_images"
 ALERT_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
 
 # IMPORTANT:
@@ -128,6 +135,9 @@ MIN_UNKNOWN_PRESENCE = 1.5
 
 # Alert deduplication: prevent duplicate alerts within this time window (seconds)
 ALERT_DEDUP_TIME = 10.0
+# Consecutive missing ROI frames must span this duration before an exit closes
+# an event. It is deliberately independent of the former alert throttle.
+EXIT_CONFIRM_SECONDS = float(os.getenv("EXIT_CONFIRM_SECONDS", "1.0"))
 EXIT_FRAME_OFFSET = int(os.getenv("EXIT_FRAME_OFFSET", "5"))
 
 # Region of interest for Person and Face Detection: defined by the custom polygon
@@ -1371,7 +1381,7 @@ def initialize_detection_events():
         public_base_url=PUBLIC_BASE_URL,
         socketio=socketio,
         firebase_topic=FCM_TOPIC,
-        dedup_seconds=ALERT_DEDUP_TIME,
+        dedup_seconds=EXIT_CONFIRM_SECONDS,
         exit_frame_offset=EXIT_FRAME_OFFSET,
     )
 
@@ -1396,6 +1406,9 @@ def camera_worker():
     frame_counter = 0
 
     last_faces = []
+    # Person-sized event detections include people whose face is temporarily
+    # unavailable, so they still get one ROI entry/exit event.
+    last_event_people = []
     last_vehicles = []
 
     known_face_memory = []
@@ -1808,6 +1821,39 @@ def camera_worker():
                                 for face in last_faces
                             )
                         ]
+                        last_event_people = []
+                        for person_box in roi_person_boxes:
+                            matched_face = next(
+                                (
+                                    face
+                                    for face in last_faces
+                                    if face_inside_person(
+                                        face.bbox.astype(int),
+                                        person_box,
+                                    )
+                                ),
+                                None,
+                            )
+                            last_event_people.append(
+                                SimpleNamespace(
+                                    bbox=np.array(person_box),
+                                    recognized_name=getattr(
+                                        matched_face,
+                                        "recognized_name",
+                                        "Unknown",
+                                    ),
+                                    recognition_score=float(getattr(
+                                        matched_face,
+                                        "recognition_score",
+                                        0.0,
+                                    )),
+                                    person_id=getattr(
+                                        matched_face,
+                                        "person_id",
+                                        None,
+                                    ),
+                                )
+                            )
                         unmatched_person_count = max(
                             0,
                             len(roi_person_boxes)
@@ -2303,7 +2349,7 @@ def camera_worker():
                     if detection_events is not None:
                         detection_events.process_frame(
                             frame=send_frame,
-                            faces=last_faces,
+                            faces=last_event_people,
                             vehicles=last_vehicles,
                             gate_name="Main Gate 01",
                             detected_at=now,
@@ -2456,17 +2502,19 @@ def api_mobile():
     """Return the stable, combined response used by the Android app."""
     limit = request.args.get(
         "limit",
-        default=50,
+        # No limit means the Android login receives the complete persisted
+        # detection-event history, not only the current phone's cache.
+        default=0,
         type=int
     )
-    limit = max(1, min(limit, 500))
+    limit = max(0, limit)
     include_snapshot = request.args.get(
         "include_snapshot",
         default="true"
     ).lower() in {"1", "true", "yes"}
 
     detections = detection_database.latest(limit)
-    alert_limit = min(limit, len(alert_history))
+    alert_limit = len(alert_history) if limit == 0 else min(limit, len(alert_history))
     alerts = list(alert_history)[-alert_limit:]
     alerts.reverse()
 
@@ -2565,7 +2613,7 @@ def api_detections():
 
     limit = request.args.get(
         "limit",
-        default=50,
+        default=0,
         type=int
     )
 

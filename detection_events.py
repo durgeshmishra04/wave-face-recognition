@@ -1,17 +1,16 @@
+"""ROI entry/exit event tracking. Records only confirmed exits, never frames."""
 import json
 import os
 import time
 import uuid
+from collections import deque
 from pathlib import Path
 
 import cv2
 from firebase_admin import messaging
 
-from detection_database import DetectionDatabase
-
 
 class DetectionEventManager:
-
     def __init__(self, database, image_dir, public_base_url, socketio,
                  firebase_topic, dedup_seconds=10.0, exit_frame_offset=5):
         self.database = database
@@ -20,7 +19,7 @@ class DetectionEventManager:
         self.public_base_url = public_base_url.rstrip("/")
         self.socketio = socketio
         self.firebase_topic = firebase_topic
-        self.dedup_seconds = dedup_seconds
+        self.exit_confirm_seconds = max(0.1, float(dedup_seconds))
         self.exit_frame_offset = max(0, int(exit_frame_offset))
         self.active_person_events = []
         self.active_vehicle_events = []
@@ -29,349 +28,154 @@ class DetectionEventManager:
         except json.JSONDecodeError:
             self.person_ids = {}
 
+    @staticmethod
+    def _center(box):
+        return ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0)
+
+    @staticmethod
+    def _iou(a, b):
+        left, top, right, bottom = max(a[0], b[0]), max(a[1], b[1]), min(a[2], b[2]), min(a[3], b[3])
+        intersection = max(0, right - left) * max(0, bottom - top)
+        union = max(0, a[2] - a[0]) * max(0, a[3] - a[1]) + max(0, b[2] - b[0]) * max(0, b[3] - b[1]) - intersection
+        return intersection / union if union else 0.0
+
+    def _match_track(self, tracks, category, box):
+        center, best, best_score = self._center(box), None, -1.0
+        for track in tracks:
+            if track["category"] != category or track["matched_this_frame"]:
+                continue
+            iou = self._iou(track["last_box"], box)
+            distance = ((center[0] - track["center"][0]) ** 2 + (center[1] - track["center"][1]) ** 2) ** 0.5
+            scale = max(1, box[2] - box[0], box[3] - box[1], track["last_box"][2] - track["last_box"][0], track["last_box"][3] - track["last_box"][1])
+            if iou < .10 and distance > max(100, scale * 1.5):
+                continue
+            score = iou - distance / (scale * 10)
+            if score > best_score:
+                best, best_score = track, score
+        return best
+
+    def _update_track(self, tracks, category, event, frame, now):
+        track = self._match_track(tracks, category, event["box"])
+        if track is None:
+            track = {"event_id": str(uuid.uuid4()), "category": category, "state": "ENTERED_ROI", "first_seen": now, "last_seen": now, "last_box": event["box"], "center": self._center(event["box"]), "matched_this_frame": True, "known_detected_once": event["detection_type"] == "known_person", "event": event.copy(), "frames": deque(maxlen=self.exit_frame_offset + 1)}
+            tracks.append(track)
+        else:
+            track.update({"state": "TRACKING", "last_seen": now, "last_box": event["box"], "center": self._center(event["box"]), "matched_this_frame": True})
+        # A recognition is sticky for the entire physical ROI crossing.
+        if event["detection_type"] == "known_person":
+            track["known_detected_once"] = True
+            track["event"] = event.copy()
+        elif not track["known_detected_once"]:
+            track["event"] = event.copy()
+        track["event"]["box"] = event["box"]
+        track["frames"].append({"frame": frame.copy(), "event": track["event"].copy()})
+
     def _save_image(self, frame):
         filename = f"{uuid.uuid4()}.jpg"
-        image_path = self.image_dir / filename
-        if not cv2.imwrite(
-            str(image_path),
-            frame,
-            [cv2.IMWRITE_JPEG_QUALITY, 85],
-        ):
+        if not cv2.imwrite(str(self.image_dir / filename), frame, [cv2.IMWRITE_JPEG_QUALITY, 85]):
             raise RuntimeError("Could not save detection image")
         return f"{self.public_base_url}/alerts/{filename}"
 
-    def _center(self, box):
-        return (
-            (int(box[0]) + int(box[2])) / 2,
-            (int(box[1]) + int(box[3])) / 2,
-        )
+    @staticmethod
+    def _draw_event(frame, event):
+        x1, y1, x2, y2 = event["box"]
+        if event["detection_type"] == "vehicle":
+            label, color = f"{event['vehicle_type'].replace('_', ' ').title()} | {event['vehicle_class']} | {event['confidence']:.2f}", (255, 165, 0)
+        elif event["detection_type"] == "known_person":
+            label, color = f"KNOWN | {event['person_name']} | ID: {event.get('person_id') or 'N/A'} | {event['confidence']:.2f}", (0, 255, 0)
+        else:
+            count = event.get("unknown_count", 1)
+            label, color = ("UNKNOWN" if count == 1 else f"UNKNOWN PERSONS: {count}"), (0, 0, 255)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        cv2.putText(frame, label, (x1, max(24, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, .6, color, 2, cv2.LINE_AA)
 
-    def _match_track(self, tracks, key, box):
-        center = self._center(box)
-        best_track = None
-        best_distance = None
-        for track in tracks:
-            if track["key"] != key:
-                continue
-            distance = (
-                (center[0] - track["center"][0]) ** 2
-                + (center[1] - track["center"][1]) ** 2
-            ) ** 0.5
-            threshold = max(
-                100,
-                int(max(
-                    int(box[2]) - int(box[0]),
-                    int(box[3]) - int(box[1]),
-                )),
-            )
-            if distance <= threshold and (
-                best_distance is None or distance < best_distance
-            ):
-                best_track = track
-                best_distance = distance
-        return best_track
+    def _notify(self, event):
+        image_url = event["image_url"]
+        data = {key: str(value) for key, value in {"type": event["detection_type"], "detection_id": event["id"], "gate": event["gate_name"], "image_url": image_url, "confidence": event.get("confidence", ""), "unknown_count": event.get("unknown_count", ""), "detected_at": event["detected_at"]}.items()}
+        messaging.send(messaging.Message(notification=messaging.Notification(title=event["title"], body=event["message"], image=image_url), android=messaging.AndroidConfig(priority="high"), data=data, topic=self.firebase_topic))
 
-    def _update_track(self, tracks, key, box, event, frame, now):
-        track = self._match_track(tracks, key, box)
-        if track is None:
-            track = {
-                "key": key,
-                "event": event.copy(),
-                "center": self._center(box),
-                "last_box": box,
-                "last_seen": now,
-                "frames": [],
-            }
-            tracks.append(track)
-        track["event"] = event.copy()
-        track["center"] = self._center(box)
-        track["last_box"] = box
-        track["last_seen"] = now
-        track["frames"].append({
-            "frame": frame.copy(),
-            "event": event.copy(),
-        })
-        max_frames = self.exit_frame_offset + 1
-        if len(track["frames"]) > max_frames:
-            del track["frames"][:-max_frames]
-
-    def _clear_unknown_near(self, box):
-        center = self._center(box)
-        remaining = []
-        for track in self.active_person_events:
-            if track["key"] != "unknown_person":
-                remaining.append(track)
-                continue
-            distance = (
-                (center[0] - track["center"][0]) ** 2
-                + (center[1] - track["center"][1]) ** 2
-            ) ** 0.5
-            threshold = max(
-                100,
-                int(max(
-                    int(box[2]) - int(box[0]),
-                    int(box[3]) - int(box[1]),
-                )),
-            )
-            if distance > threshold:
-                remaining.append(track)
-        self.active_person_events[:] = remaining
-
-    def _finalize_track(self, track):
-        event = track["event"].copy()
-        frames = track["frames"]
-        frame_index = max(0, len(frames) - 1 - self.exit_frame_offset)
-        selected = frames[frame_index] if frames else None
-        alert_frame = selected["frame"] if selected else None
-        annotation_event = selected["event"] if selected else event
-        notify = event["detection_type"] != "known_person"
-        return self._record(None, event, notify, alert_frame, annotation_event)
-
-    def _finalize_missing(self, tracks, now):
-        records = []
-        remaining = []
-        expired = []
-        unknown_tracks = [
-            track
-            for track in tracks
-            if track["event"]["detection_type"] == "unknown_person"
-        ]
-        unknown_group_expired = bool(unknown_tracks) and (
-            now - max(track["last_seen"] for track in unknown_tracks)
-            >= self.dedup_seconds
-        )
-        for track in tracks:
-            is_unknown = track["event"]["detection_type"] == "unknown_person"
-            if is_unknown and unknown_group_expired:
-                expired.append(track)
-            elif now - track["last_seen"] >= self.dedup_seconds:
-                expired.append(track)
-            else:
-                remaining.append(track)
-        tracks[:] = remaining
-
-        unknown_tracks = [
-            track
-            for track in expired
-            if track["event"]["detection_type"] == "unknown_person"
-        ]
-        other_tracks = [
-            track
-            for track in expired
-            if track["event"]["detection_type"] != "unknown_person"
-        ]
-
-        if unknown_tracks:
-            event = unknown_tracks[0]["event"].copy()
-            count = len(unknown_tracks)
-            event["person_id"] = None
-            event["person_name"] = f"{count} Unknown Persons"
-            event["unknown_count"] = count
-            event["title"] = f"{count} Unknown Persons Detected"
-            event["message"] = (
-                f"{count} unknown person"
-                f"{'s' if count != 1 else ''} detected at {event['gate_name']}"
-            )
-            event["box"] = unknown_tracks[0]["last_box"]
-            frames = unknown_tracks[0]["frames"]
-            frame_index = max(0, len(frames) - 1 - self.exit_frame_offset)
-            selected = frames[frame_index] if frames else None
-            alert_frame = selected["frame"] if selected else None
-            annotation_event = selected["event"] if selected else event
-            records.append(
-                self._record(
-                    None,
-                    event,
-                    True,
-                    alert_frame,
-                    annotation_event,
-                )
-            )
-
-        records.extend(
-            self._finalize_track(track)
-            for track in other_tracks
-        )
-        return records
-
-    def _vehicle_key(self, vehicle):
-        return vehicle["vehicle_type"]
-
-    def _notify(self, event, image_url):
-        title = event["title"]
-        message = event["message"]
-        notification_id = str(event["id"])
-        messaging.send(
-            messaging.Message(
-                notification=messaging.Notification(
-                    title=title,
-                    body=message,
-                    image=image_url or None,
-                ),
-                android=messaging.AndroidConfig(priority="high"),
-                data={
-                    "type": event["detection_type"],
-                    "notification_id": notification_id,
-                    "title": title,
-                    "message": message,
-                    "detection_id": notification_id,
-                    "gate": event["gate_name"],
-                    "image_url": image_url,
-                    "confidence": str(event.get("confidence", "")),
-                    "detected_at": str(event["detected_at"]),
-                },
-                topic=self.firebase_topic,
-            )
-        )
-
-    def _record(
-        self,
-        frame,
-        event,
-        notify,
-        alert_frame=None,
-        annotation_event=None,
-    ):
-        image_source = alert_frame if alert_frame is not None else frame
-        if image_source is None:
-            return None
-        image_frame = image_source.copy()
-        annotation_event = annotation_event or event
-        if annotation_event["detection_type"] in {
-            "known_person",
-            "unknown_person",
-        }:
-            self._draw_person_label(image_frame, annotation_event)
-        elif annotation_event["detection_type"] == "vehicle":
-            self._draw_vehicle_label(image_frame, annotation_event)
-
-        image_url = self._save_image(image_frame)
-        event["image_url"] = image_url
-        event_id = self.database.save(event)
-        event["id"] = event_id
-        event["type"] = event["detection_type"]
-        event["time"] = time.strftime(
-            "%Y-%m-%d %H:%M:%S",
-            time.localtime(event["detected_at"]),
-        )
-        event["gate"] = event["gate_name"]
+    def _publish(self, event, image, notify):
+        event["image_url"] = self._save_image(image)
+        event["id"] = self.database.save(event)
+        event["type"], event["gate"] = event["detection_type"], event["gate_name"]
+        event["time"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(event["detected_at"]))
         self.socketio.emit("detection_event", event)
         if event["detection_type"] == "unknown_person":
             self.socketio.emit("face_alert", event)
         if notify:
             try:
-                self._notify(event, image_url)
+                self._notify(event)
             except Exception as error:
                 print(f"[ERROR] Detection notification failed: {error}")
         return event
 
-    def _draw_person_label(self, frame, event):
-        label = event["person_name"]
-        if event.get("person_id"):
-            label += f" ID: {event['person_id']}"
-        label += f" {event['confidence']:.2f}"
-        cv2.putText(
-            frame,
-            label,
-            (event["box"][0], max(20, event["box"][1] - 8)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 255, 255),
-            2,
-            cv2.LINE_AA,
-        )
+    def _finalize_expired(self, tracks, now):
+        expired, remaining = [], []
+        for track in tracks:
+            if now - track["last_seen"] < self.exit_confirm_seconds:
+                remaining.append(track)
+            elif track["frames"]:
+                track["state"] = "FINALIZED"
+                # With frames 102..107 and a confirmed exit at 108, index -5
+                # is frame 103: exactly EXIT_FRAME - 5.
+                index = (
+                    max(-len(track["frames"]), -self.exit_frame_offset)
+                    if self.exit_frame_offset
+                    else -1
+                )
+                expired.append((track, track["frames"][index]))
+        tracks[:] = remaining
+        return expired
 
-    def _draw_vehicle_label(self, frame, event):
-        label = (
-            f"{event['vehicle_type']} / {event['vehicle_class']} / "
-            f"{event['confidence']:.2f}"
-        )
-        cv2.putText(
-            frame,
-            label,
-            (event["box"][0], max(20, event["box"][1] - 8)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 255, 255),
-            2,
-            cv2.LINE_AA,
-        )
+    def _person_event(self, face, gate_name, now):
+        name, confidence = getattr(face, "recognized_name", "Unknown"), float(getattr(face, "recognition_score", 0.0))
+        known = name != "Unknown"
+        return {"detected_at": now, "detection_type": "known_person" if known else "unknown_person", "person_id": getattr(face, "person_id", None) or self.person_ids.get(name), "person_name": name, "confidence": confidence, "gate_name": gate_name, "box": tuple(int(v) for v in face.bbox), "title": "Known Person Detected" if known else "Unknown Person Detected", "message": f"{name} detected at {gate_name}"}
 
-    def process_frame(
-        self,
-        frame,
-        faces,
-        vehicles,
-        gate_name,
-        detected_at,
-        alert_frame=None,
-    ):
-        records = self._finalize_missing(
-            self.active_person_events,
-            detected_at,
-        )
-        records.extend(
-            self._finalize_missing(
-                self.active_vehicle_events,
-                detected_at,
-            )
-        )
+    def _publish_unknowns(self, unknowns, gate_name, now):
+        track, chosen = unknowns[0]
+        event = track["event"].copy()
+        count = len(unknowns)
+        event.update({"detected_at": now, "detection_type": "unknown_person", "person_name": "Unknown", "person_id": None, "unknown_count": count, "title": "Unknown Person Detected" if count == 1 else "Unknown Persons Detected", "message": f"Unknown person detected at {gate_name}" if count == 1 else f"{count} unknown persons detected at {gate_name}"})
+        image = chosen["frame"].copy()
+        for item, _ in unknowns:
+            marked = item["event"].copy()
+            marked["unknown_count"] = count
+            self._draw_event(image, marked)
+        return self._publish(event, image, notify=True)
+
+    def process_frame(self, frame, faces, vehicles, gate_name, detected_at, alert_frame=None):
+        """Ingest one annotated ROI frame; return records finalized on this call."""
+        annotated = alert_frame if alert_frame is not None else frame
+        for track in self.active_person_events + self.active_vehicle_events:
+            track["matched_this_frame"] = False
         for face in faces:
-            name = getattr(face, "recognized_name", "Unknown")
-            confidence = float(getattr(face, "recognition_score", 0.0))
-            box = tuple(int(value) for value in face.bbox)
-            event_type = "known_person" if name != "Unknown" else "unknown_person"
-            event = {
-                "detected_at": detected_at,
-                "detection_type": event_type,
-                "person_id": getattr(
-                    face,
-                    "person_id",
-                    self.person_ids.get(name),
-                ),
-                "person_name": name,
-                "confidence": confidence,
-                "gate_name": gate_name,
-                "box": box,
-                "title": "Known Person Detected" if name != "Unknown" else "Unknown Person Detected",
-                "message": f"{name} detected at {gate_name}",
-            }
-            if event_type == "known_person":
-                self._clear_unknown_near(box)
-            self._update_track(
-                self.active_person_events,
-                (event_type, name) if event_type == "known_person" else event_type,
-                box,
-                event,
-                alert_frame if alert_frame is not None else frame,
-                detected_at,
-            )
-
+            self._update_track(self.active_person_events, "person", self._person_event(face, gate_name, detected_at), annotated, detected_at)
         for vehicle in vehicles:
-            box = tuple(int(value) for value in vehicle["box"])
             vehicle_type = vehicle["vehicle_type"]
-            title = (
-                "Two Wheeler Detected"
-                if vehicle_type == "two_wheeler"
-                else "Four Wheeler Detected"
-            )
-            event = {
-                "detected_at": detected_at,
-                "detection_type": "vehicle",
-                "vehicle_type": vehicle_type,
-                "vehicle_class": vehicle["class_name"],
-                "confidence": vehicle["confidence"],
-                "gate_name": gate_name,
-                "box": box,
-                "title": title,
-                "message": f"{title} at {gate_name}",
-            }
-            self._update_track(
-                self.active_vehicle_events,
-                self._vehicle_key(vehicle),
-                box,
-                event,
-                alert_frame if alert_frame is not None else frame,
-                detected_at,
-            )
+            title = "Two Wheeler Detected" if vehicle_type == "two_wheeler" else "Four Wheeler Detected"
+            event = {"detected_at": detected_at, "detection_type": "vehicle", "vehicle_type": vehicle_type, "vehicle_class": vehicle["class_name"], "confidence": float(vehicle["confidence"]), "gate_name": gate_name, "box": tuple(int(v) for v in vehicle["box"]), "title": title, "message": f"{title} at {gate_name}"}
+            self._update_track(self.active_vehicle_events, f"vehicle:{vehicle_type}", event, annotated, detected_at)
+        # Keep the buffer aligned with real processing frames while a track is
+        # temporarily missing. This makes the selection relative to the
+        # confirmation frame (rather than merely the fifth prior detection).
+        for track in self.active_person_events + self.active_vehicle_events:
+            if not track["matched_this_frame"]:
+                track["frames"].append({
+                    "frame": annotated.copy(),
+                    "event": track["event"].copy(),
+                })
+        people = self._finalize_expired(self.active_person_events, detected_at)
+        vehicles = self._finalize_expired(self.active_vehicle_events, detected_at)
+        unknowns = [(track, chosen) for track, chosen in people if not track["known_detected_once"]]
+        records = [self._publish_unknowns(unknowns, gate_name, detected_at)] if unknowns else []
+        for track, chosen in people:
+            if track["known_detected_once"]:
+                event = track["event"].copy(); event["detected_at"] = detected_at
+                self._draw_event(chosen["frame"], event)
+                records.append(self._publish(event, chosen["frame"], notify=False))
+        for track, chosen in vehicles:
+            event = track["event"].copy(); event["detected_at"] = detected_at
+            self._draw_event(chosen["frame"], event)
+            records.append(self._publish(event, chosen["frame"], notify=True))
         return records

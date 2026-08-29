@@ -30,12 +30,23 @@ class DetectionDatabase:
                     vehicle_type TEXT,
                     vehicle_class TEXT,
                     confidence REAL,
+                    unknown_count INTEGER,
                     gate_name TEXT NOT NULL,
                     image_url TEXT,
                     created_at REAL NOT NULL
                 )
                 """
             )
+            columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(detection_records)"
+                )
+            }
+            if "unknown_count" not in columns:
+                connection.execute(
+                    "ALTER TABLE detection_records ADD COLUMN unknown_count INTEGER"
+                )
             connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_detection_records_detected_at
@@ -59,10 +70,11 @@ class DetectionDatabase:
                     vehicle_type,
                     vehicle_class,
                     confidence,
+                    unknown_count,
                     gate_name,
                     image_url,
                     created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     event.get("detected_at", time.time()),
@@ -72,6 +84,7 @@ class DetectionDatabase:
                     event.get("vehicle_type"),
                     event.get("vehicle_class"),
                     event.get("confidence"),
+                    event.get("unknown_count"),
                     event.get("gate_name", "Main Gate 01"),
                     event.get("image_url", ""),
                     time.time(),
@@ -82,20 +95,21 @@ class DetectionDatabase:
         finally:
             connection.close()
 
-    def latest(self, limit=50):
-        limit = max(1, min(int(limit), 500))
+    def latest(self, limit=0):
+        """Return persisted finalized events; limit=0 intentionally means all."""
+        limit = max(0, int(limit or 0))
         connection = self.connect()
         try:
-            rows = connection.execute(
-                """
+            query = """
                 SELECT id, detected_at, detection_type, person_id,
                        person_name, vehicle_type, vehicle_class,
-                       confidence, gate_name, image_url, created_at
+                       confidence, unknown_count, gate_name, image_url, created_at
                 FROM detection_records
                 ORDER BY detected_at DESC, id DESC
-                LIMIT ?
-                """,
-                (limit,),
+            """
+            rows = connection.execute(
+                f"{query} LIMIT ?" if limit else query,
+                (limit,) if limit else (),
             ).fetchall()
         finally:
             connection.close()
