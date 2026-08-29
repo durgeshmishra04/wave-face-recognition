@@ -138,7 +138,8 @@ ALERT_DEDUP_TIME = 10.0
 # Consecutive missing ROI frames must span this duration before an exit closes
 # an event. It is deliberately independent of the former alert throttle.
 EXIT_CONFIRM_SECONDS = float(os.getenv("EXIT_CONFIRM_SECONDS", "1.0"))
-EXIT_FRAME_OFFSET = int(os.getenv("EXIT_FRAME_OFFSET", "5"))
+# Final API/Firebase image is selected from confirmed exit frame - 6.
+EXIT_FRAME_OFFSET = int(os.getenv("EXIT_FRAME_OFFSET", "6"))
 
 # Region of interest for Person and Face Detection: defined by the custom polygon
 ROI_LEFT = float(os.getenv("ROI_LEFT", "0.10"))

@@ -60,7 +60,7 @@ class DetectionEventManager:
     def _update_track(self, tracks, category, event, frame, now):
         track = self._match_track(tracks, category, event["box"])
         if track is None:
-            track = {"event_id": str(uuid.uuid4()), "category": category, "state": "ENTERED_ROI", "first_seen": now, "last_seen": now, "last_box": event["box"], "center": self._center(event["box"]), "matched_this_frame": True, "known_detected_once": event["detection_type"] == "known_person", "event": event.copy(), "frames": deque(maxlen=self.exit_frame_offset + 1)}
+            track = {"event_id": str(uuid.uuid4()), "category": category, "state": "ENTERED_ROI", "first_seen": now, "last_seen": now, "last_box": event["box"], "center": self._center(event["box"]), "matched_this_frame": True, "known_detected_once": event["detection_type"] == "known_person", "event": event.copy(), "frames": deque(maxlen=self.exit_frame_offset + 2)}
             tracks.append(track)
         else:
             track.update({"state": "TRACKING", "last_seen": now, "last_box": event["box"], "center": self._center(event["box"]), "matched_this_frame": True})
@@ -83,7 +83,7 @@ class DetectionEventManager:
     def _draw_event(frame, event):
         if event["detection_type"] == "vehicle":
             x1, y1, x2, y2 = event["box"]
-            label, color = f"{event['vehicle_type'].replace('_', ' ').title()} | {event['vehicle_class']} | {event['confidence']:.2f}", (255, 165, 0)
+            label, color = f"{event['vehicle_type'].replace('_', ' ').title()} | {event['vehicle_class']} | {event['confidence']:.2f}", (0, 140, 255)
         elif event["detection_type"] == "known_person":
             # The person-model box is tracking-only. Only a face box may be
             # rendered on the image exposed to API/Firebase/Android.
@@ -98,7 +98,33 @@ class DetectionEventManager:
             count = event.get("unknown_count", 1)
             label, color = ("UNKNOWN" if count == 1 else f"UNKNOWN PERSONS: {count}"), (0, 0, 255)
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(frame, label, (x1, max(24, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, .6, color, 2, cv2.LINE_AA)
+        # A solid color label with thick white text remains readable in the
+        # image downloaded by Android and in the Firebase notification.
+        (text_width, text_height), baseline = cv2.getTextSize(
+            label,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            .65,
+            3,
+        )
+        label_bottom = max(text_height + baseline + 10, y1)
+        label_top = max(0, label_bottom - text_height - baseline - 10)
+        cv2.rectangle(
+            frame,
+            (x1, label_top),
+            (x1 + text_width + 12, label_bottom),
+            color,
+            -1,
+        )
+        cv2.putText(
+            frame,
+            label,
+            (x1 + 6, label_bottom - baseline - 5),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            .65,
+            (255, 255, 255),
+            3,
+            cv2.LINE_AA,
+        )
 
     def _notify(self, event):
         image_url = event["image_url"]
@@ -127,10 +153,10 @@ class DetectionEventManager:
                 remaining.append(track)
             elif track["frames"]:
                 track["state"] = "FINALIZED"
-                # With frames 102..107 and a confirmed exit at 108, index -5
-                # is frame 103: exactly EXIT_FRAME - 5.
+                # With frames 101..108 and a confirmed exit at 108, index -7
+                # is frame 102: exactly EXIT_FRAME - 6.
                 index = (
-                    max(-len(track["frames"]), -self.exit_frame_offset)
+                    max(-len(track["frames"]), -(self.exit_frame_offset + 1))
                     if self.exit_frame_offset
                     else -1
                 )
