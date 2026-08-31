@@ -12,6 +12,7 @@ import json
 import hashlib
 import io
 import uuid
+import shutil
 from collections import deque
 from types import SimpleNamespace
 
@@ -213,6 +214,9 @@ camera_running = True
 camera_status = "Starting..."
 
 known_embeddings = {}
+# Metadata for registration folders. Legacy folders retain their folder name
+# as the display name, while Android registrations use a unique folder key.
+known_person_metadata = {}
 face_app = None
 person_detector = None
 vehicle_detector = None
@@ -526,6 +530,72 @@ def _ensure_table(conn):
         """
     )
 
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS registered_persons (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            registration_id TEXT NOT NULL UNIQUE,
+            storage_key TEXT NOT NULL UNIQUE,
+            gate_no TEXT NOT NULL,
+            employee_id TEXT UNIQUE,
+            employee_name TEXT NOT NULL,
+            designation TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        )
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS registered_face_embeddings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            registration_id TEXT NOT NULL,
+            image_number INTEGER NOT NULL,
+            image_path TEXT NOT NULL,
+            embedding BLOB NOT NULL,
+            created_at REAL NOT NULL,
+            UNIQUE (registration_id, image_number)
+        )
+        """
+    )
+
+
+def _embedding_blob(embedding):
+
+    buffer = io.BytesIO()
+    np.save(
+        buffer,
+        np.asarray(embedding, dtype=np.float32),
+        allow_pickle=False,
+    )
+    return buffer.getvalue()
+
+
+def _registered_person_metadata():
+    """Return metadata keyed by the existing known_embeddings storage key."""
+
+    conn = _open_db()
+    try:
+        _ensure_table(conn)
+        rows = conn.execute(
+            """
+            SELECT storage_key, employee_name, employee_id, designation, gate_no
+            FROM registered_persons
+            """
+        ).fetchall()
+        return {
+            row[0]: {
+                "employee_name": row[1],
+                "employee_id": row[2],
+                "designation": row[3],
+                "gate_no": row[4],
+            }
+            for row in rows
+        }
+    finally:
+        conn.close()
+
 
 def _save_detection_event(
     known_count,
@@ -714,11 +784,15 @@ def _load_embedding_db(person):
 def load_known_faces():
 
     global known_embeddings
+    global known_person_metadata
 
     KNOWN_FACES_DIR.mkdir(
         parents=True,
         exist_ok=True
     )
+    known_embeddings = {}
+    registered_metadata = _registered_person_metadata()
+    known_person_metadata = {}
 
     supported = {
         ".jpg",
@@ -753,6 +827,14 @@ def load_known_faces():
         person_name,
         image_paths
     ):
+
+        known_person_metadata[person_name] = registered_metadata.get(
+            person_name,
+            {
+                "employee_name": person_name,
+                "employee_id": None,
+            },
+        )
 
         fingerprint = _compute_fingerprint(
             image_paths
@@ -919,7 +1001,7 @@ def recognize_face(face):
         face.embedding
     )
 
-    best_name = "Unknown"
+    best_key = None
     best_score = -1.0
 
     for (
@@ -937,12 +1019,20 @@ def recognize_face(face):
         if score > best_score:
 
             best_score = score
-            best_name = name
+            best_key = name
 
     if best_score >= RECOGNITION_THRESHOLD:
 
+        metadata = known_person_metadata.get(
+            best_key,
+            {"employee_name": best_key, "employee_id": None},
+        )
+        # The event manager reads this existing optional attribute when it
+        # records a known-person event.
+        face.person_id = metadata.get("employee_id")
+
         return (
-            best_name,
+            metadata["employee_name"],
             best_score
         )
 
@@ -2465,6 +2555,200 @@ def camera_worker():
             )
 
             time.sleep(5)
+
+
+# ============================================================
+# ANDROID PERSON REGISTRATION
+# ============================================================
+
+def _validate_registration_images():
+    """Decode five uploads and create compatible InsightFace embeddings."""
+
+    expected = [f"image{number}" for number in range(1, 6)]
+    supplied = [
+        field
+        for field in request.files
+        if field.lower().startswith("image")
+    ]
+    if set(supplied) != set(expected) or any(
+        len(request.files.getlist(field)) != 1
+        for field in expected
+    ):
+        raise ValueError("Exactly 5 face images are required")
+    if face_app is None:
+        raise RuntimeError("Face recognition model is not ready")
+
+    images, embeddings = [], []
+    for number, field in enumerate(expected, start=1):
+        raw = request.files[field].read()
+        image = cv2.imdecode(
+            np.frombuffer(raw, dtype=np.uint8),
+            cv2.IMREAD_COLOR,
+        ) if raw else None
+        if image is None:
+            raise ValueError(f"Image {number} is not a valid image")
+        faces = face_app.get(image)
+        if not faces:
+            raise ValueError(f"No face detected in image {number}")
+        if len(faces) != 1:
+            raise ValueError(f"Image {number} must contain exactly one face")
+        embedding = normalize_embedding(faces[0].embedding)
+        if embedding.size == 0:
+            raise ValueError(
+                f"Unable to generate face embedding for image {number}"
+            )
+        images.append(image)
+        embeddings.append(embedding)
+    return images, embeddings
+
+
+def _save_registered_person(gate_no, employee_name, designation, employee_id,
+                            images, embeddings):
+    """Persist a completely validated registration and update the live cache."""
+
+    registration_id = f"REG_{uuid.uuid4().hex[:12].upper()}"
+    storage_key = employee_id or registration_id
+    final_dir = KNOWN_FACES_DIR / storage_key
+    staging_dir = KNOWN_FACES_DIR / (
+        f".{storage_key}.registration-{uuid.uuid4().hex}"
+    )
+    moved_to_final = False
+    conn = None
+    try:
+        conn = _open_db()
+        _ensure_table(conn)
+        if employee_id and conn.execute(
+            "SELECT 1 FROM registered_persons WHERE employee_id = ?",
+            (employee_id,),
+        ).fetchone():
+            raise ValueError("Employee ID already registered")
+        if final_dir.exists():
+            raise ValueError("Employee registration folder already exists")
+
+        staging_dir.mkdir(parents=True, exist_ok=False)
+        image_paths = []
+        for number, image in enumerate(images, start=1):
+            image_path = staging_dir / f"image_{number}.jpg"
+            if not cv2.imwrite(str(image_path), image):
+                raise RuntimeError(f"Unable to save image {number}")
+            image_paths.append(image_path)
+
+        # Move only after every image was safely written. The final directory
+        # uses a server-generated key, never an Android filename.
+        staging_dir.replace(final_dir)
+        moved_to_final = True
+        final_paths = [final_dir / path.name for path in image_paths]
+        fingerprint = _compute_fingerprint(final_paths)
+        average_embedding = normalize_embedding(np.mean(
+            np.stack(embeddings, axis=0), axis=0,
+        ))
+        now = time.time()
+
+        conn.execute(
+            """
+            INSERT INTO registered_persons (
+                registration_id, storage_key, gate_no, employee_id,
+                employee_name, designation, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                registration_id, storage_key, gate_no, employee_id,
+                employee_name, designation, now, now,
+            ),
+        )
+        for number, (path, embedding) in enumerate(
+            zip(final_paths, embeddings), start=1,
+        ):
+            conn.execute(
+                """
+                INSERT INTO registered_face_embeddings (
+                    registration_id, image_number, image_path, embedding,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    registration_id, number, str(path),
+                    sqlite3.Binary(_embedding_blob(embedding)), now,
+                ),
+            )
+        # This is the exact existing known_embeddings storage format used by
+        # load_known_faces()/recognize_face(), not a second recognition store.
+        conn.execute(
+            """
+            REPLACE INTO known_embeddings (
+                person, embedding, image_paths, fingerprint, updated_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                storage_key, sqlite3.Binary(_embedding_blob(average_embedding)),
+                json.dumps([str(path) for path in final_paths]), fingerprint, now,
+            ),
+        )
+        conn.commit()
+    except Exception:
+        if conn is not None:
+            conn.rollback()
+        if moved_to_final:
+            shutil.rmtree(final_dir, ignore_errors=True)
+        else:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+        raise
+    finally:
+        if conn is not None:
+            conn.close()
+
+    # Hot-add the normalized average to the live existing recognition cache;
+    # no model reload or RTSP interruption is needed.
+    known_embeddings[storage_key] = average_embedding
+    known_person_metadata[storage_key] = {
+        "employee_name": employee_name,
+        "employee_id": employee_id,
+        "designation": designation,
+        "gate_no": gate_no,
+    }
+    return registration_id
+
+
+@app.route("/api/register-person", methods=["POST"])
+def api_register_person():
+    required_fields = ("gate_no", "employee_name", "designation")
+    values = {
+        field: request.form.get(field, "").strip()
+        for field in required_fields
+    }
+    for field in required_fields:
+        if not values[field]:
+            return jsonify({
+                "success": False,
+                "message": f"{field} is required",
+            }), 400
+    employee_id = request.form.get("employee_id", "").strip() or None
+    try:
+        images, embeddings = _validate_registration_images()
+        registration_id = _save_registered_person(
+            values["gate_no"], values["employee_name"],
+            values["designation"], employee_id, images, embeddings,
+        )
+    except ValueError as error:
+        return jsonify({"success": False, "message": str(error)}), 400
+    except RuntimeError as error:
+        return jsonify({"success": False, "message": str(error)}), 503
+    except Exception as error:
+        print(f"[ERROR] Person registration failed: {error}")
+        return jsonify({
+            "success": False,
+            "message": "Unable to register employee",
+        }), 500
+    return jsonify({
+        "success": True,
+        "message": "Employee registered successfully",
+        "registration_id": registration_id,
+        "gate_no": values["gate_no"],
+        "employee_id": employee_id,
+        "employee_name": values["employee_name"],
+        "designation": values["designation"],
+        "images_registered": 5,
+    }), 201
 
 
 # ============================================================
