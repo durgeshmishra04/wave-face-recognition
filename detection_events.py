@@ -60,7 +60,7 @@ class DetectionEventManager:
     def _update_track(self, tracks, category, event, frame, now):
         track = self._match_track(tracks, category, event["box"])
         if track is None:
-            track = {"event_id": str(uuid.uuid4()), "category": category, "state": "ENTERED_ROI", "first_seen": now, "last_seen": now, "last_box": event["box"], "center": self._center(event["box"]), "matched_this_frame": True, "known_detected_once": event["detection_type"] == "known_person", "event": event.copy(), "frames": deque(maxlen=self.exit_frame_offset + 2)}
+            track = {"event_id": str(uuid.uuid4()), "category": category, "state": "ENTERED_ROI", "first_seen": now, "last_seen": now, "last_box": event["box"], "center": self._center(event["box"]), "matched_this_frame": True, "known_detected_once": event["detection_type"] == "known_person", "vehicle_context_detected": bool(event.get("vehicle_context_detected")), "suppress_notify": bool(event.get("suppress_notify")), "event": event.copy(), "frames": deque(maxlen=self.exit_frame_offset + 2)}
             tracks.append(track)
         else:
             track.update({"state": "TRACKING", "last_seen": now, "last_box": event["box"], "center": self._center(event["box"]), "matched_this_frame": True})
@@ -69,8 +69,14 @@ class DetectionEventManager:
             track["known_detected_once"] = True
             track["event"] = event.copy()
         elif not track["known_detected_once"]:
+            track["vehicle_context_detected"] = track.get("vehicle_context_detected", False) or bool(event.get("vehicle_context_detected"))
+            track["suppress_notify"] = track.get("suppress_notify", False) or bool(event.get("suppress_notify"))
             track["event"] = event.copy()
         track["event"]["box"] = event["box"]
+        if track.get("vehicle_context_detected"):
+            track["event"]["vehicle_context_detected"] = True
+        if track.get("suppress_notify"):
+            track["event"]["suppress_notify"] = True
         track["frames"].append({"frame": frame.copy(), "event": track["event"].copy()})
 
     def _save_image(self, frame):
@@ -173,7 +179,15 @@ class DetectionEventManager:
         track, chosen = unknowns[0]
         event = track["event"].copy()
         count = len(unknowns)
+        vehicle_context = any(
+            item[0].get("vehicle_context_detected")
+            for item in unknowns
+        )
         event.update({"detected_at": now, "detection_type": "unknown_person", "person_name": "Unknown", "person_id": None, "unknown_count": count, "title": "Unknown Person Detected" if count == 1 else "Unknown Persons Detected", "message": f"Unknown person detected at {gate_name}" if count == 1 else f"{count} unknown persons detected at {gate_name}"})
+        if vehicle_context:
+            event["title"] = "Unknown Person Detected at Vehicle" if count == 1 else "Unknown Persons Detected at Vehicle"
+            event["message"] = f"Unknown person detected at vehicle at {gate_name}" if count == 1 else f"{count} unknown persons detected at vehicle at {gate_name}"
+            event["vehicle_context_detected"] = True
         image = chosen["frame"].copy()
         for item, _ in unknowns:
             marked = item["event"].copy()
@@ -193,6 +207,18 @@ class DetectionEventManager:
             title = "Two Wheeler Detected" if vehicle_type == "two_wheeler" else "Four Wheeler Detected"
             event = {"detected_at": detected_at, "detection_type": "vehicle", "vehicle_type": vehicle_type, "vehicle_class": vehicle["class_name"], "confidence": float(vehicle["confidence"]), "gate_name": gate_name, "box": tuple(int(v) for v in vehicle["box"]), "title": title, "message": f"{title} at {gate_name}"}
             self._update_track(self.active_vehicle_events, f"vehicle:{vehicle_type}", event, annotated, detected_at)
+        active_unknown_tracks = [
+            track
+            for track in self.active_person_events
+            if not track["known_detected_once"]
+        ]
+        if active_unknown_tracks and self.active_vehicle_events:
+            for track in active_unknown_tracks:
+                track["vehicle_context_detected"] = True
+                track["event"]["vehicle_context_detected"] = True
+            for track in self.active_vehicle_events:
+                track["suppress_notify"] = True
+                track["event"]["suppress_notify"] = True
         # Keep the buffer aligned with real processing frames while a track is
         # temporarily missing. This makes the selection relative to the
         # confirmation frame (rather than merely the fifth prior detection).
@@ -232,5 +258,5 @@ class DetectionEventManager:
         for track, chosen in vehicles:
             event = track["event"].copy(); event["detected_at"] = detected_at
             self._draw_event(chosen["frame"], event)
-            records.append(self._publish(event, chosen["frame"], notify=True))
+            records.append(self._publish(event, chosen["frame"], notify=not track.get("suppress_notify", False)))
         return records
