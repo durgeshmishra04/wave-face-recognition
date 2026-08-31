@@ -597,6 +597,159 @@ def _registered_person_metadata():
         conn.close()
 
 
+def _registered_employee_image_url(storage_key, filename):
+    return (
+        f"{PUBLIC_BASE_URL}/known-faces/"
+        f"{quote(str(storage_key))}/{quote(str(filename))}"
+    )
+
+
+def _registered_employees_payload():
+    conn = _open_db()
+    try:
+        _ensure_table(conn)
+        person_rows = conn.execute(
+            """
+            SELECT
+                registration_id,
+                storage_key,
+                gate_no,
+                employee_id,
+                employee_name,
+                designation,
+                created_at,
+                updated_at
+            FROM registered_persons
+            ORDER BY created_at DESC, id DESC
+            """
+        ).fetchall()
+        embedding_rows = conn.execute(
+            """
+            SELECT
+                registration_id,
+                image_number,
+                image_path
+            FROM registered_face_embeddings
+            ORDER BY registration_id ASC, image_number ASC
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+
+    images_by_registration = {}
+    for row in embedding_rows:
+        image_path = Path(row[2])
+        storage_key = image_path.parent.name
+        images_by_registration.setdefault(row[0], []).append({
+            "image_number": int(row[1]),
+            "image_path": str(image_path),
+            "image_name": image_path.name,
+            "image_url": _registered_employee_image_url(
+                storage_key,
+                image_path.name,
+            ),
+        })
+
+    employees = []
+    for row in person_rows:
+        registration_id = row[0]
+        storage_key = row[1]
+        employees.append({
+            "registration_id": registration_id,
+            "storage_key": storage_key,
+            "gate_no": row[2],
+            "employee_id": row[3],
+            "employee_name": row[4],
+            "designation": row[5],
+            "created_at": row[6],
+            "updated_at": row[7],
+            "image_urls": [
+                item["image_url"]
+                for item in images_by_registration.get(registration_id, [])
+            ],
+            "images": [
+                {
+                    "image_number": item["image_number"],
+                    "image_name": item["image_name"],
+                    "image_path": item["image_path"],
+                    "image_url": item["image_url"],
+                }
+                for item in images_by_registration.get(registration_id, [])
+            ],
+            "images_count": len(
+                images_by_registration.get(registration_id, [])
+            ),
+        })
+
+    return employees
+
+
+def _registered_employee_payload(registration_id):
+
+    conn = _open_db()
+    try:
+        _ensure_table(conn)
+        person = conn.execute(
+            """
+            SELECT
+                registration_id,
+                storage_key,
+                gate_no,
+                employee_id,
+                employee_name,
+                designation,
+                created_at,
+                updated_at
+            FROM registered_persons
+            WHERE registration_id = ?
+            """,
+            (registration_id,),
+        ).fetchone()
+        if person is None:
+            return None
+        embedding_rows = conn.execute(
+            """
+            SELECT
+                image_number,
+                image_path
+            FROM registered_face_embeddings
+            WHERE registration_id = ?
+            ORDER BY image_number ASC
+            """,
+            (registration_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    storage_key = person[1]
+    images = []
+    for row in embedding_rows:
+        image_path = Path(row[1])
+        images.append({
+            "image_number": int(row[0]),
+            "image_path": str(image_path),
+            "image_name": image_path.name,
+            "image_url": _registered_employee_image_url(
+                storage_key,
+                image_path.name,
+            ),
+        })
+
+    return {
+        "registration_id": person[0],
+        "storage_key": storage_key,
+        "gate_no": person[2],
+        "employee_id": person[3],
+        "employee_name": person[4],
+        "designation": person[5],
+        "created_at": person[6],
+        "updated_at": person[7],
+        "image_urls": [item["image_url"] for item in images],
+        "images": images,
+        "images_count": len(images),
+    }
+
+
 def _save_detection_event(
     known_count,
     unknown_count,
@@ -781,6 +934,60 @@ def _load_embedding_db(person):
         conn.close()
 
 
+def _load_registered_embeddings_from_db():
+
+    conn = _open_db()
+
+    try:
+
+        _ensure_table(conn)
+
+        rows = conn.execute(
+            """
+            SELECT
+                p.storage_key,
+                p.employee_name,
+                p.employee_id,
+                p.designation,
+                p.gate_no,
+                e.image_number,
+                e.embedding
+            FROM registered_persons AS p
+            INNER JOIN registered_face_embeddings AS e
+                ON e.registration_id = p.registration_id
+            ORDER BY p.created_at ASC, e.image_number ASC
+            """
+        ).fetchall()
+
+    finally:
+
+        conn.close()
+
+    grouped = {}
+    for row in rows:
+        storage_key = row[0]
+        grouped.setdefault(storage_key, {
+            "employee_name": row[1],
+            "employee_id": row[2],
+            "designation": row[3],
+            "gate_no": row[4],
+            "embeddings": [],
+        })
+
+        blob = row[6]
+        if not blob:
+            continue
+
+        buf = io.BytesIO(blob)
+        buf.seek(0)
+        embedding = np.load(buf, allow_pickle=False).astype(np.float32)
+        grouped[storage_key]["embeddings"].append(
+            normalize_embedding(embedding)
+        )
+
+    return grouped
+
+
 def load_known_faces():
 
     global known_embeddings
@@ -791,203 +998,32 @@ def load_known_faces():
         exist_ok=True
     )
     known_embeddings = {}
-    registered_metadata = _registered_person_metadata()
     known_person_metadata = {}
 
-    supported = {
-        ".jpg",
-        ".jpeg",
-        ".png",
-        ".bmp",
-        ".webp"
-    }
+    registered_rows = _load_registered_embeddings_from_db()
+    for storage_key, data in registered_rows.items():
 
-    persons = [
-        p
-        for p in KNOWN_FACES_DIR.iterdir()
-        if p.is_dir()
-    ]
-
-    single_files = []
-
-    if not persons:
-
-        single_files = [
-            p
-            for p in KNOWN_FACES_DIR.iterdir()
-            if (
-                p.is_file()
-                and p.suffix.lower()
-                in supported
-            )
-        ]
-
-
-    def _process_person(
-        person_name,
-        image_paths
-    ):
-
-        known_person_metadata[person_name] = registered_metadata.get(
-            person_name,
-            {
-                "employee_name": person_name,
-                "employee_id": None,
-            },
-        )
-
-        fingerprint = _compute_fingerprint(
-            image_paths
-        )
-
-        cached = _load_embedding_db(
-            person_name
-        )
-
-        if cached is not None:
-
-            emb, _, cached_fp = cached
-
-            if cached_fp == fingerprint:
-
-                known_embeddings[
-                    person_name
-                ] = normalize_embedding(emb)
-
-                print(
-                    f"[OK] Loaded cached: "
-                    f"{person_name}"
-                )
-
-                return
-
-        embeddings = []
-
-        for image_path in image_paths:
-
-            image = cv2.imread(
-                str(image_path)
-            )
-
-            if image is None:
-
-                print(
-                    f"[WARNING] Could not read: "
-                    f"{image_path}"
-                )
-
-                continue
-
-            faces = face_app.get(image)
-
-            if not faces:
-
-                print(
-                    f"[WARNING] No face found in: "
-                    f"{image_path}"
-                )
-
-                continue
-
-            face = max(
-                faces,
-                key=lambda f:
-                max(
-                    0,
-                    f.bbox[2] - f.bbox[0]
-                )
-                *
-                max(
-                    0,
-                    f.bbox[3] - f.bbox[1]
-                )
-            )
-
-            embeddings.append(
-                normalize_embedding(
-                    face.embedding
-                )
-            )
-
+        embeddings = data.get("embeddings", [])
         if not embeddings:
+            continue
 
-            print(
-                f"[WARNING] No valid face "
-                f"embeddings for: "
-                f"{person_name}"
-            )
-
-            return
-
-        avg = normalize_embedding(
+        known_embeddings[storage_key] = normalize_embedding(
             np.mean(
-                np.stack(
-                    embeddings,
-                    axis=0
-                ),
-                axis=0
+                np.stack(embeddings, axis=0),
+                axis=0,
             )
         )
-
-        known_embeddings[
-            person_name
-        ] = avg
-
-        _save_embedding_db(
-            person_name,
-            avg,
-            image_paths,
-            fingerprint
-        )
-
-        print(
-            f"[OK] Enrolled: "
-            f"{person_name} "
-            f"({len(embeddings)} image(s))"
-        )
-
-
-    if single_files:
-
-        for image_path in single_files:
-
-            _process_person(
-                image_path.stem,
-                [image_path]
-            )
-
-    else:
-
-        for person_dir in persons:
-
-            image_files = [
-                p
-                for p in person_dir.iterdir()
-                if (
-                    p.is_file()
-                    and p.suffix.lower()
-                    in supported
-                )
-            ]
-
-            if not image_files:
-
-                print(
-                    f"[WARNING] No images found: "
-                    f"{person_dir.name}"
-                )
-
-                continue
-
-            _process_person(
-                person_dir.name,
-                image_files
-            )
+        known_person_metadata[storage_key] = {
+            "employee_name": data.get("employee_name", storage_key),
+            "employee_id": data.get("employee_id"),
+            "designation": data.get("designation"),
+            "gate_no": data.get("gate_no"),
+        }
 
     print(
         f"[INFO] Loaded "
         f"{len(known_embeddings)} "
-        f"known face(s)."
+        f"registered face(s) from database."
     )
 
 
@@ -2959,6 +2995,18 @@ def alert_image(filename):
     )
 
 
+@app.route(
+    "/known-faces/<storage_key>/<filename>",
+    methods=["GET"]
+)
+def known_face_image(storage_key, filename):
+
+    return send_from_directory(
+        KNOWN_FACES_DIR / storage_key,
+        filename
+    )
+
+
 # ============================================================
 # REST API
 # ============================================================
@@ -3100,6 +3148,47 @@ def api_known_faces():
                 sorted(
                     known_embeddings.keys()
                 )
+        }
+    )
+
+
+@app.route(
+    "/api/registered-employees",
+    methods=["GET"]
+)
+def api_registered_employees():
+
+    employees = _registered_employees_payload()
+
+    return jsonify(
+        {
+            "success": True,
+            "count": len(employees),
+            "employees": employees,
+        }
+    )
+
+
+@app.route(
+    "/api/registered-employees/<registration_id>",
+    methods=["GET"]
+)
+def api_registered_employee(registration_id):
+
+    employee = _registered_employee_payload(registration_id)
+
+    if employee is None:
+        return jsonify(
+            {
+                "success": False,
+                "message": "Registration ID not found",
+            }
+        ), 404
+
+    return jsonify(
+        {
+            "success": True,
+            "employee": employee,
         }
     )
 
