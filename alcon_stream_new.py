@@ -2752,6 +2752,198 @@ def api_register_person():
 
 
 # ============================================================
+# ANDROID PERSON UPDATE (PATCH)
+# ============================================================
+
+@app.route("/api/update-person/<registration_id>", methods=["PATCH"])
+def api_update_person(registration_id):
+    """Update one or more fields of a registered person.
+
+    All fields are optional — only the supplied fields are updated.
+    Accepted form/JSON fields: gate_no, employee_name, designation, employee_id.
+    """
+
+    # Accept both form-data and JSON payloads.
+    if request.is_json:
+        payload = request.get_json(silent=True) or {}
+    else:
+        payload = request.form.to_dict()
+
+    updatable_fields = ("gate_no", "employee_name", "designation", "employee_id")
+    updates = {}
+    for field in updatable_fields:
+        if field in payload:
+            value = str(payload[field]).strip()
+            # Allow explicitly clearing employee_id by sending an empty string.
+            if field == "employee_id":
+                updates[field] = value or None
+            else:
+                if not value:
+                    return jsonify({
+                        "success": False,
+                        "message": f"{field} cannot be empty",
+                    }), 400
+                updates[field] = value
+
+    if not updates:
+        return jsonify({
+            "success": False,
+            "message": "No updatable fields provided. "
+                       "Accepted fields: gate_no, employee_name, designation, employee_id",
+        }), 400
+
+    conn = None
+    try:
+        conn = _open_db()
+        _ensure_table(conn)
+
+        # Fetch the existing record.
+        row = conn.execute(
+            "SELECT storage_key, gate_no, employee_id, employee_name, designation "
+            "FROM registered_persons WHERE registration_id = ?",
+            (registration_id,),
+        ).fetchone()
+        if row is None:
+            return jsonify({
+                "success": False,
+                "message": "Registration ID not found",
+            }), 404
+
+        old_storage_key, old_gate_no, old_employee_id, old_employee_name, old_designation = row
+
+        # If the caller wants to change employee_id, ensure uniqueness.
+        new_employee_id = updates.get("employee_id", old_employee_id)
+        if (
+            "employee_id" in updates
+            and new_employee_id is not None
+            and new_employee_id != old_employee_id
+        ):
+            conflict = conn.execute(
+                "SELECT 1 FROM registered_persons WHERE employee_id = ? AND registration_id != ?",
+                (new_employee_id, registration_id),
+            ).fetchone()
+            if conflict:
+                return jsonify({
+                    "success": False,
+                    "message": "Employee ID already registered to another person",
+                }), 400
+
+        # Build the dynamic UPDATE.
+        set_clauses = []
+        params = []
+        for field, value in updates.items():
+            set_clauses.append(f"{field} = ?")
+            params.append(value)
+        set_clauses.append("updated_at = ?")
+        params.append(time.time())
+        params.append(registration_id)
+
+        conn.execute(
+            f"UPDATE registered_persons SET {', '.join(set_clauses)} "
+            f"WHERE registration_id = ?",
+            tuple(params),
+        )
+        conn.commit()
+    except Exception as error:
+        if conn is not None:
+            conn.rollback()
+        print(f"[ERROR] Person update failed: {error}")
+        return jsonify({
+            "success": False,
+            "message": "Unable to update employee",
+        }), 500
+    finally:
+        if conn is not None:
+            conn.close()
+
+    # Refresh the live metadata cache so recognition labels update immediately.
+    final_values = {
+        "gate_no": updates.get("gate_no", old_gate_no),
+        "employee_name": updates.get("employee_name", old_employee_name),
+        "employee_id": updates.get("employee_id", old_employee_id),
+        "designation": updates.get("designation", old_designation),
+    }
+    if old_storage_key in known_person_metadata:
+        known_person_metadata[old_storage_key] = final_values
+
+    return jsonify({
+        "success": True,
+        "message": "Employee updated successfully",
+        "registration_id": registration_id,
+        **final_values,
+    }), 200
+
+
+# ============================================================
+# ANDROID PERSON DELETE
+# ============================================================
+
+@app.route("/api/delete-person/<registration_id>", methods=["DELETE"])
+def api_delete_person(registration_id):
+    """Delete a registered person and remove them from live recognition."""
+
+    conn = None
+    try:
+        conn = _open_db()
+        _ensure_table(conn)
+
+        row = conn.execute(
+            "SELECT storage_key FROM registered_persons WHERE registration_id = ?",
+            (registration_id,),
+        ).fetchone()
+        if row is None:
+            return jsonify({
+                "success": False,
+                "message": "Registration ID not found",
+            }), 404
+
+        storage_key = row[0]
+
+        # Remove from all three database tables.
+        conn.execute(
+            "DELETE FROM registered_face_embeddings WHERE registration_id = ?",
+            (registration_id,),
+        )
+        conn.execute(
+            "DELETE FROM registered_persons WHERE registration_id = ?",
+            (registration_id,),
+        )
+        conn.execute(
+            "DELETE FROM known_embeddings WHERE person = ?",
+            (storage_key,),
+        )
+        conn.commit()
+
+        # Remove the image folder from disk.
+        person_dir = KNOWN_FACES_DIR / storage_key
+        if person_dir.exists():
+            shutil.rmtree(person_dir, ignore_errors=True)
+
+    except Exception as error:
+        if conn is not None:
+            conn.rollback()
+        print(f"[ERROR] Person deletion failed: {error}")
+        return jsonify({
+            "success": False,
+            "message": "Unable to delete employee",
+        }), 500
+    finally:
+        if conn is not None:
+            conn.close()
+
+    # Evict from the live recognition caches so the person
+    # stops being recognized immediately.
+    known_embeddings.pop(storage_key, None)
+    known_person_metadata.pop(storage_key, None)
+
+    return jsonify({
+        "success": True,
+        "message": "Employee deleted successfully",
+        "registration_id": registration_id,
+    }), 200
+
+
+# ============================================================
 # SERVE ALERT IMAGES
 # ============================================================
 
