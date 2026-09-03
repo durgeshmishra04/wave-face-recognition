@@ -3,7 +3,6 @@ import os
 import time
 import threading
 import base64
-import hmac
 from pathlib import Path
 from urllib.parse import quote
 from urllib.parse import urlencode
@@ -11,6 +10,7 @@ from urllib.request import HTTPDigestAuthHandler, HTTPPasswordMgrWithDefaultReal
 import sqlite3
 import json
 import hashlib
+import hmac
 import io
 import uuid
 import shutil
@@ -501,9 +501,11 @@ def _open_db():
         str(DB_FILENAME)
     )
 
-    conn.execute("PRAGMA foreign_keys=ON;")
     conn.execute(
         "PRAGMA journal_mode=WAL;"
+    )
+    conn.execute(
+        "PRAGMA foreign_keys=ON;"
     )
 
     return conn
@@ -571,10 +573,11 @@ def _ensure_table(conn):
         CREATE TABLE IF NOT EXISTS auth_accounts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             role TEXT NOT NULL CHECK (role IN ('admin', 'user')),
-            username TEXT NOT NULL UNIQUE,
+            username TEXT NOT NULL,
             password_hash TEXT NOT NULL,
             created_at REAL NOT NULL,
-            updated_at REAL NOT NULL
+            updated_at REAL NOT NULL,
+            UNIQUE (role, username)
         )
         """
     )
@@ -599,44 +602,32 @@ def _ensure_table(conn):
 
 
 def _bootstrap_auth_accounts(conn):
-
     defaults = (
         ("admin", DEFAULT_ADMIN_USERNAME, DEFAULT_ADMIN_PASSWORD),
         ("user", DEFAULT_USER_USERNAME, DEFAULT_USER_PASSWORD),
     )
     now = time.time()
-
     for role, username, password in defaults:
         username = (username or "").strip()
         password = (password or "").strip()
         if not username or not password:
             continue
-
         existing = conn.execute(
             "SELECT id FROM auth_accounts WHERE role = ? AND username = ?",
             (role, username),
         ).fetchone()
-        if existing is not None:
-            continue
-
-        conn.execute(
-            """
-            INSERT INTO auth_accounts (
-                role, username, password_hash, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?)
-            """,
-            (
-                role,
-                username,
-                _hash_password(password),
-                now,
-                now,
-            ),
-        )
+        if existing is None:
+            conn.execute(
+                """
+                INSERT INTO auth_accounts (
+                    role, username, password_hash, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (role, username, _hash_password(password), now, now),
+            )
 
 
 def _hash_password(password):
-
     salt = os.urandom(16)
     digest = hashlib.pbkdf2_hmac(
         "sha256",
@@ -644,27 +635,24 @@ def _hash_password(password):
         salt,
         AUTH_PASSWORD_HASH_ITERATIONS,
     )
-    return (
-        f"pbkdf2_sha256${AUTH_PASSWORD_HASH_ITERATIONS}$"
-        f"{base64.b64encode(salt).decode('ascii')}$"
-        f"{base64.b64encode(digest).decode('ascii')}"
+    return "pbkdf2_sha256${}${}${}".format(
+        AUTH_PASSWORD_HASH_ITERATIONS,
+        salt.hex(),
+        digest.hex(),
     )
 
 
 def _verify_password(password, stored_hash):
-
     try:
-        algorithm, rounds, salt_b64, digest_b64 = stored_hash.split("$", 3)
+        algorithm, rounds, salt_hex, digest_hex = stored_hash.split("$", 3)
         if algorithm != "pbkdf2_sha256":
             return False
-        rounds = int(rounds)
-        salt = base64.b64decode(salt_b64.encode("ascii"))
-        expected = base64.b64decode(digest_b64.encode("ascii"))
+        expected = bytes.fromhex(digest_hex)
         actual = hashlib.pbkdf2_hmac(
             "sha256",
             password.encode("utf-8"),
-            salt,
-            rounds,
+            bytes.fromhex(salt_hex),
+            int(rounds),
         )
         return hmac.compare_digest(actual, expected)
     except Exception:
@@ -672,20 +660,12 @@ def _verify_password(password, stored_hash):
 
 
 def _json_or_form_payload():
-
     if request.is_json:
         return request.get_json(silent=True) or {}
     return request.form.to_dict()
 
 
-def _normalize_role(role):
-
-    role = (role or "").strip().lower()
-    return role if role in {"admin", "user"} else ""
-
-
 def _auth_account_by_credentials(role, username, password):
-
     conn = _open_db()
     try:
         _ensure_table(conn)
@@ -705,16 +685,11 @@ def _auth_account_by_credentials(role, username, password):
 
 
 def _auth_account_by_id(role, account_id):
-
     conn = _open_db()
     try:
         _ensure_table(conn)
         return conn.execute(
-            """
-            SELECT id, role, username, password_hash
-            FROM auth_accounts
-            WHERE role = ? AND id = ?
-            """,
+            "SELECT id, role, username FROM auth_accounts WHERE role = ? AND id = ?",
             (role, account_id),
         ).fetchone()
     finally:
@@ -722,21 +697,15 @@ def _auth_account_by_id(role, account_id):
 
 
 def _upsert_fcm_token(account_id, role, fcm_token, is_active=True):
-
     fcm_token = (fcm_token or "").strip()
     if not fcm_token:
         return
-
     conn = _open_db()
     try:
         _ensure_table(conn)
         now = time.time()
         existing = conn.execute(
-            """
-            SELECT id
-            FROM fcm_device_tokens
-            WHERE fcm_token = ?
-            """,
+            "SELECT id FROM fcm_device_tokens WHERE fcm_token = ?",
             (fcm_token,),
         ).fetchone()
         if existing is None:
@@ -747,39 +716,17 @@ def _upsert_fcm_token(account_id, role, fcm_token, is_active=True):
                     created_at, updated_at, last_login_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (
-                    account_id,
-                    role,
-                    fcm_token,
-                    1 if is_active else 0,
-                    now,
-                    now,
-                    now if is_active else None,
-                ),
+                (account_id, role, fcm_token, int(is_active), now, now, now),
             )
         else:
             conn.execute(
                 """
                 UPDATE fcm_device_tokens
-                SET account_id = ?,
-                    role = ?,
-                    is_active = ?,
-                    updated_at = ?,
-                    last_login_at = CASE
-                        WHEN ? = 1 THEN ?
-                        ELSE last_login_at
-                    END
+                SET account_id = ?, role = ?, is_active = ?, updated_at = ?,
+                    last_login_at = ?
                 WHERE fcm_token = ?
                 """,
-                (
-                    account_id,
-                    role,
-                    1 if is_active else 0,
-                    now,
-                    1 if is_active else 0,
-                    now,
-                    fcm_token,
-                ),
+                (account_id, role, int(is_active), now, now, fcm_token),
             )
         conn.commit()
     finally:
@@ -787,11 +734,9 @@ def _upsert_fcm_token(account_id, role, fcm_token, is_active=True):
 
 
 def _set_fcm_token_active_status(account_id, role, fcm_token, is_active):
-
     fcm_token = (fcm_token or "").strip()
     if not fcm_token:
         return False
-
     conn = _open_db()
     try:
         _ensure_table(conn)
@@ -799,29 +744,12 @@ def _set_fcm_token_active_status(account_id, role, fcm_token, is_active):
         cursor = conn.execute(
             """
             UPDATE fcm_device_tokens
-            SET is_active = ?,
-                updated_at = ?,
-                last_login_at = CASE
-                    WHEN ? = 1 THEN COALESCE(last_login_at, ?)
-                    ELSE last_login_at
-                END,
-                last_logout_at = CASE
-                    WHEN ? = 0 THEN ?
-                    ELSE last_logout_at
-                END
+            SET is_active = ?, updated_at = ?,
+                last_logout_at = CASE WHEN ? = 0 THEN ? ELSE last_logout_at END
             WHERE account_id = ? AND role = ? AND fcm_token = ?
             """,
-            (
-                1 if is_active else 0,
-                now,
-                1 if is_active else 0,
-                now,
-                1 if is_active else 0,
-                now,
-                account_id,
-                role,
-                fcm_token,
-            ),
+            (int(is_active), now, int(is_active), now,
+             account_id, role, fcm_token),
         )
         conn.commit()
         return cursor.rowcount > 0
@@ -829,159 +757,88 @@ def _set_fcm_token_active_status(account_id, role, fcm_token, is_active):
         conn.close()
 
 
+def _active_fcm_tokens():
+    conn = _open_db()
+    try:
+        _ensure_table(conn)
+        return [
+            row[0]
+            for row in conn.execute(
+                """
+                SELECT t.fcm_token
+                FROM fcm_device_tokens AS t
+                INNER JOIN auth_accounts AS a ON a.id = t.account_id
+                WHERE t.is_active = 1 AND t.role = a.role
+                """
+            ).fetchall()
+            if row[0]
+        ]
+    finally:
+        conn.close()
+
+
+def _is_invalid_fcm_error(error):
+    text = str(error).lower()
+    return any(marker in text for marker in (
+        "registration-token-not-registered",
+        "invalid-registration-token",
+        "not-registered",
+        "unregistered",
+    ))
+
+
 def _mark_fcm_token_inactive(fcm_token):
-
-    fcm_token = (fcm_token or "").strip()
-    if not fcm_token:
-        return
-
     conn = _open_db()
     try:
         _ensure_table(conn)
         conn.execute(
             """
             UPDATE fcm_device_tokens
-            SET is_active = 0,
-                updated_at = ?,
-                last_logout_at = ?
+            SET is_active = 0, updated_at = ?, last_logout_at = ?
             WHERE fcm_token = ?
             """,
-            (
-                time.time(),
-                time.time(),
-                fcm_token,
-            ),
+            (time.time(), time.time(), fcm_token),
         )
         conn.commit()
     finally:
         conn.close()
 
 
-def _active_fcm_token_rows(role=None):
-
-    conn = _open_db()
-    try:
-        _ensure_table(conn)
-        if role:
-            rows = conn.execute(
-                """
-                SELECT t.fcm_token, t.account_id, t.role
-                FROM fcm_device_tokens AS t
-                INNER JOIN auth_accounts AS a ON a.id = t.account_id
-                WHERE t.is_active = 1 AND t.role = ? AND a.role = ?
-                ORDER BY t.updated_at DESC, t.id DESC
-                """,
-                (role, role),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                """
-                SELECT t.fcm_token, t.account_id, t.role
-                FROM fcm_device_tokens AS t
-                INNER JOIN auth_accounts AS a ON a.id = t.account_id
-                WHERE t.is_active = 1
-                ORDER BY t.updated_at DESC, t.id DESC
-                """,
-            ).fetchall()
-        return rows
-    finally:
-        conn.close()
-
-
-def _chunked(items, size=500):
-
-    for index in range(0, len(items), size):
-        yield items[index:index + size]
-
-
-def _is_invalid_fcm_error(error):
-
-    text = str(error).lower()
-    invalid_markers = (
-        "registration-token-not-registered",
-        "registration token is not a valid fcm registration token",
-        "requested entity was not found",
-        "invalid registration token",
-        "not-registered",
-        "unregistered",
-        "messaging/invalid-registration-token",
-    )
-    return any(marker in text for marker in invalid_markers)
-
-
-def _send_fcm_to_active_tokens(
-    title,
-    body,
-    data,
-    image_url=None,
-    role=None,
-):
-
-    rows = _active_fcm_token_rows(role=role)
-    tokens = [row[0] for row in rows if row and row[0]]
+def _send_fcm_to_active_tokens(title, body, data, image_url=None):
+    tokens = _active_fcm_tokens()
     if not tokens:
-        return {
-            "success": True,
-            "sent": 0,
-            "invalid_tokens": [],
-        }
+        print("[WARNING] FCM notification skipped: no active device tokens.")
+        return {"success": True, "sent": 0, "invalid_tokens": []}
 
-    invalid_tokens = []
-    sent = 0
-    android_config = messaging.AndroidConfig(priority="high")
     notification = messaging.Notification(
         title=title,
         body=body,
         image=image_url if image_url else None,
     )
-    for token_batch in _chunked(tokens, 500):
-        message = messaging.MulticastMessage(
-            notification=notification,
-            android=android_config,
-            data={key: str(value) for key, value in data.items()},
-            tokens=token_batch,
-        )
+    sent = 0
+    invalid_tokens = []
+    for token in tokens:
         try:
-            if hasattr(messaging, "send_each_for_multicast"):
-                response = messaging.send_each_for_multicast(message)
-                sent += int(getattr(response, "success_count", 0))
-                for token, response_item in zip(token_batch, response.responses):
-                    if not getattr(response_item, "success", False):
-                        error = getattr(response_item, "exception", None)
-                        if error is not None and _is_invalid_fcm_error(error):
-                            invalid_tokens.append(token)
-            else:
-                for token in token_batch:
-                    try:
-                        messaging.send(
-                            messaging.Message(
-                                notification=notification,
-                                android=android_config,
-                                data={key: str(value) for key, value in data.items()},
-                                token=token,
-                            )
-                        )
-                        sent += 1
-                    except Exception as error:
-                        if _is_invalid_fcm_error(error):
-                            invalid_tokens.append(token)
-                        print(
-                            f"[WARNING] FCM send failed for token: {error}"
-                        )
-        except Exception as error:
-            print(
-                f"[ERROR] FCM multicast send failed: {error}"
+            messaging.send(
+                messaging.Message(
+                    notification=notification,
+                    data={key: str(value) for key, value in (data or {}).items()},
+                    token=token,
+                )
             )
-            continue
+            sent += 1
+        except Exception as error:
+            print(f"[WARNING] FCM send failed for token: {error}")
+            if _is_invalid_fcm_error(error):
+                invalid_tokens.append(token)
 
     for token in invalid_tokens:
         _mark_fcm_token_inactive(token)
-
-    return {
-        "success": True,
-        "sent": sent,
-        "invalid_tokens": invalid_tokens,
-    }
+    print(
+        f"[INFO] FCM notification complete: active recipients={len(tokens)}, "
+        f"sent={sent}, invalid={len(invalid_tokens)}."
+    )
+    return {"success": True, "sent": sent, "invalid_tokens": invalid_tokens}
 
 
 def _embedding_blob(embedding):
@@ -1450,17 +1307,6 @@ def load_known_faces():
     )
 
 
-def initialize_auth_accounts():
-
-    conn = _open_db()
-    try:
-        _ensure_table(conn)
-        _bootstrap_auth_accounts(conn)
-        conn.commit()
-    finally:
-        conn.close()
-
-
 def recognize_face(face):
 
     if not known_embeddings:
@@ -1882,6 +1728,7 @@ def push_alert(
     # --------------------------------------------------------
 
     try:
+
         response = _send_fcm_to_active_tokens(
             title="New Person Detected",
             body=message,
@@ -1893,11 +1740,7 @@ def push_alert(
                 "gate": gate_name,
                 "image_url": image_url,
             },
-            image_url=(
-                image_url
-                if image_url
-                else None
-            ),
+            image_url=image_url or None,
         )
 
         print(
@@ -1933,6 +1776,16 @@ def initialize_detection_events():
         dedup_seconds=EXIT_CONFIRM_SECONDS,
         exit_frame_offset=EXIT_FRAME_OFFSET,
     )
+
+
+def initialize_auth_accounts():
+    conn = _open_db()
+    try:
+        _ensure_table(conn)
+        _bootstrap_auth_accounts(conn)
+        conn.commit()
+    finally:
+        conn.close()
 
 
 # ============================================================
@@ -3406,93 +3259,58 @@ def api_delete_person(registration_id):
 # ============================================================
 
 def _auth_login_response(role, account_row, fcm_token):
-
     account_id = int(account_row[0])
-    username = account_row[2]
     _upsert_fcm_token(account_id, role, fcm_token, is_active=True)
     payload = {
         "success": True,
         "message": "Login successful",
         "role": role,
-        "username": username,
+        "username": account_row[2],
         "account_id": account_id,
         "fcm_token": fcm_token,
     }
-    if role == "admin":
-        payload["admin_id"] = account_id
-    else:
-        payload["user_id"] = account_id
+    payload["admin_id" if role == "admin" else "user_id"] = account_id
     return jsonify(payload), 200
+
+
+def _auth_login(role):
+    payload = _json_or_form_payload()
+    username = str(payload.get("username", "")).strip()
+    password = str(payload.get("password", "")).strip()
+    fcm_token = str(payload.get("fcm_token", "")).strip()
+    if not username or not password or not fcm_token:
+        return jsonify({
+            "success": False,
+            "message": "username, password and fcm_token are required",
+        }), 400
+    account = _auth_account_by_credentials(role, username, password)
+    if account is None:
+        return jsonify({
+            "success": False,
+            "message": f"Invalid {role} credentials",
+        }), 401
+    return _auth_login_response(role, account, fcm_token)
 
 
 @app.route("/api/admin/login", methods=["POST"])
 def api_admin_login():
-
-    payload = _json_or_form_payload()
-    username = str(payload.get("username", "")).strip()
-    password = str(payload.get("password", "")).strip()
-    fcm_token = str(payload.get("fcm_token", "")).strip()
-
-    if not username or not password:
-        return jsonify({
-            "success": False,
-            "message": "username and password are required",
-        }), 400
-    if not fcm_token:
-        return jsonify({
-            "success": False,
-            "message": "fcm_token is required",
-        }), 400
-
-    account = _auth_account_by_credentials("admin", username, password)
-    if account is None:
-        return jsonify({
-            "success": False,
-            "message": "Invalid admin credentials",
-        }), 401
-
-    return _auth_login_response("admin", account, fcm_token)
+    return _auth_login("admin")
 
 
 @app.route("/api/user/login", methods=["POST"])
 def api_user_login():
+    return _auth_login("user")
 
+
+def _auth_logout(role, id_field):
     payload = _json_or_form_payload()
-    username = str(payload.get("username", "")).strip()
-    password = str(payload.get("password", "")).strip()
+    account_id = payload.get(id_field)
     fcm_token = str(payload.get("fcm_token", "")).strip()
-
-    if not username or not password:
+    if account_id is None or not fcm_token:
         return jsonify({
             "success": False,
-            "message": "username and password are required",
+            "message": f"{id_field} and fcm_token are required",
         }), 400
-    if not fcm_token:
-        return jsonify({
-            "success": False,
-            "message": "fcm_token is required",
-        }), 400
-
-    account = _auth_account_by_credentials("user", username, password)
-    if account is None:
-        return jsonify({
-            "success": False,
-            "message": "Invalid user credentials",
-        }), 401
-
-    return _auth_login_response("user", account, fcm_token)
-
-
-def _auth_logout(role, id_field, account_id):
-
-    payload = _json_or_form_payload()
-    fcm_token = str(payload.get("fcm_token", "")).strip()
-    if not fcm_token:
-        return jsonify({
-            "success": False,
-            "message": "fcm_token is required",
-        }), 400
-
     try:
         account_id = int(account_id)
     except (TypeError, ValueError):
@@ -3500,21 +3318,18 @@ def _auth_logout(role, id_field, account_id):
             "success": False,
             "message": f"{id_field} must be a valid integer",
         }), 400
-
-    account = _auth_account_by_id(role, account_id)
-    if account is None:
+    if _auth_account_by_id(role, account_id) is None:
         return jsonify({
             "success": False,
             "message": f"{id_field} not found",
         }), 404
-
-    updated = _set_fcm_token_active_status(account_id, role, fcm_token, False)
-    if not updated:
+    if not _set_fcm_token_active_status(
+        account_id, role, fcm_token, is_active=False
+    ):
         return jsonify({
             "success": False,
             "message": "Matching active device token not found",
         }), 404
-
     return jsonify({
         "success": True,
         "message": "Logout successful",
@@ -3527,24 +3342,12 @@ def _auth_logout(role, id_field, account_id):
 
 @app.route("/api/admin/logout", methods=["POST"])
 def api_admin_logout():
-
-    payload = _json_or_form_payload()
-    return _auth_logout(
-        "admin",
-        "admin_id",
-        payload.get("admin_id"),
-    )
+    return _auth_logout("admin", "admin_id")
 
 
 @app.route("/api/user/logout", methods=["POST"])
 def api_user_logout():
-
-    payload = _json_or_form_payload()
-    return _auth_logout(
-        "user",
-        "user_id",
-        payload.get("user_id"),
-    )
+    return _auth_logout("user", "user_id")
 
 
 # ============================================================
@@ -3984,9 +3787,7 @@ def main():
         f"{PUBLIC_BASE_URL}/alerts/"
     )
 
-    print(
-        "[INFO] FCM delivery: active login devices only"
-    )
+    print("[INFO] FCM delivery: active login devices only")
 
     print(
         "[INFO] Socket.IO events: "
