@@ -12,13 +12,15 @@ from firebase_admin import messaging
 
 class DetectionEventManager:
     def __init__(self, database, image_dir, public_base_url, socketio,
-                 firebase_topic, dedup_seconds=10.0, exit_frame_offset=5):
+                 firebase_topic=None, fcm_sender=None,
+                 dedup_seconds=10.0, exit_frame_offset=5):
         self.database = database
         self.image_dir = Path(image_dir)
         self.image_dir.mkdir(parents=True, exist_ok=True)
         self.public_base_url = public_base_url.rstrip("/")
         self.socketio = socketio
         self.firebase_topic = firebase_topic
+        self.fcm_sender = fcm_sender
         self.exit_confirm_seconds = max(0.1, float(dedup_seconds))
         self.exit_frame_offset = max(0, int(exit_frame_offset))
         self.active_person_events = []
@@ -135,7 +137,15 @@ class DetectionEventManager:
     def _notify(self, event):
         image_url = event["image_url"]
         data = {key: str(value) for key, value in {"type": event["detection_type"], "detection_id": event["id"], "gate": event["gate_name"], "image_url": image_url, "confidence": event.get("confidence", ""), "unknown_count": event.get("unknown_count", ""), "detected_at": event["detected_at"]}.items()}
-        messaging.send(messaging.Message(notification=messaging.Notification(title=event["title"], body=event["message"], image=image_url), android=messaging.AndroidConfig(priority="high"), data=data, topic=self.firebase_topic))
+        if self.fcm_sender is not None:
+            self.fcm_sender(
+                title=event["title"],
+                body=event["message"],
+                data=data,
+                image_url=image_url,
+            )
+            return
+        print("[WARNING] No FCM sender configured; notification skipped.")
 
     def _publish(self, event, image, notify):
         event["image_url"] = self._save_image(image)
