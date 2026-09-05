@@ -888,6 +888,36 @@ def _active_fcm_token_rows(role=None):
         conn.close()
 
 
+def _all_fcm_token_rows(role=None):
+
+    conn = _open_db()
+    try:
+        _ensure_table(conn)
+        if role:
+            rows = conn.execute(
+                """
+                SELECT t.fcm_token, t.account_id, t.role
+                FROM fcm_device_tokens AS t
+                INNER JOIN auth_accounts AS a ON a.id = t.account_id
+                WHERE t.role = ? AND a.role = ?
+                ORDER BY t.updated_at DESC, t.id DESC
+                """,
+                (role, role),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT t.fcm_token, t.account_id, t.role
+                FROM fcm_device_tokens AS t
+                INNER JOIN auth_accounts AS a ON a.id = t.account_id
+                ORDER BY t.updated_at DESC, t.id DESC
+                """,
+            ).fetchall()
+        return rows
+    finally:
+        conn.close()
+
+
 def _chunked(items, size=500):
 
     for index in range(0, len(items), size):
@@ -918,6 +948,81 @@ def _send_fcm_to_active_tokens(
 ):
 
     rows = _active_fcm_token_rows(role=role)
+    tokens = [row[0] for row in rows if row and row[0]]
+    if not tokens:
+        return {
+            "success": True,
+            "sent": 0,
+            "invalid_tokens": [],
+        }
+
+    invalid_tokens = []
+    sent = 0
+    android_config = messaging.AndroidConfig(priority="high")
+    notification = messaging.Notification(
+        title=title,
+        body=body,
+        image=image_url if image_url else None,
+    )
+    for token_batch in _chunked(tokens, 500):
+        message = messaging.MulticastMessage(
+            notification=notification,
+            android=android_config,
+            data={key: str(value) for key, value in data.items()},
+            tokens=token_batch,
+        )
+        try:
+            if hasattr(messaging, "send_each_for_multicast"):
+                response = messaging.send_each_for_multicast(message)
+                sent += int(getattr(response, "success_count", 0))
+                for token, response_item in zip(token_batch, response.responses):
+                    if not getattr(response_item, "success", False):
+                        error = getattr(response_item, "exception", None)
+                        if error is not None and _is_invalid_fcm_error(error):
+                            invalid_tokens.append(token)
+            else:
+                for token in token_batch:
+                    try:
+                        messaging.send(
+                            messaging.Message(
+                                notification=notification,
+                                android=android_config,
+                                data={key: str(value) for key, value in data.items()},
+                                token=token,
+                            )
+                        )
+                        sent += 1
+                    except Exception as error:
+                        if _is_invalid_fcm_error(error):
+                            invalid_tokens.append(token)
+                        print(
+                            f"[WARNING] FCM send failed for token: {error}"
+                        )
+        except Exception as error:
+            print(
+                f"[ERROR] FCM multicast send failed: {error}"
+            )
+            continue
+
+    for token in invalid_tokens:
+        _mark_fcm_token_inactive(token)
+
+    return {
+        "success": True,
+        "sent": sent,
+        "invalid_tokens": invalid_tokens,
+    }
+
+
+def _send_fcm_to_all_tokens(
+    title,
+    body,
+    data,
+    image_url=None,
+    role=None,
+):
+
+    rows = _all_fcm_token_rows(role=role)
     tokens = [row[0] for row in rows if row and row[0]]
     if not tokens:
         return {
@@ -1882,7 +1987,7 @@ def push_alert(
     # --------------------------------------------------------
 
     try:
-        response = _send_fcm_to_active_tokens(
+        response = _send_fcm_to_all_tokens(
             title="New Person Detected",
             body=message,
             data={
@@ -1929,7 +2034,7 @@ def initialize_detection_events():
         public_base_url=PUBLIC_BASE_URL,
         socketio=socketio,
         firebase_topic=None,
-        fcm_sender=_send_fcm_to_active_tokens,
+        fcm_sender=_send_fcm_to_all_tokens,
         dedup_seconds=EXIT_CONFIRM_SECONDS,
         exit_frame_offset=EXIT_FRAME_OFFSET,
     )
@@ -3985,7 +4090,7 @@ def main():
     )
 
     print(
-        "[INFO] FCM delivery: active login devices only"
+        "[INFO] FCM delivery: all registered devices"
     )
 
     print(
