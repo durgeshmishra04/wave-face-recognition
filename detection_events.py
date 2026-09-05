@@ -7,6 +7,7 @@ from collections import deque
 from pathlib import Path
 
 import cv2
+import numpy as np
 from firebase_admin import messaging
 
 
@@ -44,6 +45,38 @@ class DetectionEventManager:
         union = max(0, a[2] - a[0]) * max(0, a[3] - a[1]) + max(0, b[2] - b[0]) * max(0, b[3] - b[1]) - intersection
         return intersection / union if union else 0.0
 
+    @staticmethod
+    def _buffer_frame(frame):
+        """
+        Compress frame before storing it in the tracking buffer.
+        """
+        success, encoded = cv2.imencode(
+            ".jpg",
+            frame,
+            [cv2.IMWRITE_JPEG_QUALITY, 75]
+        )
+
+        if not success:
+            raise RuntimeError("Could not encode tracking frame")
+
+        return encoded.tobytes()
+
+    @staticmethod
+    def _decode_buffered_frame(frame_data):
+        if isinstance(frame_data, bytes):
+            frame = cv2.imdecode(
+                np.frombuffer(frame_data, dtype=np.uint8),
+                cv2.IMREAD_COLOR
+            )
+
+            if frame is None:
+                raise RuntimeError("Could not decode buffered frame")
+
+            return frame
+
+        # Backward compatibility
+        return frame_data.copy()
+
     def _match_track(self, tracks, category, box):
         center, best, best_score = self._center(box), None, -1.0
         for track in tracks:
@@ -79,7 +112,12 @@ class DetectionEventManager:
             track["event"]["vehicle_context_detected"] = True
         if track.get("suppress_notify"):
             track["event"]["suppress_notify"] = True
-        track["frames"].append({"frame": frame.copy(), "event": track["event"].copy()})
+        try:
+            buffered_frame = self._buffer_frame(frame)
+        except Exception as error:
+            print(f"[ERROR] Could not buffer tracking frame: {error}")
+            return
+        track["frames"].append({"frame": buffered_frame, "event": track["event"].copy()})
 
     def _save_image(self, frame):
         filename = f"{uuid.uuid4()}.jpg"
@@ -198,7 +236,11 @@ class DetectionEventManager:
             event["title"] = "Unknown Person Detected at Vehicle" if count == 1 else "Unknown Persons Detected at Vehicle"
             event["message"] = f"Unknown person detected at vehicle at {gate_name}" if count == 1 else f"{count} unknown persons detected at vehicle at {gate_name}"
             event["vehicle_context_detected"] = True
-        image = chosen["frame"].copy()
+        try:
+            image = self._decode_buffered_frame(chosen["frame"])
+        except Exception as error:
+            print(f"[ERROR] Could not decode tracking frame: {error}")
+            return None
         for item, _ in unknowns:
             marked = item["event"].copy()
             marked["unknown_count"] = count
@@ -234,8 +276,13 @@ class DetectionEventManager:
         # confirmation frame (rather than merely the fifth prior detection).
         for track in self.active_person_events + self.active_vehicle_events:
             if not track["matched_this_frame"]:
+                try:
+                    buffered_frame = self._buffer_frame(annotated)
+                except Exception as error:
+                    print(f"[ERROR] Could not buffer tracking frame: {error}")
+                    continue
                 track["frames"].append({
-                    "frame": annotated.copy(),
+                    "frame": buffered_frame,
                     "event": track["event"].copy(),
                 })
         people = self._finalize_expired(self.active_person_events, detected_at)
@@ -263,10 +310,20 @@ class DetectionEventManager:
         for track, chosen in people:
             if track["known_detected_once"]:
                 event = track["event"].copy(); event["detected_at"] = detected_at
-                self._draw_event(chosen["frame"], event)
-                records.append(self._publish(event, chosen["frame"], notify=False))
+                try:
+                    image = self._decode_buffered_frame(chosen["frame"])
+                except Exception as error:
+                    print(f"[ERROR] Could not decode tracking frame: {error}")
+                    continue
+                self._draw_event(image, event)
+                records.append(self._publish(event, image, notify=False))
         for track, chosen in vehicles:
             event = track["event"].copy(); event["detected_at"] = detected_at
-            self._draw_event(chosen["frame"], event)
-            records.append(self._publish(event, chosen["frame"], notify=not track.get("suppress_notify", False)))
+            try:
+                image = self._decode_buffered_frame(chosen["frame"])
+            except Exception as error:
+                print(f"[ERROR] Could not decode tracking frame: {error}")
+                continue
+            self._draw_event(image, event)
+            records.append(self._publish(event, image, notify=not track.get("suppress_notify", False)))
         return records
