@@ -281,6 +281,9 @@ camera_states = {}
 camera_event_managers = {}
 camera_state_lock = threading.Lock()
 camera_manager = None
+camera_captures = {}
+camera_capture_lock = threading.Lock()
+shutdown_started = False
 
 known_embeddings = {}
 # Metadata for registration folders. Legacy folders retain their folder name
@@ -403,6 +406,14 @@ def _set_camera_state(camera_id, **updates):
         return
     with state["lock"]:
         state.update(updates)
+
+
+def _release_camera_capture(camera_id):
+    with camera_capture_lock:
+        cap = camera_captures.pop(camera_id, None)
+    if cap is not None:
+        cap.release()
+        _camera_log(camera_id, "RTSP released")
 
 
 # ============================================================
@@ -2268,6 +2279,7 @@ def camera_worker(camera_config):
 
     while not shutdown_event.is_set():
 
+        cap = None
         try:
 
             rtsp_url = build_rtsp_url(camera_config)
@@ -2284,6 +2296,8 @@ def camera_worker(camera_config):
                     10000,
                 ]
             )
+            with camera_capture_lock:
+                camera_captures[camera_id] = cap
 
 
             if not cap.isOpened():
@@ -2296,8 +2310,9 @@ def camera_worker(camera_config):
                     latest_update_at=time.time(),
                 )
                 _camera_log(camera_id, "Could not open RTSP stream.")
+                _release_camera_capture(camera_id)
 
-                time.sleep(5)
+                shutdown_event.wait(5)
 
                 continue
 
@@ -3294,7 +3309,8 @@ def camera_worker(camera_config):
                         )
 
 
-            cap.release()
+            if cap is not None:
+                _release_camera_capture(camera_id)
 
 
         except Exception as e:
@@ -3311,7 +3327,9 @@ def camera_worker(camera_config):
 
             _camera_log(camera_id, f"[ERROR] Camera worker: {e}")
 
-            time.sleep(5)
+            if cap is not None:
+                _release_camera_capture(camera_id)
+            shutdown_event.wait(5)
 
 
 # ============================================================
@@ -4287,6 +4305,7 @@ def leave_camera(payload):
 def main():
 
     global camera_manager
+    global shutdown_started
 
     print("=" * 60)
 
@@ -4336,12 +4355,22 @@ def main():
         _enabled_cameras(),
         camera_worker,
         shutdown_event=shutdown_event,
+        release_resources=_release_camera_capture,
     )
     camera_manager.start()
 
     def _shutdown_handler(signum, frame):
-        camera_manager.stop()
+        global shutdown_started
+        if shutdown_started:
+            return
+        shutdown_started = True
         print(f"[INFO] Shutdown signal received: {signum}")
+        shutdown_event.set()
+        print("[INFO] Stopping camera workers...")
+        camera_manager.stop_all(timeout=5)
+        # Returning from a custom signal handler would leave socketio.run()
+        # serving. Let main() unwind it through the normal exception path.
+        raise KeyboardInterrupt
 
     signal.signal(signal.SIGINT, _shutdown_handler)
     signal.signal(signal.SIGTERM, _shutdown_handler)
@@ -4384,16 +4413,24 @@ def main():
     print()
 
 
-    socketio.run(
-        app,
-        host=HOST,
-        port=PORT,
-        debug=False,
-        use_reloader=False,
-        allow_unsafe_werkzeug=True
-    )
+    try:
+        socketio.run(
+            app,
+            host=HOST,
+            port=PORT,
+            debug=False,
+            use_reloader=False,
+            allow_unsafe_werkzeug=True
+        )
+    except KeyboardInterrupt:
+        pass
 
-    camera_manager.stop()
+    if not shutdown_started:
+        shutdown_started = True
+        shutdown_event.set()
+        print("[INFO] Stopping camera workers...")
+        camera_manager.stop_all(timeout=5)
+    print("[INFO] Flask/Socket.IO shutdown complete")
 
 
 # ============================================================
