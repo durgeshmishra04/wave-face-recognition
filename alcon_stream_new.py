@@ -2270,6 +2270,7 @@ def camera_worker(camera_config):
     last_detection_log_time = 0.0
 
     last_emit_time = 0.0
+    last_frame_diagnostic_time = 0.0
 
     emit_interval = (
         1.0 /
@@ -3260,6 +3261,15 @@ def camera_worker(camera_config):
                             encoded.tobytes()
                         )
 
+                        if now - last_frame_diagnostic_time >= 5.0:
+                            _camera_log(
+                                camera_id,
+                                f"Frame generated: {width}x{height}, "
+                                f"jpeg={len(encoded_bytes) // 1024}KB, "
+                                f"base64={((len(encoded_bytes) + 2) // 3) * 4} chars",
+                            )
+                            last_frame_diagnostic_time = now
+
 
                         if state is not None:
                             with state["lock"]:
@@ -3916,6 +3926,8 @@ def api_status():
             "camera_id": snapshot["camera_id"],
             "camera_name": snapshot["camera_name"],
             "status": snapshot["status"],
+            "frame_available": snapshot["frame"] is not None,
+            "frame_bytes": len(snapshot["frame"] or b""),
             "connected_clients":
                 connected_clients,
             "known_faces_count":
