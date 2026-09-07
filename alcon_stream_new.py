@@ -3906,6 +3906,64 @@ def known_face_image(storage_key, filename):
 # REST API
 # ============================================================
 
+def _camera_api_status(camera):
+    if not camera.get("enabled", False):
+        return "disabled"
+
+    snapshot = _camera_snapshot(camera["camera_id"])
+    raw_status = snapshot["status"] if snapshot else "Starting..."
+    if raw_status == "LIVE":
+        return "online"
+    if raw_status == "Starting...":
+        return "connecting"
+    if raw_status.startswith("Error:"):
+        return "error"
+    if raw_status.startswith("Stream lost") or raw_status.startswith("RTSP connection"):
+        return "offline"
+    return raw_status.lower()
+
+
+def _camera_api_payload(camera):
+    return {
+        "camera_id": camera["camera_id"],
+        "name": camera["name"],
+        "kpi": camera.get("kpi", "person"),
+        "channel": camera.get("channel"),
+        "status": _camera_api_status(camera),
+        "enabled": bool(camera.get("enabled", False)),
+    }
+
+
+@app.route("/api/cameras", methods=["GET"])
+def api_cameras():
+    return jsonify({
+        "success": True,
+        "cameras": [
+            _camera_api_payload(camera)
+            for camera in CAMERAS
+        ],
+    })
+
+
+@app.route("/api/cameras/<camera_id>", methods=["GET"])
+def api_camera(camera_id):
+    camera = next(
+        (
+            item for item in CAMERAS
+            if item["camera_id"].lower() == camera_id.lower()
+        ),
+        None,
+    )
+    if camera is None:
+        return jsonify({
+            "success": False,
+            "message": "Camera not found",
+        }), 404
+    return jsonify({
+        "success": True,
+        "camera": _camera_api_payload(camera),
+    })
+
 @app.route(
     "/api/status",
     methods=["GET"]
