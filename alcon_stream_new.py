@@ -14,6 +14,7 @@ import hashlib
 import io
 import uuid
 import shutil
+import signal
 from collections import deque
 from types import SimpleNamespace
 
@@ -32,11 +33,12 @@ except ImportError:
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
-from flask_socketio import SocketIO
+from flask_socketio import SocketIO, join_room, leave_room
 
 from insightface.app import FaceAnalysis
 from detection_database import DetectionDatabase
 from detection_events import DetectionEventManager
+from camera.manager import CameraManager
 
 
 # ============================================================
@@ -50,14 +52,12 @@ load_dotenv()
 # CONFIGURATION
 # ============================================================
 
-NVR_IP = "115.247.225.82"
+DEFAULT_NVR_IP = os.getenv("NVR_IP", "115.247.225.82")
 NVR_USERNAME = "admin"
 NVR_PASSWORD = os.getenv("ALCON_PASSWORD", "")
 
 RTSP_PORT = 554
 NVR_HTTP_PORT = int(os.getenv("NVR_HTTP_PORT", "80"))
-CHANNEL = 1
-SUBTYPE = 1
 RTSP_PATH = "/cam/realmonitor"
 
 RECOGNITION_THRESHOLD = 0.50
@@ -103,6 +103,65 @@ KNOWN_FACES_DIR = PROJECT_DIR / "known_faces"
 
 HOST = "0.0.0.0"
 PORT = 5000
+
+CAMERA_CONFIG_PATH = PROJECT_DIR / "config" / "cameras.json"
+
+
+def _load_camera_config():
+    """Load camera identity/config without changing the existing pipeline."""
+    with CAMERA_CONFIG_PATH.open("r", encoding="utf-8") as config_file:
+        configured = json.load(config_file)
+
+    cameras = []
+    for item in configured:
+        camera_id = str(item["camera_id"]).strip()
+        if not camera_id or any(
+            camera_id == existing["camera_id"] for existing in cameras
+        ):
+            raise ValueError(f"Duplicate or empty camera_id: {camera_id!r}")
+        cameras.append({
+            "camera_id": camera_id,
+            "name": str(item["name"]).strip(),
+            # Preserve the existing NVR/channel RTSP flow.
+            "nvr_ip": os.getenv(
+                f"{camera_id}_NVR_IP",
+                item.get("nvr_ip", DEFAULT_NVR_IP),
+            ),
+            "channel": int(os.getenv(
+                f"{camera_id}_CHANNEL", str(item.get("channel", 1))
+            )),
+            "subtype": int(os.getenv(
+                f"{camera_id}_SUBTYPE", str(item.get("subtype", 1))
+            )),
+            "kpi": str(item.get("kpi", "person")).strip().lower(),
+            "enabled": os.getenv(
+                f"{camera_id}_ENABLED",
+                "true" if item.get("enabled", True) else "false",
+            ).strip().lower() not in {"false", "0", "no", "off"},
+        })
+
+    enabled_override = os.getenv("ENABLED_CAMERAS", "").strip()
+    if enabled_override:
+        selected = {
+            value.strip().upper()
+            for value in enabled_override.split(",")
+            if value.strip()
+        }
+        if selected != {"ALL"}:
+            known_ids = {camera["camera_id"] for camera in cameras}
+            unknown = selected - known_ids
+            if unknown:
+                raise ValueError(
+                    "Unknown camera IDs in ENABLED_CAMERAS: "
+                    + ", ".join(sorted(unknown))
+                )
+            for camera in cameras:
+                camera["enabled"] = camera["camera_id"] in selected
+
+    return cameras
+
+
+CAMERAS = _load_camera_config()
 
 
 # ============================================================
@@ -217,6 +276,11 @@ latest_annotated_frame = None
 
 camera_running = True
 camera_status = "Starting..."
+shutdown_event = threading.Event()
+camera_states = {}
+camera_event_managers = {}
+camera_state_lock = threading.Lock()
+camera_manager = None
 
 known_embeddings = {}
 # Metadata for registration folders. Legacy folders retain their folder name
@@ -235,6 +299,110 @@ last_alert_time = 0.0
 alert_history = deque(maxlen=MAX_ALERT_HISTORY)
 
 connected_clients = 0
+
+
+def _enabled_cameras():
+
+    return [
+        camera
+        for camera in CAMERAS
+        if camera.get("enabled", True)
+    ]
+
+
+def _default_camera():
+
+    cameras = _enabled_cameras()
+
+    if cameras:
+        return cameras[0]
+
+    return CAMERAS[0]
+
+
+def _camera_room(camera_id):
+
+    return f"camera:{camera_id}"
+
+
+def _camera_log(camera_id, message):
+
+    print(f"[{camera_id}] {message}")
+
+
+def _create_camera_state(camera_config):
+
+    now = time.time()
+
+    return {
+        "camera_id": camera_config["camera_id"],
+        "camera_name": camera_config["name"],
+        "status": "Starting...",
+        "latest_annotated_frame": None,
+        "latest_frame_timestamp": 0.0,
+        "frame_counter": 0,
+        "connected": False,
+        "processing": False,
+        "fps": 0.0,
+        "unknown_present": False,
+        "unknown_first_seen": 0.0,
+        "unknown_last_seen": 0.0,
+        "last_alert_time": 0.0,
+        "latest_update_at": now,
+        "lock": threading.Lock(),
+    }
+
+
+def _camera_state(camera_id):
+
+    return camera_states.get(camera_id)
+
+
+def _camera_snapshot(camera_id=None):
+
+    camera_id = camera_id or _default_camera()["camera_id"]
+    state = _camera_state(camera_id)
+    if state is None:
+        return None
+    with state["lock"]:
+        frame = state["latest_annotated_frame"]
+        status = state["status"]
+        camera_name = state["camera_name"]
+        timestamp = state["latest_frame_timestamp"]
+    return {
+        "camera_id": camera_id,
+        "camera_name": camera_name,
+        "status": status,
+        "timestamp": timestamp,
+        "frame": frame,
+    }
+
+
+def initialize_camera_states():
+
+    global camera_states
+
+    camera_states = {}
+
+    for camera_config in _enabled_cameras():
+        camera_states[camera_config["camera_id"]] = _create_camera_state(
+            camera_config
+        )
+
+    if not camera_states:
+        default_camera = _default_camera()
+        camera_states[default_camera["camera_id"]] = _create_camera_state(
+            default_camera
+        )
+
+
+def _set_camera_state(camera_id, **updates):
+
+    state = camera_states.get(camera_id)
+    if state is None:
+        return
+    with state["lock"]:
+        state.update(updates)
 
 
 # ============================================================
@@ -279,10 +447,10 @@ def initialize_firebase():
 # RTSP URL
 # ============================================================
 
-def configure_h264_stream():
+def configure_h264_stream(camera_config):
 
     config_url = (
-        f"http://{NVR_IP}:{NVR_HTTP_PORT}/cgi-bin/configManager.cgi?"
+        f"http://{camera_config['nvr_ip']}:{NVR_HTTP_PORT}/cgi-bin/configManager.cgi?"
         + urlencode({
             "action": "setConfig",
             "Encode[0].MainFormat[0].Video.Codec": "H.264",
@@ -306,11 +474,11 @@ def configure_h264_stream():
             result = response.read().decode("utf-8", errors="replace")
         if "OK" not in result.upper():
             raise RuntimeError(result.strip() or "Camera rejected H.264 configuration")
-        print("[OK] Camera streams configured to H.264.")
+        _camera_log(camera_config["camera_id"], "Camera streams configured to H.264.")
     except Exception as e:
-        print(f"[WARNING] Could not configure camera to H.264: {e}")
+        _camera_log(camera_config["camera_id"], f"Could not configure camera to H.264: {e}")
 
-def build_rtsp_url():
+def build_rtsp_url(camera_config):
 
     if not NVR_PASSWORD:
 
@@ -330,9 +498,9 @@ def build_rtsp_url():
 
     return (
         f"rtsp://{user}:{password}@"
-        f"{NVR_IP}:{RTSP_PORT}"
+        f"{camera_config['nvr_ip']}:{RTSP_PORT}"
         f"{RTSP_PATH}"
-        f"?channel={CHANNEL}&subtype={SUBTYPE}"
+        f"?channel={camera_config['channel']}&subtype={camera_config['subtype']}"
     )
 
 
@@ -1929,8 +2097,12 @@ def save_alert_image(frame):
 def push_alert(
     message,
     frame,
-    gate_name="Main Gate 01"
+    gate_name=None,
+    camera_id=None,
+    camera_name=None
 ):
+
+    gate_name = gate_name or _default_camera()["name"]
 
     # --------------------------------------------------------
     # Generate ID and save image
@@ -1965,6 +2137,8 @@ def push_alert(
         "time": time.time(),
         "message": message,
         "gate": gate_name,
+        "camera_id": camera_id,
+        "camera_name": camera_name or gate_name,
         "image_url": image_url,
         "type": "person_detected"
     }
@@ -1995,6 +2169,8 @@ def push_alert(
                 "notification_id": notification_id,
                 "title": "New Person Detected",
                 "message": message,
+                "camera_id": camera_id or "",
+                "camera_name": camera_name or gate_name,
                 "gate": gate_name,
                 "image_url": image_url,
             },
@@ -2027,37 +2203,46 @@ def push_alert(
 def initialize_detection_events():
 
     global detection_events
+    global camera_event_managers
 
-    detection_events = DetectionEventManager(
-        database=detection_database,
-        image_dir=ALERT_IMAGE_DIR,
-        public_base_url=PUBLIC_BASE_URL,
-        socketio=socketio,
-        firebase_topic=None,
-        fcm_sender=_send_fcm_to_all_tokens,
-        dedup_seconds=EXIT_CONFIRM_SECONDS,
-        exit_frame_offset=EXIT_FRAME_OFFSET,
-    )
+    camera_event_managers = {}
+
+    for camera_config in _enabled_cameras():
+        camera_event_managers[camera_config["camera_id"]] = DetectionEventManager(
+            database=detection_database,
+            image_dir=ALERT_IMAGE_DIR,
+            public_base_url=PUBLIC_BASE_URL,
+            socketio=socketio,
+            firebase_topic=None,
+            fcm_sender=_send_fcm_to_all_tokens,
+            dedup_seconds=EXIT_CONFIRM_SECONDS,
+            exit_frame_offset=EXIT_FRAME_OFFSET,
+            camera_id=camera_config["camera_id"],
+            camera_name=camera_config["name"],
+        )
+
+    default_camera = _default_camera()["camera_id"]
+    detection_events = camera_event_managers.get(default_camera)
 
 
 # ============================================================
 # CAMERA WORKER
 # ============================================================
 
-def camera_worker():
+def camera_worker(camera_config):
 
-    global camera_status
-
-    global last_alert_time
-
-    global unknown_present
-    global unknown_first_seen
-    global unknown_last_seen
-
-    global latest_annotated_frame
-
+    camera_id = camera_config["camera_id"]
+    camera_name = camera_config["name"]
+    gate_name = camera_name
+    detection_manager = camera_event_managers.get(camera_id)
+    state = camera_states.get(camera_id)
 
     frame_counter = 0
+    camera_status = "Starting..."
+    last_alert_time = 0.0
+    unknown_present = False
+    unknown_first_seen = 0.0
+    unknown_last_seen = 0.0
 
     last_faces = []
     # The person detector only gates face recognition. Final person events
@@ -2081,15 +2266,13 @@ def camera_worker():
     )
 
 
-    while camera_running:
+    while not shutdown_event.is_set():
 
         try:
 
-            rtsp_url = build_rtsp_url()
+            rtsp_url = build_rtsp_url(camera_config)
 
-            print(
-                "[INFO] Connecting to RTSP..."
-            )
+            _camera_log(camera_id, "Connecting to RTSP...")
 
             cap = cv2.VideoCapture(
                 rtsp_url,
@@ -2105,14 +2288,14 @@ def camera_worker():
 
             if not cap.isOpened():
 
-                camera_status = (
-                    "RTSP connection failed"
+                camera_status = "RTSP connection failed"
+                _set_camera_state(
+                    camera_id,
+                    status=camera_status,
+                    connected=False,
+                    latest_update_at=time.time(),
                 )
-
-                print(
-                    "[ERROR] Could not open "
-                    "RTSP stream."
-                )
+                _camera_log(camera_id, "Could not open RTSP stream.")
 
                 time.sleep(5)
 
@@ -2120,15 +2303,18 @@ def camera_worker():
 
 
             camera_status = "LIVE"
-
-            print(
-                "[OK] RTSP stream connected."
+            _set_camera_state(
+                camera_id,
+                status=camera_status,
+                connected=True,
+                latest_update_at=time.time(),
             )
+            _camera_log(camera_id, "RTSP stream connected.")
 
             consecutive_read_failures = 0
 
 
-            while camera_running:
+            while not shutdown_event.is_set():
 
                 ok, frame = cap.read()
 
@@ -2149,15 +2335,14 @@ def camera_worker():
 
                         continue
 
-                    camera_status = (
-                        "Stream lost - "
-                        "reconnecting..."
+                    camera_status = "Stream lost - reconnecting..."
+                    _set_camera_state(
+                        camera_id,
+                        status=camera_status,
+                        connected=False,
+                        latest_update_at=time.time(),
                     )
-
-                    print(
-                        "[WARNING] Frame read "
-                        "failed repeatedly."
-                    )
+                    _camera_log(camera_id, "Frame read failed repeatedly.")
 
                     break
 
@@ -2188,6 +2373,8 @@ def camera_worker():
                         person_boxes = detect_person_boxes(frame)
 
                         if (
+                            camera_config.get("kpi") == "vehicle"
+                            and
                             frame_counter
                             %
                             VEHICLE_PROCESS_EVERY_N_FRAMES
@@ -2203,6 +2390,8 @@ def camera_worker():
                                     frame.shape[0],
                                 )
                             ]
+                        elif camera_config.get("kpi") != "vehicle":
+                            last_vehicles = []
 
                         vehicle_person_boxes = [
                             person_box
@@ -2579,25 +2768,24 @@ def camera_worker():
                                 for vehicle in last_vehicles
                             ) or "none"
 
-                            print(
-                                f"[INFO] Faces detected: "
-                                f"{len(detected_faces)}, "
+                            _camera_log(
+                                camera_id,
+                                f"Faces detected: {len(detected_faces)}, "
                                 f"persons: {len(person_boxes)}, "
                                 f"inside ROI: {len(last_faces)}, "
                                 f"known: {known_count_in_frame}, "
                                 f"unknown: {unknown_count_in_frame}, "
                                 f"two_wheeler: {two_wheeler_count}, "
                                 f"four_wheeler: {four_wheeler_count}, "
-                                f"vehicles: {vehicle_labels}"
+                                f"vehicles: {vehicle_labels}",
                             )
 
                             for vehicle in last_vehicles:
-                                print(
-                                    f"[VEHICLE] Vehicle detected: "
-                                    f"{vehicle['vehicle_type']} "
-                                    f"({vehicle['class_name']}), "
-                                    f"confidence: "
-                                    f"{vehicle['confidence']:.2f}"
+                                _camera_log(
+                                    camera_id,
+                                    f"Vehicle detected: {vehicle['vehicle_type']} "
+                                    f"({vehicle['class_name']}), confidence: "
+                                    f"{vehicle['confidence']:.2f}",
                                 )
 
                             last_detection_log_time = now
@@ -2644,28 +2832,25 @@ def camera_worker():
                                         >= ALERT_DEDUP_TIME
                                     ):
 
-                                        print(
-                                            "[ALERT] Unknown person "
-                                            "detected in ROI."
+                                        _camera_log(camera_id, "Unknown person detected in ROI.")
+
+                                        camera_status = "Unknown person detected"
+                                        _set_camera_state(
+                                            camera_id,
+                                            status=camera_status,
+                                            latest_update_at=time.time(),
                                         )
 
-                                        camera_status = (
-                                            "Unknown person detected"
-                                        )
-
-                                        print(
-                                            "[INFO] Unknown event will be "
-                                            "saved by the detection manager."
-                                        )
+                                        _camera_log(camera_id, "Unknown event will be saved by the detection manager.")
 
                                         last_alert_time = now
 
                                     else:
 
-                                        print(
-                                            "[INFO] Alert suppressed "
-                                            "(duplicate within "
-                                            f"{ALERT_DEDUP_TIME}s window)"
+                                        _camera_log(
+                                            camera_id,
+                                            "Alert suppressed "
+                                            f"(duplicate within {ALERT_DEDUP_TIME}s window)",
                                         )
 
                                     unknown_alert_sent = True
@@ -2700,10 +2885,7 @@ def camera_worker():
 
                     except Exception as e:
 
-                        print(
-                            "[ERROR] Face processing "
-                            f"error: {e}"
-                        )
+                        _camera_log(camera_id, f"[ERROR] Face processing error: {e}")
 
 
                 # ------------------------------------------------
@@ -3009,12 +3191,12 @@ def camera_worker():
                         )
 
 
-                    if detection_events is not None:
-                        detection_events.process_frame(
+                    if detection_manager is not None:
+                        detection_manager.process_frame(
                             frame=send_frame,
                             faces=last_event_people,
                             vehicles=last_vehicles,
-                            gate_name="Main Gate 01",
+                            gate_name=gate_name,
                             detected_at=now,
                             alert_frame=send_frame,
                         )
@@ -3064,11 +3246,17 @@ def camera_worker():
                         )
 
 
-                        with latest_frame_lock:
+                        if state is not None:
+                            with state["lock"]:
+                                state["latest_annotated_frame"] = encoded_bytes
+                                state["latest_frame_timestamp"] = now
+                                state["status"] = camera_status
+                                state["frame_counter"] = frame_counter
+                                state["processing"] = True
+                                state["connected"] = True
 
-                            latest_annotated_frame = (
-                                encoded_bytes
-                            )
+                        with latest_frame_lock:
+                            latest_annotated_frame = encoded_bytes
 
 
                         # ----------------------------------------
@@ -3078,6 +3266,8 @@ def camera_worker():
                         socketio.emit(
                             "face_frame",
                             {
+                                "camera_id": camera_id,
+                                "camera_name": camera_name,
                                 "image":
                                     base64.b64encode(
                                         encoded_bytes
@@ -3112,10 +3302,14 @@ def camera_worker():
             camera_status = (
                 f"Error: {e}"
             )
-
-            print(
-                f"[ERROR] Camera worker: {e}"
+            _set_camera_state(
+                camera_id,
+                status=camera_status,
+                connected=False,
+                latest_update_at=time.time(),
             )
+
+            _camera_log(camera_id, f"[ERROR] Camera worker: {e}")
 
             time.sleep(5)
 
@@ -3690,13 +3884,24 @@ def known_face_image(storage_key, filename):
 )
 def api_status():
 
+    camera_id = request.args.get("camera_id", "").strip() or _default_camera()["camera_id"]
+    snapshot = _camera_snapshot(camera_id)
+    if snapshot is None:
+        return jsonify({
+            "status": "Unknown camera",
+            "connected_clients": connected_clients,
+            "known_faces_count": len(known_embeddings),
+        }), 404
+
     return jsonify(
         {
-            "status": camera_status,
+            "camera_id": snapshot["camera_id"],
+            "camera_name": snapshot["camera_name"],
+            "status": snapshot["status"],
             "connected_clients":
                 connected_clients,
             "known_faces_count":
-                len(known_embeddings)
+                len(known_embeddings),
         }
     )
 
@@ -3723,6 +3928,7 @@ def api_mobile():
     }
     if detection_type not in valid_detection_types:
         detection_type = ""
+    camera_id = request.args.get("camera_id", default="").strip() or ""
     include_snapshot = request.args.get(
         "include_snapshot",
         default="true"
@@ -3730,7 +3936,7 @@ def api_mobile():
 
     # Read the persisted master history first so summary totals remain correct
     # for every mobile installation. Filtering changes only the returned list.
-    all_detections = detection_database.latest(0)
+    all_detections = detection_database.latest(0, camera_id=camera_id or None)
     detections = [
         item
         for item in all_detections
@@ -3758,20 +3964,34 @@ def api_mobile():
             for item in all_detections
         ),
     }
-    alert_limit = len(alert_history) if limit == 0 else min(limit, len(alert_history))
-    alerts = list(alert_history)[-alert_limit:]
+    alert_items = [
+        item
+        for item in alert_history
+        if not camera_id or item.get("camera_id") == camera_id
+    ]
+    alert_limit = len(alert_items) if limit == 0 else min(limit, len(alert_items))
+    alerts = alert_items[-alert_limit:]
     alerts.reverse()
 
     gates = sorted({
         item["gate"]
         for item in detections
         if item.get("gate")
-    } | {"Main Gate 01"})
+    } | {camera_states[camera_id]["camera_name"] if camera_id in camera_states else _default_camera()["name"]})
 
+    cameras_payload = []
+    for camera in _enabled_cameras():
+        snapshot = _camera_snapshot(camera["camera_id"])
+        cameras_payload.append({
+            "camera_id": camera["camera_id"],
+            "camera_name": camera["name"],
+            "status": snapshot["status"] if snapshot else "Starting...",
+        })
+
+    snapshot_state = _camera_snapshot(camera_id or None)
     snapshot = None
     if include_snapshot:
-        with latest_frame_lock:
-            frame = latest_annotated_frame
+        frame = snapshot_state["frame"] if snapshot_state else None
         if frame is not None:
             snapshot = {
                 "mime_type": "image/jpeg",
@@ -3783,7 +4003,7 @@ def api_mobile():
             "success": True,
             "version": 1,
             "data": {
-                "status": camera_status,
+                "status": snapshot_state["status"] if snapshot_state else "Unknown",
                 "connected_clients": connected_clients,
                 "known_faces_count": len(known_embeddings),
                 "people": sorted(known_embeddings.keys()),
@@ -3791,6 +4011,9 @@ def api_mobile():
                 "detections": detections,
                 "detection_summary": detection_summary,
                 "snapshot": snapshot,
+                "camera_id": camera_id or _default_camera()["camera_id"],
+                "camera_name": snapshot_state["camera_name"] if snapshot_state else _default_camera()["name"],
+                "cameras": cameras_payload,
             },
             "options": {
                 "gates": gates,
@@ -3877,10 +4100,13 @@ def api_alerts():
         default=20,
         type=int
     )
+    camera_id = request.args.get("camera_id", "").strip() or ""
 
-    items = list(
-        alert_history
-    )[-limit:]
+    items = [
+        item
+        for item in alert_history
+        if not camera_id or item.get("camera_id") == camera_id
+    ][-limit:]
 
     items.reverse()
 
@@ -3902,10 +4128,11 @@ def api_detections():
         default=0,
         type=int
     )
+    camera_id = request.args.get("camera_id", "").strip() or None
 
     return jsonify(
         {
-            "detections": detection_database.latest(limit)
+            "detections": detection_database.latest(limit, camera_id=camera_id)
         }
     )
 
@@ -3915,10 +4142,12 @@ def api_detections():
     methods=["GET"]
 )
 def api_snapshot():
+    camera_id = request.args.get("camera_id", "").strip() or _default_camera()["camera_id"]
+    snapshot = _camera_snapshot(camera_id)
+    if snapshot is None:
+        return jsonify({"error": "Unknown camera"}), 404
 
-    with latest_frame_lock:
-
-        frame = latest_annotated_frame
+    frame = snapshot["frame"]
 
 
     if frame is None:
@@ -3939,7 +4168,9 @@ def api_snapshot():
     return jsonify(
         {
             "image": b64_frame,
-            "status": camera_status
+            "status": snapshot["status"],
+            "camera_id": snapshot["camera_id"],
+            "camera_name": snapshot["camera_name"],
         }
     )
 
@@ -3953,10 +4184,9 @@ def api_snapshot():
     methods=["POST"]
 )
 def test_notification():
-
-    with latest_frame_lock:
-
-        frame = latest_annotated_frame
+    default_camera = _default_camera()
+    snapshot = _camera_snapshot(default_camera["camera_id"])
+    frame = snapshot["frame"] if snapshot else None
 
 
     if frame is None:
@@ -3972,9 +4202,11 @@ def test_notification():
 
     push_alert(
         "New person detected "
-        "on Main Gate 01",
+        f"on {default_camera['name']}",
         frame,
-        "Main Gate 01"
+        default_camera["name"],
+        camera_id=default_camera["camera_id"],
+        camera_name=default_camera["name"],
     )
 
 
@@ -4020,16 +4252,46 @@ def on_disconnect():
     )
 
 
+@socketio.on("join_camera")
+def join_camera(payload):
+
+    camera_id = str((payload or {}).get("camera_id", "")).strip()
+    if not camera_id or camera_id not in camera_states:
+        return {"success": False, "message": "camera_id is required"}
+    join_room(_camera_room(camera_id))
+    return {
+        "success": True,
+        "camera_id": camera_id,
+        "room": _camera_room(camera_id),
+    }
+
+
+@socketio.on("leave_camera")
+def leave_camera(payload):
+
+    camera_id = str((payload or {}).get("camera_id", "")).strip()
+    if not camera_id:
+        return {"success": False, "message": "camera_id is required"}
+    leave_room(_camera_room(camera_id))
+    return {
+        "success": True,
+        "camera_id": camera_id,
+        "room": _camera_room(camera_id),
+    }
+
+
 # ============================================================
 # MAIN
 # ============================================================
 
 def main():
 
+    global camera_manager
+
     print("=" * 60)
 
     print(
-        " ALCON CAMERA 1 - "
+        " ALCON MULTI-CAMERA "
         "FACE RECOGNITION"
     )
 
@@ -4045,13 +4307,15 @@ def main():
     # ----------------------------------------
 
     initialize_firebase()
+    initialize_camera_states()
 
 
     # ----------------------------------------
     # Face model
     # ----------------------------------------
 
-    configure_h264_stream()
+    for camera_config in _enabled_cameras():
+        configure_h264_stream(camera_config)
 
     initialize_face_model()
     initialize_detection_events()
@@ -4068,13 +4332,19 @@ def main():
     # ----------------------------------------
     # Camera worker
     # ----------------------------------------
-
-    worker = threading.Thread(
-        target=camera_worker,
-        daemon=True
+    camera_manager = CameraManager(
+        _enabled_cameras(),
+        camera_worker,
+        shutdown_event=shutdown_event,
     )
+    camera_manager.start()
 
-    worker.start()
+    def _shutdown_handler(signum, frame):
+        camera_manager.stop()
+        print(f"[INFO] Shutdown signal received: {signum}")
+
+    signal.signal(signal.SIGINT, _shutdown_handler)
+    signal.signal(signal.SIGTERM, _shutdown_handler)
 
 
     print()
@@ -4095,7 +4365,15 @@ def main():
 
     print(
         "[INFO] Socket.IO events: "
-        "'face_frame', 'face_alert'"
+        "'face_frame', 'face_alert', 'detection_event'"
+    )
+
+    print(
+        "[INFO] Enabled cameras: "
+        + ", ".join(
+            f"{camera['camera_id']}={camera['name']}"
+            for camera in _enabled_cameras()
+        )
     )
 
     print(
@@ -4114,6 +4392,8 @@ def main():
         use_reloader=False,
         allow_unsafe_werkzeug=True
     )
+
+    camera_manager.stop()
 
 
 # ============================================================
