@@ -3096,7 +3096,6 @@ def camera_worker(camera_config, rtsp_url=None):
 
                     send_frame = frame.copy()
 
-
                     for face in last_faces:
 
                         x1, y1, x2, y2 = (
