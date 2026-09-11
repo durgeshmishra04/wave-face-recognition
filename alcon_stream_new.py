@@ -59,6 +59,7 @@ NVR_PASSWORD = os.getenv("ALCON_PASSWORD", "")
 RTSP_PORT = 554
 NVR_HTTP_PORT = int(os.getenv("NVR_HTTP_PORT", "554"))
 RTSP_PATH = "/cam/realmonitor"
+RTSP_DEBUG = os.getenv("RTSP_DEBUG", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 RECOGNITION_THRESHOLD = 0.50
 PROCESS_EVERY_N_FRAMES = 2
@@ -516,6 +517,16 @@ def configure_h264_stream(camera_config):
     except Exception as e:
         _camera_log(camera_config["camera_id"], f"Could not configure camera to H.264: {e}")
 
+def _redact_rtsp_url(rtsp_url):
+    try:
+        scheme, remainder = rtsp_url.split("://", 1)
+        auth, rest = remainder.split("@", 1)
+        username, _, _ = auth.partition(":")
+        return f"{scheme}://{username}:***@{rest}"
+    except ValueError:
+        return rtsp_url
+
+
 def build_rtsp_url(camera_config):
 
     if not NVR_PASSWORD:
@@ -534,11 +545,13 @@ def build_rtsp_url(camera_config):
         safe=""
     )
 
+    channel = int(camera_config.get("channel", 1))
+    subtype = int(camera_config.get("subtype", 1))
+
     return (
         f"rtsp://{user}:{password}@"
-        f"{camera_config['nvr_ip']}:{RTSP_PORT}"
-        f"{RTSP_PATH}"
-        f"?channel={camera_config['channel']}&subtype={camera_config['subtype']}"
+        f"{camera_config.get('nvr_ip', DEFAULT_NVR_IP)}:{RTSP_PORT}"
+        f"/{channel}/{subtype}"
     )
 
 
@@ -2313,6 +2326,7 @@ def camera_worker(camera_config, rtsp_url=None):
 
     last_emit_time = 0.0
     last_frame_diagnostic_time = 0.0
+    last_rtsp_debug_time = 0.0
 
     emit_interval = (
         1.0 /
@@ -2333,6 +2347,12 @@ def camera_worker(camera_config, rtsp_url=None):
                     f"SUBTYPE={camera_config['subtype']}"
                 ),
             )
+            if RTSP_DEBUG:
+                _camera_log(
+                    camera_id,
+                    f"[RTSP OPEN] camera={camera_id} channel={camera_config['channel']} "
+                    f"subtype={camera_config['subtype']} url={_redact_rtsp_url(rtsp_url)}",
+                )
 
             cap = cv2.VideoCapture(
                 rtsp_url,
@@ -2411,6 +2431,16 @@ def camera_worker(camera_config, rtsp_url=None):
 
 
                 consecutive_read_failures = 0
+
+                if RTSP_DEBUG and (time.time() - last_rtsp_debug_time >= 5.0):
+                    small = cv2.resize(frame, (64, 36), interpolation=cv2.INTER_AREA)
+                    frame_hash = hashlib.md5(small.tobytes()).hexdigest()[:8]
+                    _camera_log(
+                        camera_id,
+                        f"[FRAME CHECK] camera={camera_id} channel={camera_config['channel']} "
+                        f"subtype={camera_config['subtype']} hash={frame_hash}",
+                    )
+                    last_rtsp_debug_time = time.time()
 
                 frame_counter += 1
 
