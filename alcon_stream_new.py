@@ -273,6 +273,7 @@ socketio = SocketIO(
 latest_frame_lock = threading.Lock()
 
 latest_annotated_frame = None
+latest_annotated_frames = {}
 
 camera_running = True
 camera_status = "Starting..."
@@ -321,6 +322,27 @@ def _default_camera():
         return cameras[0]
 
     return CAMERAS[0]
+
+
+def _camera_by_id_or_channel(camera_id=None, channel=None):
+
+    if camera_id:
+        camera_id = str(camera_id).strip()
+        for camera in CAMERAS:
+            if camera["camera_id"].lower() == camera_id.lower():
+                return camera
+
+    if channel is not None:
+        try:
+            channel_value = int(channel)
+        except (TypeError, ValueError):
+            channel_value = None
+        if channel_value is not None:
+            for camera in CAMERAS:
+                if int(camera.get("channel", 0)) == channel_value:
+                    return camera
+
+    return _default_camera()
 
 
 def _camera_room(camera_id):
@@ -372,6 +394,9 @@ def _camera_snapshot(camera_id=None):
         status = state["status"]
         camera_name = state["camera_name"]
         timestamp = state["latest_frame_timestamp"]
+    if frame is None:
+        with latest_frame_lock:
+            frame = latest_annotated_frames.get(camera_id)
     return {
         "camera_id": camera_id,
         "camera_name": camera_name,
@@ -386,6 +411,7 @@ def initialize_camera_states():
     global camera_states
 
     camera_states = {}
+    latest_annotated_frames.clear()
 
     for camera_config in _enabled_cameras():
         camera_states[camera_config["camera_id"]] = _create_camera_state(
@@ -3290,6 +3316,7 @@ def camera_worker(camera_config, rtsp_url=None):
 
                         with latest_frame_lock:
                             latest_annotated_frame = encoded_bytes
+                            latest_annotated_frames[camera_id] = encoded_bytes
 
 
                         # ----------------------------------------
@@ -3978,8 +4005,11 @@ def api_camera(camera_id):
 )
 def api_status():
 
-    camera_id = request.args.get("camera_id", "").strip() or _default_camera()["camera_id"]
-    snapshot = _camera_snapshot(camera_id)
+    camera_id = request.args.get("camera_id", "").strip()
+    if not camera_id:
+        camera_id = request.args.get("channel", "").strip()
+    selected = _camera_by_id_or_channel(camera_id=camera_id if camera_id and not camera_id.isdigit() else None, channel=camera_id if camera_id and camera_id.isdigit() else request.args.get("channel", ""))
+    snapshot = _camera_snapshot(selected["camera_id"])
     if snapshot is None:
         return jsonify({
             "status": "Unknown camera",
@@ -4238,8 +4268,10 @@ def api_detections():
     methods=["GET"]
 )
 def api_snapshot():
-    camera_id = request.args.get("camera_id", "").strip() or _default_camera()["camera_id"]
-    snapshot = _camera_snapshot(camera_id)
+    camera_id = request.args.get("camera_id", "").strip()
+    channel = request.args.get("channel", "").strip()
+    selected = _camera_by_id_or_channel(camera_id=camera_id or None, channel=channel or None)
+    snapshot = _camera_snapshot(selected["camera_id"])
     if snapshot is None:
         return jsonify({"error": "Unknown camera"}), 404
 
