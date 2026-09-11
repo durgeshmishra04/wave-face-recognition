@@ -284,6 +284,7 @@ camera_state_lock = threading.Lock()
 camera_manager = None
 camera_captures = {}
 camera_capture_lock = threading.Lock()
+face_inference_lock = threading.Lock()
 shutdown_started = False
 
 known_embeddings = {}
@@ -1771,6 +1772,18 @@ def initialize_auth_accounts():
         conn.close()
 
 
+def safe_face_inference(frame):
+    """Serialize GPU InsightFace calls across all camera workers.
+
+    The model instance is intentionally shared, but only the actual CUDA/ONNX
+    inference call is protected so each worker keeps its own state and frame.
+    """
+    if face_app is None:
+        return []
+    with face_inference_lock:
+        return face_app.get(frame)
+
+
 def recognize_face(face):
 
     if not known_embeddings:
@@ -2456,7 +2469,7 @@ def camera_worker(camera_config, rtsp_url=None):
                         ]
 
                         detected_faces = (
-                            face_app.get(frame)
+                            safe_face_inference(frame)
                             if person_boxes
                             else []
                         )
@@ -3407,7 +3420,7 @@ def _validate_registration_images():
         ) if raw else None
         if image is None:
             raise ValueError(f"Image {number} is not a valid image")
-        faces = face_app.get(image)
+        faces = safe_face_inference(image)
         if not faces:
             raise ValueError(f"No face detected in image {number}")
         if len(faces) != 1:
