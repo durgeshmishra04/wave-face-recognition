@@ -2240,13 +2240,16 @@ def initialize_detection_events():
 # CAMERA WORKER
 # ============================================================
 
-def camera_worker(camera_config):
+def camera_worker(camera_config, rtsp_url=None):
 
     camera_id = camera_config["camera_id"]
     camera_name = camera_config["name"]
     gate_name = camera_name
     detection_manager = camera_event_managers.get(camera_id)
     state = camera_states.get(camera_id)
+
+    if rtsp_url is None:
+        rtsp_url = build_rtsp_url(camera_config)
 
     frame_counter = 0
     camera_status = "Starting..."
@@ -2283,9 +2286,14 @@ def camera_worker(camera_config):
         cap = None
         try:
 
-            rtsp_url = build_rtsp_url(camera_config)
-
-            _camera_log(camera_id, "Connecting to RTSP...")
+            _camera_log(
+                camera_id,
+                (
+                    f"Connecting to NVR={camera_config['nvr_ip']} "
+                    f"CHANNEL={camera_config['channel']} "
+                    f"SUBTYPE={camera_config['subtype']}"
+                ),
+            )
 
             cap = cv2.VideoCapture(
                 rtsp_url,
@@ -4426,6 +4434,7 @@ def main():
         camera_worker,
         shutdown_event=shutdown_event,
         release_resources=_release_camera_capture,
+        rtsp_url_builder=build_rtsp_url,
     )
     camera_manager.start()
 

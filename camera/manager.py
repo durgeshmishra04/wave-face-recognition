@@ -5,14 +5,15 @@ import time
 
 
 class ManagedWorker:
-    def __init__(self, camera_config, target, release_resources):
+    def __init__(self, camera_config, target, release_resources, rtsp_url=None):
         self.camera_config = camera_config
         self.camera_id = camera_config["camera_id"]
+        self.rtsp_url = rtsp_url
         self.stop_event = threading.Event()
         self.release_resources = release_resources
         self.thread = threading.Thread(
             target=target,
-            args=(camera_config,),
+            args=(camera_config, self.rtsp_url),
             name=f"camera-{self.camera_id}",
             daemon=True,
         )
@@ -34,11 +35,12 @@ class CameraManager:
     """Create, start, stop, and inspect one worker per enabled camera."""
 
     def __init__(self, cameras, worker_target, shutdown_event=None,
-                 release_resources=None):
+                 release_resources=None, rtsp_url_builder=None):
         self.cameras = list(cameras)
         self.worker_target = worker_target
         self.shutdown_event = shutdown_event or threading.Event()
         self.release_resources = release_resources or (lambda camera_id: None)
+        self.rtsp_url_builder = rtsp_url_builder
         self.workers = {}
         self._stop_lock = threading.Lock()
         self._stopped = False
@@ -48,10 +50,17 @@ class CameraManager:
             camera_id = camera_config["camera_id"]
             if camera_id in self.workers:
                 continue
+            rtsp_url = None
+            if self.rtsp_url_builder is not None:
+                try:
+                    rtsp_url = self.rtsp_url_builder(camera_config)
+                except Exception as exc:
+                    print(f"[WARN][{camera_id}] RTSP URL generation failed: {exc}")
             worker = ManagedWorker(
                 camera_config,
                 self.worker_target,
                 self.release_resources,
+                rtsp_url=rtsp_url,
             )
             self.workers[camera_id] = worker
             worker.start()
