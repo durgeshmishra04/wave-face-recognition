@@ -285,7 +285,8 @@ camera_state_lock = threading.Lock()
 camera_manager = None
 camera_captures = {}
 camera_capture_lock = threading.Lock()
-face_inference_lock = threading.Lock()
+gpu_inference_lock = threading.RLock()
+face_inference_lock = gpu_inference_lock
 shutdown_started = False
 
 known_embeddings = {}
@@ -1785,16 +1786,36 @@ def initialize_auth_accounts():
         conn.close()
 
 
-def safe_face_inference(frame):
-    """Serialize GPU InsightFace calls across all camera workers.
+def safe_gpu_inference(operation, *args, **kwargs):
+    """Centralize all GPU model execution behind one lock.
 
-    The model instance is intentionally shared, but only the actual CUDA/ONNX
-    inference call is protected so each worker keeps its own state and frame.
+    RTSP workers can still run in parallel, but the shared CUDA/ONNX session is
+    only entered through this single execution path. This prevents concurrent
+    InsightFace and YOLO calls from racing each other on the same GPU context.
     """
+    with gpu_inference_lock:
+        return operation(*args, **kwargs)
+
+
+def safe_face_inference(frame):
+    """Serialize GPU InsightFace calls across all camera workers."""
     if face_app is None:
         return []
-    with face_inference_lock:
-        return face_app.get(frame)
+    return safe_gpu_inference(face_app.get, frame)
+
+
+def safe_person_inference(frame):
+    """Serialize shared YOLO person inference on the GPU."""
+    if person_detector is None:
+        raise RuntimeError("Person detector is not initialized.")
+    return safe_gpu_inference(person_detector.predict, frame, classes=[0], conf=PERSON_CONFIDENCE, iou=PERSON_IOU, verbose=False)
+
+
+def safe_vehicle_inference(frame):
+    """Serialize shared YOLO vehicle inference on the GPU."""
+    if vehicle_detector is None:
+        raise RuntimeError("Vehicle detector is not initialized.")
+    return safe_gpu_inference(vehicle_detector.predict, frame, conf=VEHICLE_CONFIDENCE, device=VEHICLE_DEVICE, verbose=False)
 
 
 def recognize_face(face):
@@ -1998,16 +2019,7 @@ def vehicle_in_roi(vehicle_box, frame_width, frame_height):
 
 def detect_person_boxes(frame):
 
-    if person_detector is None:
-        raise RuntimeError("Person detector is not initialized.")
-
-    results = person_detector.predict(
-        frame,
-        classes=[0],
-        conf=PERSON_CONFIDENCE,
-        iou=PERSON_IOU,
-        verbose=False,
-    )
+    results = safe_person_inference(frame)
 
     if not results or results[0].boxes is None:
         return []
@@ -2020,15 +2032,7 @@ def detect_person_boxes(frame):
 
 def detect_vehicle_boxes(frame):
 
-    if vehicle_detector is None:
-        raise RuntimeError("Vehicle detector is not initialized.")
-
-    results = vehicle_detector.predict(
-        frame,
-        conf=VEHICLE_CONFIDENCE,
-        device=VEHICLE_DEVICE,
-        verbose=False,
-    )
+    results = safe_vehicle_inference(frame)
 
     if not results or results[0].boxes is None:
         return []
