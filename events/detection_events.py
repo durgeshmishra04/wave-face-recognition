@@ -29,6 +29,7 @@ class DetectionEventManager:
         self.camera_name = camera_name or camera_id or "Main Gate 01"
         self.active_person_events = []
         self.active_vehicle_events = []
+        self._recent_event_cache = {}
         # Unknown people in one concurrent ROI visit are deliberately held
         # until the final member exits, then emitted as a single group event.
         self.pending_unknown_exits = []
@@ -178,6 +179,42 @@ class DetectionEventManager:
             cv2.LINE_AA,
         )
 
+    def _dedup_key(self, event):
+        detection_type = event.get("detection_type")
+        camera_id = event.get("camera_id") or self.camera_id
+        gate_name = event.get("gate_name")
+        if detection_type == "known_person":
+            return (
+                "known_person",
+                camera_id,
+                gate_name,
+                event.get("person_id"),
+                event.get("person_name"),
+            )
+        if detection_type == "vehicle":
+            return (
+                "vehicle",
+                camera_id,
+                gate_name,
+                event.get("vehicle_type"),
+                event.get("vehicle_class"),
+            )
+        return (
+            detection_type,
+            camera_id,
+            gate_name,
+            event.get("unknown_count", 1),
+        )
+
+    def _is_duplicate_event(self, event):
+        now = time.time()
+        key = self._dedup_key(event)
+        previous = self._recent_event_cache.get(key)
+        if previous is not None and (now - previous) < self.exit_confirm_seconds:
+            return True
+        self._recent_event_cache[key] = now
+        return False
+
     def _notify(self, event):
         image_url = event["image_url"]
         data = {key: str(value) for key, value in {"type": event["detection_type"], "detection_id": event["id"], "camera_id": event.get("camera_id", self.camera_id or ""), "camera_name": event.get("camera_name", self.camera_name or ""), "gate": event["gate_name"], "image_url": image_url, "confidence": event.get("confidence", ""), "unknown_count": event.get("unknown_count", ""), "detected_at": event["detected_at"]}.items()}
@@ -192,6 +229,9 @@ class DetectionEventManager:
         print("[WARNING] No FCM sender configured; notification skipped.")
 
     def _publish(self, event, image, notify):
+        if self._is_duplicate_event(event):
+            return None
+
         event["image_url"] = self._save_image(image)
         event["camera_id"] = event.get("camera_id") or self.camera_id
         event["camera_name"] = event.get("camera_name") or self.camera_name
