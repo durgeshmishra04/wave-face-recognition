@@ -53,11 +53,11 @@ load_dotenv()
 # ============================================================
 
 DEFAULT_NVR_IP = os.getenv("NVR_IP", "115.247.225.82")
-NVR_USERNAME = "admin"
+NVR_USERNAME = "alcon"
 NVR_PASSWORD = os.getenv("ALCON_PASSWORD", "")
 
 RTSP_PORT = 554
-NVR_HTTP_PORT = int(os.getenv("NVR_HTTP_PORT", "80"))
+NVR_HTTP_PORT = int(os.getenv("NVR_HTTP_PORT", "554"))
 RTSP_PATH = "/cam/realmonitor"
 
 RECOGNITION_THRESHOLD = 0.50
