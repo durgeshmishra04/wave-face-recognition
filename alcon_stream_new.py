@@ -290,9 +290,10 @@ face_inference_lock = gpu_inference_lock
 shutdown_started = False
 
 known_embeddings = {}
-# Metadata for registration folders. Legacy folders retain their folder name
-# as the display name, while Android registrations use a unique folder key.
+# Legacy average-embedding compatibility map used by existing APIs and older code.
 known_person_metadata = {}
+# Full per-person embedding templates used by live recognition.
+known_face_templates = {}
 face_app = None
 person_detector = None
 vehicle_detector = None
@@ -652,6 +653,7 @@ def initialize_face_model():
     print(
         "[INFO] Loading InsightFace buffalo_l..."
     )
+    print(f"[FACE MODEL] model=buffalo_l provider={providers}")
 
     face_app = FaceAnalysis(
         name="buffalo_l",
@@ -676,6 +678,7 @@ def initialize_face_model():
     print("[OK] Vehicle detector loaded.")
 
     print("[OK] Face model loaded.")
+    print(f"[FACE MODEL] embedding_dimension={face_app.model.get_output_dim() if hasattr(face_app, 'model') and hasattr(face_app.model, 'get_output_dim') else 'unknown'}")
 
 
 # ============================================================
@@ -1736,10 +1739,35 @@ def _load_registered_embeddings_from_db():
     return grouped
 
 
+def _validated_template_embedding(embedding, person_key, image_label=None):
+    """Normalize one embedding and discard invalid values without killing the app."""
+    try:
+        array = np.asarray(embedding, dtype=np.float32).reshape(-1)
+    except Exception as error:
+        print(f"[KNOWN LOAD] invalid embedding for {person_key} ({image_label}): {error}")
+        return None
+
+    if array.size == 0:
+        print(f"[KNOWN LOAD] empty embedding for {person_key} ({image_label})")
+        return None
+    if not np.all(np.isfinite(array)):
+        print(f"[KNOWN LOAD] non-finite embedding for {person_key} ({image_label})")
+        return None
+
+    norm = float(np.linalg.norm(array))
+    if norm <= 0.0:
+        print(f"[KNOWN LOAD] zero-norm embedding for {person_key} ({image_label})")
+        return None
+
+    normalized = array / norm
+    return normalized.astype(np.float32, copy=False)
+
+
 def load_known_faces():
 
     global known_embeddings
     global known_person_metadata
+    global known_face_templates
 
     KNOWN_FACES_DIR.mkdir(
         parents=True,
@@ -1747,42 +1775,75 @@ def load_known_faces():
     )
     known_embeddings = {}
     known_person_metadata = {}
+    known_face_templates = {}
 
     registered_rows = _load_registered_embeddings_from_db()
+    total_templates = 0
+    person_count = 0
+
     for storage_key, data in registered_rows.items():
 
         embeddings = data.get("embeddings", [])
         if not embeddings:
+            print(f"[KNOWN LOAD] skip {storage_key}: no valid embeddings found")
             continue
 
-        known_embeddings[storage_key] = normalize_embedding(
-            np.mean(
-                np.stack(embeddings, axis=0),
-                axis=0,
+        valid_templates = []
+        for index, embedding in enumerate(embeddings, start=1):
+            normalized = _validated_template_embedding(
+                embedding,
+                storage_key,
+                image_label=f"image_{index}",
             )
-        )
+            if normalized is None:
+                continue
+            valid_templates.append(normalized)
+
+        if not valid_templates:
+            print(f"[KNOWN LOAD] skip {storage_key}: all embeddings invalid")
+            continue
+
+        known_face_templates[storage_key] = valid_templates
         known_person_metadata[storage_key] = {
             "employee_name": data.get("employee_name", storage_key),
+            "person_name": data.get("employee_name", storage_key),
             "employee_id": data.get("employee_id"),
             "designation": data.get("designation"),
             "gate_no": data.get("gate_no"),
+            "storage_key": storage_key,
         }
+        known_embeddings[storage_key] = normalize_embedding(
+            np.mean(
+                np.stack(valid_templates, axis=0),
+                axis=0,
+            )
+        )
+        total_templates += len(valid_templates)
+        person_count += 1
+        print(
+            f"[KNOWN LOAD] person={storage_key} "
+            f"name={known_person_metadata[storage_key]['employee_name']} "
+            f"templates={len(valid_templates)} "
+            f"dimension={valid_templates[0].shape[0]} status=OK"
+        )
 
     print(
-        f"[INFO] Loaded "
-        f"{len(known_embeddings)} "
-        f"registered face(s) from database."
+        f"[INFO] Loaded {person_count} registered face(s) from database. "
+        f"Total templates: {total_templates}."
     )
 
 
-def refresh_known_faces_cache():
+def refresh_known_faces_cache(force=False):
     """Reload the live recognition cache from the persisted registration DB."""
-    if not known_embeddings:
+    if force or not known_face_templates:
+        print("[KNOWN CACHE] Reloading registered faces...")
         try:
             load_known_faces()
         except Exception as error:
             print(f"[WARN] Failed to reload known faces from DB: {error}")
-        return bool(known_embeddings)
+            return False
+        print(f"[KNOWN CACHE] Ready: {len(known_face_templates)} persons loaded")
+        return bool(known_face_templates)
     return True
 
 
@@ -1829,60 +1890,61 @@ def safe_vehicle_inference(frame):
     return safe_gpu_inference(vehicle_detector.predict, frame, conf=VEHICLE_CONFIDENCE, device=VEHICLE_DEVICE, verbose=False)
 
 
-def recognize_face(face):
-
-    # If the runtime cache is empty for any reason (fresh startup, stale memory,
-    # or an external registration), reload it from the database before falling
-    # back to unknown labels.
-    if not known_embeddings:
+def recognize_face(face, camera_id=None):
+    """Compare a live face embedding against all valid registered templates."""
+    if not known_face_templates:
         refresh_known_faces_cache()
 
-    if not known_embeddings:
+    if not known_face_templates:
+        print(f"[FACE MATCH] camera={camera_id or 'UNKNOWN'} RESULT=UNKNOWN reason=no_known_templates")
+        face.person_id = None
         return "Unknown", 0.0
 
-    query = normalize_embedding(
-        face.embedding
-    )
+    try:
+        query = normalize_embedding(np.asarray(face.embedding, dtype=np.float32).reshape(-1))
+    except Exception as error:
+        print(f"[FACE MATCH] camera={camera_id or 'UNKNOWN'} RESULT=UNKNOWN reason=invalid_live_embedding:{error}")
+        face.person_id = None
+        return "Unknown", 0.0
+
+    if query.size == 0 or not np.all(np.isfinite(query)):
+        print(f"[FACE MATCH] camera={camera_id or 'UNKNOWN'} RESULT=UNKNOWN reason=invalid_live_embedding")
+        face.person_id = None
+        return "Unknown", 0.0
 
     best_key = None
     best_score = -1.0
 
-    for (
-        name,
-        reference
-    ) in known_embeddings.items():
+    for person_key, templates in known_face_templates.items():
+        for template in templates:
+            score = float(np.dot(query, template))
+            if score > best_score:
+                best_score = score
+                best_key = person_key
 
-        score = float(
-            np.dot(
-                query,
-                reference
-            )
-        )
-
-        if score > best_score:
-
-            best_score = score
-            best_key = name
-
-    if best_score >= RECOGNITION_THRESHOLD:
-
+    if best_key is not None and best_score >= RECOGNITION_THRESHOLD:
         metadata = known_person_metadata.get(
             best_key,
-            {"employee_name": best_key, "employee_id": None},
+            {"employee_name": best_key, "person_name": best_key, "employee_id": None},
         )
-        # The event manager reads this existing optional attribute when it
-        # records a known-person event.
         face.person_id = metadata.get("employee_id")
-
-        return (
-            metadata["employee_name"],
-            best_score
+        recognized_name = metadata.get("employee_name") or metadata.get("person_name") or best_key
+        print(
+            f"[FACE MATCH] camera={camera_id or 'UNKNOWN'} "
+            f"BEST_PERSON={best_key} BEST_SCORE={best_score:.4f} THRESHOLD={RECOGNITION_THRESHOLD:.4f} RESULT=KNOWN"
         )
+        return recognized_name, best_score
 
-    return (
-        "Unknown",
-        best_score
-    )
+    if best_key is not None:
+        print(
+            f"[FACE MATCH] camera={camera_id or 'UNKNOWN'} "
+            f"BEST_PERSON={best_key} BEST_SCORE={best_score:.4f} THRESHOLD={RECOGNITION_THRESHOLD:.4f} RESULT=UNKNOWN"
+        )
+    else:
+        print(f"[FACE MATCH] camera={camera_id or 'UNKNOWN'} RESULT=UNKNOWN reason=no_match")
+
+    face.person_id = None
+    return "Unknown", best_score if best_key is not None else 0.0
 
 
 def boxes_overlap(
@@ -2589,7 +2651,8 @@ def camera_worker(camera_config, rtsp_url=None):
                                 name,
                                 score
                             ) = recognize_face(
-                                face
+                                face,
+                                camera_id=camera_id,
                             )
 
                             current_box = (
@@ -3028,16 +3091,27 @@ def camera_worker(camera_config, rtsp_url=None):
                     x1, y1, x2, y2 = (
                         face.bbox.astype(int)
                     )
+                    recognized_name = getattr(
+                        face,
+                        "recognized_name",
+                        "Unknown"
+                    )
 
                     faces_payload.append(
                         {
-                            "name": getattr(
-                                face,
-                                "recognized_name",
-                                "Unknown"
-                            ),
-
+                            "name": recognized_name,
+                            "recognized_name": recognized_name,
                             "score": round(
+                                float(
+                                    getattr(
+                                        face,
+                                        "recognition_score",
+                                        0.0
+                                    )
+                                ),
+                                3
+                            ),
+                            "recognition_score": round(
                                 float(
                                     getattr(
                                         face,
@@ -3580,14 +3654,25 @@ def _save_registered_person(gate_no, employee_name, designation, employee_id,
             conn.close()
 
     # Hot-add the normalized average to the live existing recognition cache;
-    # no model reload or RTSP interruption is needed.
+    # keep the full per-person template list for true multi-template matching.
     known_embeddings[storage_key] = average_embedding
     known_person_metadata[storage_key] = {
         "employee_name": employee_name,
+        "person_name": employee_name,
         "employee_id": employee_id,
         "designation": designation,
         "gate_no": gate_no,
     }
+    known_face_templates[storage_key] = [
+        normalize_embedding(np.asarray(embedding, dtype=np.float32).reshape(-1))
+        for embedding in embeddings
+    ]
+    print(
+        f"[REGISTER] Person registered successfully: {employee_name} "
+        f"storage_key={storage_key} templates={len(known_face_templates[storage_key])}"
+    )
+    print("[KNOWN CACHE] Reloading registered faces...")
+    refresh_known_faces_cache(force=True)
     return registration_id
 
 
@@ -3750,10 +3835,17 @@ def api_update_person(registration_id):
         "designation": updates.get("designation", old_designation),
     }
     if old_storage_key in known_person_metadata:
-        known_person_metadata[old_storage_key] = final_values
+        known_person_metadata[old_storage_key] = {
+            **known_person_metadata[old_storage_key],
+            "gate_no": final_values["gate_no"],
+            "employee_name": final_values["employee_name"],
+            "person_name": final_values["employee_name"],
+            "employee_id": final_values["employee_id"],
+            "designation": final_values["designation"],
+        }
 
     # Keep the live recognition cache in sync with the persisted DB after edits.
-    load_known_faces()
+    refresh_known_faces_cache(force=True)
 
     return jsonify({
         "success": True,
@@ -3824,7 +3916,8 @@ def api_delete_person(registration_id):
     # stops being recognized immediately.
     known_embeddings.pop(storage_key, None)
     known_person_metadata.pop(storage_key, None)
-    load_known_faces()
+    known_face_templates.pop(storage_key, None)
+    refresh_known_faces_cache(force=True)
 
     return jsonify({
         "success": True,
