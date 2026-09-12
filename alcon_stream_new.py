@@ -1775,6 +1775,17 @@ def load_known_faces():
     )
 
 
+def refresh_known_faces_cache():
+    """Reload the live recognition cache from the persisted registration DB."""
+    if not known_embeddings:
+        try:
+            load_known_faces()
+        except Exception as error:
+            print(f"[WARN] Failed to reload known faces from DB: {error}")
+        return bool(known_embeddings)
+    return True
+
+
 def initialize_auth_accounts():
 
     conn = _open_db()
@@ -1820,8 +1831,13 @@ def safe_vehicle_inference(frame):
 
 def recognize_face(face):
 
+    # If the runtime cache is empty for any reason (fresh startup, stale memory,
+    # or an external registration), reload it from the database before falling
+    # back to unknown labels.
     if not known_embeddings:
+        refresh_known_faces_cache()
 
+    if not known_embeddings:
         return "Unknown", 0.0
 
     query = normalize_embedding(
@@ -3605,6 +3621,10 @@ def api_register_person():
             "success": False,
             "message": "Unable to register employee",
         }), 500
+    # Reload the DB-backed cache immediately so the same process can recognize
+    # the newly registered employee without waiting for a service restart.
+    load_known_faces()
+
     return jsonify({
         "success": True,
         "message": "Employee registered successfully",
@@ -3732,6 +3752,9 @@ def api_update_person(registration_id):
     if old_storage_key in known_person_metadata:
         known_person_metadata[old_storage_key] = final_values
 
+    # Keep the live recognition cache in sync with the persisted DB after edits.
+    load_known_faces()
+
     return jsonify({
         "success": True,
         "message": "Employee updated successfully",
@@ -3801,6 +3824,7 @@ def api_delete_person(registration_id):
     # stops being recognized immediately.
     known_embeddings.pop(storage_key, None)
     known_person_metadata.pop(storage_key, None)
+    load_known_faces()
 
     return jsonify({
         "success": True,

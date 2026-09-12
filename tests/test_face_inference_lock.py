@@ -63,3 +63,30 @@ def test_gpu_inference_helpers_serialize_all_gpu_models(monkeypatch):
     assert events[0] == "lock-enter"
     assert events[1] == ("predict", "frame-person", {})
     assert events[-1] == "lock-exit"
+
+
+def test_register_person_refreshes_known_face_cache(monkeypatch):
+    called = {"count": 0}
+
+    def fake_load_known_faces():
+        called["count"] += 1
+        alcon_stream_new.known_embeddings = {"REG_123": [1.0, 0.0]}
+        alcon_stream_new.known_person_metadata = {"REG_123": {"employee_name": "Alice", "employee_id": "E-1"}}
+
+    monkeypatch.setattr(alcon_stream_new, "load_known_faces", fake_load_known_faces)
+    monkeypatch.setattr(alcon_stream_new, "_validate_registration_images", lambda: ([], []))
+    monkeypatch.setattr(alcon_stream_new, "_save_registered_person", lambda *args, **kwargs: "REG_123")
+
+    with alcon_stream_new.app.test_client() as client:
+        response = client.post(
+            "/api/register-person",
+            data={
+                "gate_no": "G1",
+                "employee_name": "Alice",
+                "designation": "Manager",
+                "employee_id": "E-1",
+            },
+        )
+
+    assert response.status_code == 201
+    assert called["count"] == 1
