@@ -1812,12 +1812,10 @@ def load_known_faces():
             "gate_no": data.get("gate_no"),
             "storage_key": storage_key,
         }
-        known_embeddings[storage_key] = normalize_embedding(
-            np.mean(
-                np.stack(valid_templates, axis=0),
-                axis=0,
-            )
-        )
+        # Keep a single representative embedding only for legacy compatibility.
+        # Recognition is driven by all templates in known_face_templates, not by
+        # an averaged face vector.
+        known_embeddings[storage_key] = valid_templates[0].astype(np.float32, copy=False)
         total_templates += len(valid_templates)
         person_count += 1
         print(
@@ -1914,13 +1912,15 @@ def recognize_face(face, camera_id=None):
 
     best_key = None
     best_score = -1.0
+    best_template = None
 
     for person_key, templates in known_face_templates.items():
-        for template in templates:
+        for template_index, template in enumerate(templates):
             score = float(np.dot(query, template))
             if score > best_score:
                 best_score = score
                 best_key = person_key
+                best_template = template_index + 1
 
     if best_key is not None and best_score >= RECOGNITION_THRESHOLD:
         metadata = known_person_metadata.get(
@@ -3627,8 +3627,9 @@ def _save_registered_person(gate_no, employee_name, designation, employee_id,
                     sqlite3.Binary(_embedding_blob(embedding)), now,
                 ),
             )
-        # This is the exact existing known_embeddings storage format used by
-        # load_known_faces()/recognize_face(), not a second recognition store.
+        # This is the legacy compatibility record used by the app and DB
+        # inspection tooling. The live recognition path must compare against
+        # every stored template in registered_face_embeddings.
         conn.execute(
             """
             REPLACE INTO known_embeddings (
@@ -3636,7 +3637,7 @@ def _save_registered_person(gate_no, employee_name, designation, employee_id,
             ) VALUES (?, ?, ?, ?, ?)
             """,
             (
-                storage_key, sqlite3.Binary(_embedding_blob(average_embedding)),
+                storage_key, sqlite3.Binary(_embedding_blob(embeddings[0])),
                 json.dumps([str(path) for path in final_paths]), fingerprint, now,
             ),
         )
@@ -3653,9 +3654,12 @@ def _save_registered_person(gate_no, employee_name, designation, employee_id,
         if conn is not None:
             conn.close()
 
-    # Hot-add the normalized average to the live existing recognition cache;
-    # keep the full per-person template list for true multi-template matching.
-    known_embeddings[storage_key] = average_embedding
+    # Keep the compatibility cache entry but do not use it for recognition.
+    # The live matcher compares every stored template globally before choosing
+    # the best known person.
+    known_embeddings[storage_key] = normalize_embedding(
+        np.asarray(embeddings[0], dtype=np.float32).reshape(-1)
+    )
     known_person_metadata[storage_key] = {
         "employee_name": employee_name,
         "person_name": employee_name,
