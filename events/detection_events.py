@@ -199,11 +199,14 @@ class DetectionEventManager:
                 event.get("vehicle_type"),
                 event.get("vehicle_class"),
             )
+        # Unknown entries must collapse to one alert per camera/gate while the
+        # same person is still being tracked in the ROI. Counting multiple
+        # unknown frames as distinct dedupe keys caused duplicate notifications
+        # for the same person in one camera.
         return (
             detection_type,
             camera_id,
             gate_name,
-            event.get("unknown_count", 1),
         )
 
     def _is_duplicate_event(self, event):

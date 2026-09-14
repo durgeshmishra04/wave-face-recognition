@@ -212,17 +212,20 @@ ROI_LEFT = float(os.getenv("ROI_LEFT", "0.10"))
 ROI_TOP = 0.54
 ROI_RIGHT = 0.995
 ROI_BOTTOM = 0.99
+# Shared gate ROI for all cameras: this is the actual entry path / gate
+# approach zone. Keep the same polygon for every camera so alerts and
+# tracking decisions remain consistent across the whole site.
 PERSON_ROI_POLYGON = np.array(
     [
-        [0.098, 1.000],
-        [0.149, 0.796],
-        [0.195, 0.574],
-        [0.265, 0.530],
-        [0.450, 0.556],
-        [0.700, 0.556],
-        [0.850, 0.613],
-        [0.912, 0.617],
-        [0.951, 1.000],
+        [0.10, 1.00],
+        [0.12, 0.82],
+        [0.18, 0.64],
+        [0.28, 0.55],
+        [0.42, 0.54],
+        [0.62, 0.55],
+        [0.76, 0.58],
+        [0.88, 0.62],
+        [0.94, 1.00],
     ],
     dtype=np.float32,
 )
