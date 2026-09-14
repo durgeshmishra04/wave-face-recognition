@@ -2091,6 +2091,34 @@ def vehicle_in_roi(vehicle_box, frame_width, frame_height):
     return in_center or in_bottom
 
 
+def _is_plausible_human_box(box, frame_shape):
+    """Reject dogs, clutter, and other non-human detections before alerting."""
+    height, width = frame_shape[:2]
+    x1, y1, x2, y2 = np.asarray(box, dtype=np.float32)
+
+    box_width = max(0.0, x2 - x1)
+    box_height = max(0.0, y2 - y1)
+    if box_width <= 0 or box_height <= 0:
+        return False
+
+    frame_area = float(width * height)
+    box_area = box_width * box_height
+    if box_area < 0.0015 * frame_area:
+        return False
+    if box_area > 0.55 * frame_area:
+        return False
+    if box_height < 0.08 * height:
+        return False
+    if box_width < 0.05 * width:
+        return False
+
+    aspect = box_width / max(box_height, 1.0)
+    if aspect < 0.15 or aspect > 1.8:
+        return False
+
+    return True
+
+
 def detect_person_boxes(frame):
 
     results = safe_person_inference(frame)
@@ -2098,9 +2126,15 @@ def detect_person_boxes(frame):
     if not results or results[0].boxes is None:
         return []
 
-    return [
+    person_boxes = [
         box.astype(int)
         for box in results[0].boxes.xyxy.cpu().numpy()
+    ]
+
+    return [
+        box
+        for box in person_boxes
+        if _is_plausible_human_box(box, frame.shape)
     ]
 
 
@@ -2608,11 +2642,21 @@ def camera_worker(camera_config, rtsp_url=None):
                             )
                         ]
 
-                        detected_faces = (
-                            safe_face_inference(frame)
-                            if person_boxes
-                            else []
-                        )
+                        detected_faces = []
+                        if person_boxes:
+                            detected_faces = safe_face_inference(frame)
+
+                            detected_faces = [
+                                face
+                                for face in detected_faces
+                                if any(
+                                    face_inside_person(
+                                        face.bbox.astype(int),
+                                        person_box,
+                                    )
+                                    for person_box in person_boxes
+                                )
+                            ]
 
                         last_faces = [
                             face
@@ -2639,6 +2683,19 @@ def camera_worker(camera_config, rtsp_url=None):
                                 )
                             )
                         ]
+
+                        # Strict gate: if no human body box exists, no face recognition
+                        # or unknown-person alert should be raised for that camera frame.
+                        if not person_boxes:
+                            last_faces = []
+                            last_event_people = []
+                            known_face_memory[:] = []
+                            seen_unknown_in_frame = False
+                            unknown_count_in_frame = 0
+                            unknown_present = False
+                            unknown_first_seen = 0.0
+                            unknown_last_seen = 0.0
+                            unknown_alert_sent = False
 
                         now = time.time()
 
