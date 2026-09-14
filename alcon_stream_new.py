@@ -1812,10 +1812,10 @@ def load_known_faces():
             "gate_no": data.get("gate_no"),
             "storage_key": storage_key,
         }
-        # Keep a single representative embedding only for legacy compatibility.
-        # Recognition is driven by all templates in known_face_templates, not by
-        # an averaged face vector.
-        known_embeddings[storage_key] = valid_templates[0].astype(np.float32, copy=False)
+        # Keep every registered embedding separately for the live matcher.
+        known_embeddings[storage_key] = [
+            template.astype(np.float32, copy=False) for template in valid_templates
+        ]
         total_templates += len(valid_templates)
         person_count += 1
         print(
@@ -1826,8 +1826,8 @@ def load_known_faces():
         )
 
     print(
-        f"[INFO] Loaded {person_count} registered face(s) from database. "
-        f"Total templates: {total_templates}."
+        f"[INFO] Loaded {person_count} registered person(s) with "
+        f"{total_templates} individual face templates."
     )
 
 
@@ -1894,19 +1894,19 @@ def recognize_face(face, camera_id=None):
         refresh_known_faces_cache()
 
     if not known_face_templates:
-        print(f"[FACE MATCH] camera={camera_id or 'UNKNOWN'} RESULT=UNKNOWN reason=no_known_templates")
+        print(f"[FACE] UNKNOWN | best_score=0.00 | best_person=None | threshold={RECOGNITION_THRESHOLD:.2f}")
         face.person_id = None
         return "Unknown", 0.0
 
     try:
         query = normalize_embedding(np.asarray(face.embedding, dtype=np.float32).reshape(-1))
     except Exception as error:
-        print(f"[FACE MATCH] camera={camera_id or 'UNKNOWN'} RESULT=UNKNOWN reason=invalid_live_embedding:{error}")
+        print(f"[FACE] UNKNOWN | best_score=0.00 | best_person=None | threshold={RECOGNITION_THRESHOLD:.2f} | reason={error}")
         face.person_id = None
         return "Unknown", 0.0
 
     if query.size == 0 or not np.all(np.isfinite(query)):
-        print(f"[FACE MATCH] camera={camera_id or 'UNKNOWN'} RESULT=UNKNOWN reason=invalid_live_embedding")
+        print(f"[FACE] UNKNOWN | best_score=0.00 | best_person=None | threshold={RECOGNITION_THRESHOLD:.2f} | reason=invalid_live_embedding")
         face.person_id = None
         return "Unknown", 0.0
 
@@ -1930,21 +1930,17 @@ def recognize_face(face, camera_id=None):
         face.person_id = metadata.get("employee_id")
         recognized_name = metadata.get("employee_name") or metadata.get("person_name") or best_key
         print(
-            f"[FACE MATCH] camera={camera_id or 'UNKNOWN'} "
-            f"BEST_PERSON={best_key} BEST_SCORE={best_score:.4f} THRESHOLD={RECOGNITION_THRESHOLD:.4f} RESULT=KNOWN"
+            f"[FACE] KNOWN | name={recognized_name} | score={best_score:.4f} | template={best_template}"
         )
         return recognized_name, best_score
 
-    if best_key is not None:
-        print(
-            f"[FACE MATCH] camera={camera_id or 'UNKNOWN'} "
-            f"BEST_PERSON={best_key} BEST_SCORE={best_score:.4f} THRESHOLD={RECOGNITION_THRESHOLD:.4f} RESULT=UNKNOWN"
-        )
-    else:
-        print(f"[FACE MATCH] camera={camera_id or 'UNKNOWN'} RESULT=UNKNOWN reason=no_match")
+    print(
+        f"[FACE] UNKNOWN | best_score={best_score if best_key is not None else 0.0:.4f} | "
+        f"best_person={best_key or 'None'} | threshold={RECOGNITION_THRESHOLD:.2f}"
+    )
 
     face.person_id = None
-    return "Unknown", best_score if best_key is not None else 0.0
+    return "Unknown", max(best_score, 0.0)
 
 
 def boxes_overlap(
@@ -2108,6 +2104,35 @@ def detect_person_boxes(frame):
     ]
 
 
+def _is_plausible_vehicle_box(box, frame_shape):
+    """Reject wall/structural false positives that share a vehicle label but not a vehicle shape."""
+    height, width = frame_shape[:2]
+    x1, y1, x2, y2 = np.asarray(box, dtype=np.float32)
+
+    box_width = max(0.0, x2 - x1)
+    box_height = max(0.0, y2 - y1)
+    area = box_width * box_height
+    frame_area = float(width * height)
+
+    if box_width <= 0 or box_height <= 0:
+        return False
+    if area < 0.0025 * frame_area:
+        return False
+    if area > 0.60 * frame_area:
+        return False
+
+    aspect = box_width / max(box_height, 1.0)
+    if aspect > 7.0 or aspect < 0.18:
+        return False
+
+    if box_height > 0.85 * height and box_width < 0.45 * width:
+        return False
+    if box_width > 0.80 * width and box_height < 0.25 * height:
+        return False
+
+    return True
+
+
 def detect_vehicle_boxes(frame):
 
     results = safe_vehicle_inference(frame)
@@ -2139,6 +2164,9 @@ def detect_vehicle_boxes(frame):
             class_name not in TWO_WHEELER_CLASSES
             and class_name not in FOUR_WHEELER_CLASSES
         ):
+            continue
+
+        if not _is_plausible_vehicle_box(box, frame.shape):
             continue
 
         vehicle_type = (
@@ -3654,12 +3682,12 @@ def _save_registered_person(gate_no, employee_name, designation, employee_id,
         if conn is not None:
             conn.close()
 
-    # Keep the compatibility cache entry but do not use it for recognition.
-    # The live matcher compares every stored template globally before choosing
-    # the best known person.
-    known_embeddings[storage_key] = normalize_embedding(
-        np.asarray(embeddings[0], dtype=np.float32).reshape(-1)
-    )
+    # Keep the compatibility cache entry but do not use it as the primary live
+    # recognition template. The matcher compares every stored template globally.
+    known_embeddings[storage_key] = [
+        normalize_embedding(np.asarray(embedding, dtype=np.float32).reshape(-1))
+        for embedding in embeddings
+    ]
     known_person_metadata[storage_key] = {
         "employee_name": employee_name,
         "person_name": employee_name,

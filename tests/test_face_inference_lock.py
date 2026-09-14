@@ -146,3 +146,38 @@ def test_register_person_refreshes_known_face_cache(monkeypatch):
 
     assert response.status_code == 201
     assert called["count"] == 1
+
+
+def test_detect_vehicle_boxes_rejects_wall_like_false_positive(monkeypatch):
+    frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+
+    class DummyArray:
+        def __init__(self, value):
+            self.value = np.asarray(value, dtype=np.float32)
+
+        def cpu(self):
+            return self
+
+        def numpy(self):
+            return self.value
+
+    class DummyResults:
+        def __init__(self):
+            self.boxes = SimpleNamespace(
+                xyxy=DummyArray([
+                    [10, 10, 150, 700],
+                    [250, 420, 550, 540],
+                ]),
+                cls=DummyArray([2, 2]),
+                conf=DummyArray([0.92, 0.91]),
+            )
+            self.names = {2: "car"}
+
+    monkeypatch.setattr(alcon_stream_new, "safe_vehicle_inference", lambda frame: [DummyResults()])
+
+    vehicles = alcon_stream_new.detect_vehicle_boxes(frame)
+
+    assert len(vehicles) == 1
+    assert vehicles[0]["class_name"] == "car"
+    assert vehicles[0]["box"][0] == 250
+    assert vehicles[0]["box"][2] == 550
