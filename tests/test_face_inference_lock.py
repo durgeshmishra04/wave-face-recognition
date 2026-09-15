@@ -105,6 +105,23 @@ def test_recognize_face_keeps_candidate_and_unknown_distinct(monkeypatch):
     assert unknown_face.recognition_decision == "UNKNOWN"
 
 
+def test_identity_track_requires_spatial_continuity():
+    assert alcon_stream_new._same_face_track(
+        np.array([102, 102, 198, 198]),
+        np.array([100, 100, 200, 200]),
+    )
+    assert not alcon_stream_new._same_face_track(
+        np.array([420, 420, 520, 520]),
+        np.array([100, 100, 200, 200]),
+    )
+
+
+def test_identity_track_configuration_preserves_strong_threshold():
+    assert alcon_stream_new.RECOGNITION_THRESHOLD == pytest.approx(0.50)
+    assert alcon_stream_new.FACE_RECOGNITION_MIN_DET_SCORE == pytest.approx(0.40)
+    assert alcon_stream_new.KNOWN_IDENTITY_MEMORY_TIMEOUT == pytest.approx(2.0)
+
+
 def test_refresh_known_faces_cache_reloads_when_forced(monkeypatch):
     calls = {"count": 0}
 

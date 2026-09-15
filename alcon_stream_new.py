@@ -73,8 +73,11 @@ DET_THRESH = float(os.getenv("DET_THRESH", "0.40"))
 UNKNOWN_FACE_MIN_SCORE = float(
     os.getenv("UNKNOWN_FACE_MIN_SCORE", "0.60")
 )
-FACE_DETECTION_MIN_SCORE = float(
-    os.getenv("FACE_DETECTION_MIN_SCORE", "0.75")
+FACE_RECOGNITION_MIN_DET_SCORE = float(
+    os.getenv("FACE_RECOGNITION_MIN_DET_SCORE", "0.40")
+)
+KNOWN_IDENTITY_MEMORY_TIMEOUT = float(
+    os.getenv("KNOWN_IDENTITY_MEMORY_TIMEOUT", "2.0")
 )
 PERSON_MODEL = os.getenv("PERSON_MODEL", "yolo11n.pt")
 PERSON_CONFIDENCE = float(os.getenv("PERSON_CONFIDENCE", "0.45"))
@@ -2059,6 +2062,40 @@ def boxes_overlap(
     )
 
 
+def _box_center(box):
+    return ((float(box[0]) + float(box[2])) / 2.0,
+            (float(box[1]) + float(box[3])) / 2.0)
+
+
+def _same_face_track(current_box, remembered_box):
+    """Require meaningful continuity before retaining a known identity."""
+    current = np.asarray(current_box, dtype=np.float32)
+    remembered = np.asarray(remembered_box, dtype=np.float32)
+    if current.size != 4 or remembered.size != 4:
+        return False
+    iou = _box_iou(current, remembered)
+    current_center = _box_center(current)
+    remembered_center = _box_center(remembered)
+    current_scale = max(current[2] - current[0], current[3] - current[1], 1.0)
+    center_distance = float(np.hypot(
+        current_center[0] - remembered_center[0],
+        current_center[1] - remembered_center[1],
+    ))
+    return iou >= 0.20 or center_distance <= current_scale * 0.75
+
+
+def _box_iou(first_box, second_box):
+    left = max(float(first_box[0]), float(second_box[0]))
+    top = max(float(first_box[1]), float(second_box[1]))
+    right = min(float(first_box[2]), float(second_box[2]))
+    bottom = min(float(first_box[3]), float(second_box[3]))
+    intersection = max(0.0, right - left) * max(0.0, bottom - top)
+    first_area = max(0.0, float(first_box[2]) - float(first_box[0])) * max(0.0, float(first_box[3]) - float(first_box[1]))
+    second_area = max(0.0, float(second_box[2]) - float(second_box[0])) * max(0.0, float(second_box[3]) - float(second_box[1]))
+    union = first_area + second_area - intersection
+    return intersection / union if union else 0.0
+
+
 def face_inside_person(face_box, person_box):
 
     face_x1, face_y1, face_x2, face_y2 = face_box
@@ -2690,8 +2727,6 @@ def camera_worker(camera_config, rtsp_url=None):
 
                     try:
 
-                        previous_faces = last_faces
-
                         person_boxes = detect_person_boxes(frame)
 
                         if (
@@ -2743,7 +2778,7 @@ def camera_worker(camera_config, rtsp_url=None):
                             face
                             for face in detected_faces
                             if float(getattr(face, "det_score", 0.0))
-                            >= FACE_DETECTION_MIN_SCORE
+                            >= FACE_RECOGNITION_MIN_DET_SCORE
                             and is_plausible_face_detection(face)
                             and face_in_roi(
                                 face.bbox.astype(int),
@@ -2757,8 +2792,17 @@ def camera_worker(camera_config, rtsp_url=None):
                             _camera_log(
                                 camera_id,
                                 f"[FACE] {excluded_face_count} detected face(s) excluded "
-                                f"by confidence/ROI (min_det_score={FACE_DETECTION_MIN_SCORE:.2f})",
+                                f"by confidence/ROI (min_det_score={FACE_RECOGNITION_MIN_DET_SCORE:.2f})",
                             )
+                        for face in detected_faces:
+                            det_score = float(getattr(face, "det_score", 0.0))
+                            if det_score < FACE_RECOGNITION_MIN_DET_SCORE:
+                                _camera_log(
+                                    camera_id,
+                                    f"[FACE] REJECTED | camera={camera_id} | "
+                                    f"det_score={det_score:.4f} | "
+                                    "reason=low_detection_confidence",
+                                )
 
                         now = time.time()
 
@@ -2777,23 +2821,17 @@ def camera_worker(camera_config, rtsp_url=None):
                         # Remove old remembered faces
                         # ----------------------------------------
 
-                        known_face_memory[:] = [
-
-                            remembered_face
-
-                            for remembered_face
-                            in known_face_memory
-
-                            if (
-                                now
-                                -
-                                remembered_face[
-                                    "last_seen"
-                                ]
-                                <
-                                UNKNOWN_GONE_CLEARANCE
-                            )
-                        ]
+                        active_memory = []
+                        for remembered_face in known_face_memory:
+                            if now - remembered_face["last_seen"] < KNOWN_IDENTITY_MEMORY_TIMEOUT:
+                                active_memory.append(remembered_face)
+                            else:
+                                _camera_log(
+                                    camera_id,
+                                    f"[FACE] IDENTITY_CLEARED | camera={camera_id} | "
+                                    f"name={remembered_face['name']} | reason=track_timeout",
+                                )
+                        known_face_memory[:] = active_memory
 
                         # ----------------------------------------
                         # Process faces
@@ -2812,6 +2850,14 @@ def camera_worker(camera_config, rtsp_url=None):
                             current_box = (
                                 face.bbox.astype(int)
                             )
+                            current_body_box = next(
+                                (
+                                    np.asarray(person_box, dtype=np.int32)
+                                    for person_box in person_boxes
+                                    if face_inside_person(current_box, person_box)
+                                ),
+                                None,
+                            )
                             face_is_in_roi = face_in_roi(
                                 current_box,
                                 frame.shape[1],
@@ -2819,66 +2865,107 @@ def camera_worker(camera_config, rtsp_url=None):
                             )
 
 
-                            # The current embedding is authoritative. Previous
-                            # frame and known-face memory must never assign an
-                            # identity when this frame did not pass recognition.
+                            candidate_key = getattr(
+                                face,
+                                "recognition_candidate_key",
+                                None,
+                            )
+                            current_strong_match = (
+                                name != "Unknown"
+                                and candidate_key is not None
+                                and score >= RECOGNITION_THRESHOLD
+                            )
+                            retained_memory = None
+                            if not current_strong_match:
+                                for remembered_face in known_face_memory:
+                                    if not _same_face_track(
+                                        current_box,
+                                        remembered_face["box"],
+                                    ):
+                                        continue
+                                    remembered_body_box = remembered_face.get("body_box")
+                                    if (
+                                        current_body_box is not None
+                                        and remembered_body_box is not None
+                                        and not _same_face_track(
+                                            current_body_box,
+                                            remembered_body_box,
+                                        )
+                                    ):
+                                        continue
+                                    retained_memory = remembered_face
+                                    break
 
-                            # Known face memory
-                            # ------------------------------------
-
-                            if name != "Unknown":
-
+                            if current_strong_match:
+                                metadata = known_person_metadata.get(candidate_key, {})
                                 matching_memory = next(
                                     (
                                         remembered_face
-
-                                        for remembered_face
-                                        in known_face_memory
-
-                                        if (
-                                            remembered_face[
-                                                "name"
-                                            ]
-                                            ==
-                                            name
-                                            and
-                                            boxes_overlap(
-                                                current_box,
-                                                remembered_face[
-                                                    "box"
-                                                ]
-                                            )
+                                        for remembered_face in known_face_memory
+                                        if remembered_face.get("key") == candidate_key
+                                        and _same_face_track(
+                                            current_box,
+                                            remembered_face["box"],
                                         )
                                     ),
-                                    None
+                                    None,
                                 )
-
-
                                 if matching_memory is None:
-
-                                    known_face_memory.append(
-                                        {
-                                            "name": name,
-                                            "score": score,
-                                            "box": current_box,
-                                            "last_seen": now
-                                        }
-                                    )
-
+                                    matching_memory = {
+                                        "key": candidate_key,
+                                        "name": name,
+                                        "employee_id": metadata.get("employee_id"),
+                                        "score": score,
+                                        "last_verified_score": score,
+                                        "box": current_box,
+                                        "body_box": current_body_box,
+                                        "last_seen": now,
+                                        "camera_id": camera_id,
+                                        "identity_source": "face_match",
+                                        "confidence_state": "verified",
+                                    }
+                                    known_face_memory.append(matching_memory)
                                 else:
-
-                                    matching_memory[
-                                        "box"
-                                    ] = current_box
-
-                                    matching_memory[
-                                        "score"
-                                    ] = score
-
-                                    matching_memory[
-                                        "last_seen"
-                                    ] = now
-
+                                    matching_memory.update({
+                                        "name": name,
+                                        "employee_id": metadata.get("employee_id"),
+                                        "score": score,
+                                        "last_verified_score": score,
+                                        "box": current_box,
+                                        "body_box": current_body_box,
+                                        "last_seen": now,
+                                        "confidence_state": "verified",
+                                    })
+                                _camera_log(
+                                    camera_id,
+                                    f"[FACE] KNOWN | name={name} | "
+                                    f"current_similarity={score:.4f} | source=current_match",
+                                )
+                            elif retained_memory is not None:
+                                name = retained_memory["name"]
+                                face.person_id = retained_memory.get("employee_id")
+                                retained_memory.update({
+                                    "box": current_box,
+                                    "body_box": (
+                                        current_body_box
+                                        if current_body_box is not None
+                                        else retained_memory.get("body_box")
+                                    ),
+                                    "last_seen": now,
+                                    "score": score,
+                                    "confidence_state": "retained",
+                                })
+                                face.recognition_decision = "RETAINED"
+                                _camera_log(
+                                    camera_id,
+                                    f"[FACE] KNOWN_RETAINED | camera={camera_id} | "
+                                    f"name={name} | current_similarity={score:.4f} | "
+                                    f"last_verified={retained_memory['last_verified_score']:.4f} | "
+                                    "source=active_track",
+                                )
+                            else:
+                                name = "Unknown"
+                                face.person_id = None
 
                             face.recognized_name = name
 
