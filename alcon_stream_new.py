@@ -73,6 +73,9 @@ DET_THRESH = float(os.getenv("DET_THRESH", "0.40"))
 UNKNOWN_FACE_MIN_SCORE = float(
     os.getenv("UNKNOWN_FACE_MIN_SCORE", "0.60")
 )
+FACE_DETECTION_MIN_SCORE = float(
+    os.getenv("FACE_DETECTION_MIN_SCORE", "0.75")
+)
 PERSON_MODEL = os.getenv("PERSON_MODEL", "yolo11n.pt")
 PERSON_CONFIDENCE = float(os.getenv("PERSON_CONFIDENCE", "0.45"))
 PERSON_IOU = float(os.getenv("PERSON_IOU", "0.45"))
@@ -2103,6 +2106,41 @@ def face_in_roi(face_box, frame_width, frame_height):
     return in_center or in_bottom
 
 
+def is_plausible_face_detection(face):
+    """Reject object regions whose InsightFace landmarks are not face-like."""
+    landmarks = np.asarray(getattr(face, "kps", []), dtype=np.float32)
+    box = np.asarray(getattr(face, "bbox", []), dtype=np.float32).reshape(-1)
+    if landmarks.shape != (5, 2) or box.size != 4:
+        return False
+    if not np.all(np.isfinite(landmarks)) or not np.all(np.isfinite(box)):
+        return False
+
+    x1, y1, x2, y2 = box
+    width = max(x2 - x1, 1.0)
+    height = max(y2 - y1, 1.0)
+    if width / height < 0.35 or width / height > 1.5:
+        return False
+    if np.any(landmarks[:, 0] < x1 - width * 0.15) or np.any(landmarks[:, 0] > x2 + width * 0.15):
+        return False
+    if np.any(landmarks[:, 1] < y1 - height * 0.15) or np.any(landmarks[:, 1] > y2 + height * 0.15):
+        return False
+
+    left_eye, right_eye, nose, left_mouth, right_mouth = landmarks
+    eye_distance = float(np.linalg.norm(right_eye - left_eye))
+    if eye_distance < width * 0.18:
+        return False
+    if abs(float(left_eye[1] - right_eye[1])) > height * 0.30:
+        return False
+    eye_y = (left_eye[1] + right_eye[1]) / 2.0
+    mouth_y = (left_mouth[1] + right_mouth[1]) / 2.0
+    if not eye_y < nose[1] < mouth_y:
+        return False
+    eye_left, eye_right = sorted((left_eye[0], right_eye[0]))
+    if nose[0] < eye_left - eye_distance * 0.60 or nose[0] > eye_right + eye_distance * 0.60:
+        return False
+    return True
+
+
 def vehicle_in_roi(vehicle_box, frame_width, frame_height):
 
     x1, y1, x2, y2 = vehicle_box
@@ -2686,10 +2724,23 @@ def camera_worker(camera_config, rtsp_url=None):
 
                         detected_faces = safe_face_inference(frame)
 
+                        if detected_faces:
+                            _camera_log(
+                                camera_id,
+                                "[FACE] detections="
+                                + ", ".join(
+                                    f"{float(getattr(face, 'det_score', 0.0)):.3f}"
+                                    for face in detected_faces
+                                ),
+                            )
+
                         last_faces = [
                             face
                             for face in detected_faces
-                            if face_in_roi(
+                            if float(getattr(face, "det_score", 0.0))
+                            >= FACE_DETECTION_MIN_SCORE
+                            and is_plausible_face_detection(face)
+                            and face_in_roi(
                                 face.bbox.astype(int),
                                 frame.shape[1],
                                 frame.shape[0],
@@ -2700,7 +2751,8 @@ def camera_worker(camera_config, rtsp_url=None):
                         if excluded_face_count:
                             _camera_log(
                                 camera_id,
-                                f"[FACE] {excluded_face_count} detected face(s) excluded by ROI",
+                                f"[FACE] {excluded_face_count} detected face(s) excluded "
+                                f"by confidence/ROI (min_det_score={FACE_DETECTION_MIN_SCORE:.2f})",
                             )
 
                         now = time.time()
@@ -2827,6 +2879,9 @@ def camera_worker(camera_config, rtsp_url=None):
 
                             face.recognition_score = score
                             face.in_roi = face_is_in_roi
+                            # A geometrically valid face may still be unknown;
+                            # database similarity must not suppress its alert.
+                            face.unknown_evidence = True
 
                             face_detection_score = float(
                                 getattr(face, "det_score", 0.0)
@@ -2836,6 +2891,7 @@ def camera_worker(camera_config, rtsp_url=None):
                             if (
                                 name == "Unknown"
                                 and face_is_in_roi
+                                and face.unknown_evidence
                                 and face_detection_score
                                 >= UNKNOWN_FACE_MIN_SCORE
                             ):
@@ -2862,6 +2918,7 @@ def camera_worker(camera_config, rtsp_url=None):
                                 (
                                     face
                                     for face in last_faces
+                                    if getattr(face, "unknown_evidence", False)
                                     if face_inside_person(
                                         face.bbox.astype(int),
                                         person_box,
@@ -3096,6 +3153,12 @@ def camera_worker(camera_config, rtsp_url=None):
 
                 for face in last_faces:
 
+                    if (
+                        getattr(face, "recognized_name", "Unknown") == "Unknown"
+                        and not getattr(face, "unknown_evidence", False)
+                    ):
+                        continue
+
                     x1, y1, x2, y2 = (
                         face.bbox.astype(int)
                     )
@@ -3195,6 +3258,12 @@ def camera_worker(camera_config, rtsp_url=None):
                     send_frame = frame.copy()
 
                     for face in last_faces:
+
+                        if (
+                            getattr(face, "recognized_name", "Unknown") == "Unknown"
+                            and not getattr(face, "unknown_evidence", False)
+                        ):
+                            continue
 
                         x1, y1, x2, y2 = (
                             face.bbox.astype(int)
