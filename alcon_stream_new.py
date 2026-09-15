@@ -66,9 +66,6 @@ RECOGNITION_CANDIDATE_THRESHOLD = float(
     os.getenv("RECOGNITION_CANDIDATE_THRESHOLD", "0.43")
 )
 RECOGNITION_MARGIN = float(os.getenv("RECOGNITION_MARGIN", "0.05"))
-RECOGNITION_CONFIRM_FRAMES = int(
-    os.getenv("RECOGNITION_CONFIRM_FRAMES", "2")
-)
 PROCESS_EVERY_N_FRAMES = 2
 DET_SIZE_VALUE = int(os.getenv("DET_SIZE", "800"))
 DET_SIZE = (DET_SIZE_VALUE, DET_SIZE_VALUE)
@@ -1900,6 +1897,7 @@ def safe_vehicle_inference(frame):
 
 def recognize_face(face, camera_id=None):
     """Compare a live face against every template, ranked by person."""
+    face.recognition_embedding_valid = False
     face.recognition_candidate_name = None
     face.recognition_candidate_score = 0.0
     face.recognition_candidate_key = None
@@ -1926,6 +1924,8 @@ def recognize_face(face, camera_id=None):
         print(f"[FACE] UNKNOWN | best_score=0.00 | best_person=None | threshold={RECOGNITION_THRESHOLD:.2f} | reason=invalid_live_embedding")
         face.person_id = None
         return "Unknown", 0.0
+
+    face.recognition_embedding_valid = True
 
     person_scores = {}
     person_templates = {}
@@ -2504,7 +2504,6 @@ def camera_worker(camera_config, rtsp_url=None):
     last_vehicles = []
 
     known_face_memory = []
-    candidate_face_memory = []
 
     unknown_frame_history = deque(maxlen=5)
     max_unknown_count = 0
@@ -2739,10 +2738,6 @@ def camera_worker(camera_config, rtsp_url=None):
                             )
                         ]
 
-                        for candidate in candidate_face_memory:
-                            candidate["matched_this_cycle"] = False
-
-
                         # ----------------------------------------
                         # Process faces
                         # ----------------------------------------
@@ -2757,22 +2752,6 @@ def camera_worker(camera_config, rtsp_url=None):
                                 camera_id=camera_id,
                             )
 
-                            candidate_name = getattr(
-                                face,
-                                "recognition_candidate_name",
-                                None,
-                            )
-                            candidate_key = getattr(
-                                face,
-                                "recognition_candidate_key",
-                                None,
-                            )
-                            candidate_score = float(getattr(
-                                face,
-                                "recognition_candidate_score",
-                                score,
-                            ))
-
                             current_box = (
                                 face.bbox.astype(int)
                             )
@@ -2783,117 +2762,9 @@ def camera_worker(camera_config, rtsp_url=None):
                             )
 
 
-                            # ------------------------------------
-                            # Previous frame matching
-                            # ------------------------------------
-
-                            if name == "Unknown" and not candidate_name:
-
-                                for previous_face in previous_faces:
-
-                                    previous_name = getattr(
-                                        previous_face,
-                                        "recognized_name",
-                                        "Unknown"
-                                    )
-
-                                    if (
-                                        previous_name
-                                        !=
-                                        "Unknown"
-                                        and
-                                        boxes_overlap(
-                                            current_box,
-                                            previous_face.bbox.astype(
-                                                int
-                                            )
-                                        )
-                                    ):
-
-                                        name = previous_name
-
-                                        score = getattr(
-                                            previous_face,
-                                            "recognition_score",
-                                            score
-                                        )
-
-                                        break
-
-
-                            # ------------------------------------
-                            # Memory matching
-                            # ------------------------------------
-
-                            if name == "Unknown" and not candidate_name:
-
-                                for remembered_face in known_face_memory:
-
-                                    if boxes_overlap(
-                                        current_box,
-                                        remembered_face["box"]
-                                    ):
-
-                                        name = remembered_face[
-                                            "name"
-                                        ]
-
-                                        score = remembered_face[
-                                            "score"
-                                        ]
-
-                                        remembered_face[
-                                            "box"
-                                        ] = current_box
-
-                                        remembered_face[
-                                            "last_seen"
-                                        ] = now
-
-                                        break
-
-
-                            # ------------------------------------
-                            if name == "Unknown" and candidate_name:
-                                candidate_match = next(
-                                    (
-                                        candidate
-                                        for candidate in candidate_face_memory
-                                        if candidate["key"] == candidate_key
-                                        and boxes_overlap(
-                                            current_box,
-                                            candidate["box"],
-                                        )
-                                    ),
-                                    None,
-                                )
-                                if candidate_match is None:
-                                    candidate_face_memory.append({
-                                        "key": candidate_key,
-                                        "name": candidate_name,
-                                        "score": candidate_score,
-                                        "box": current_box,
-                                        "count": 1,
-                                        "matched_this_cycle": True,
-                                    })
-                                else:
-                                    candidate_match["count"] += 1
-                                    candidate_match["score"] = candidate_score
-                                    candidate_match["box"] = current_box
-                                    candidate_match["matched_this_cycle"] = True
-                                    if candidate_match["count"] >= max(1, RECOGNITION_CONFIRM_FRAMES):
-                                        name = candidate_name
-                                        score = candidate_score
-                                        face.person_id = known_person_metadata.get(
-                                            candidate_key, {}
-                                        ).get("employee_id")
-                                        face.recognition_decision = "KNOWN"
-                                        _camera_log(
-                                            camera_id,
-                                            f"[FACE] CANDIDATE PROMOTED | person={candidate_name} "
-                                            f"score={candidate_score:.4f} | "
-                                            f"confirmations={candidate_match['count']} | decision=KNOWN",
-                                        )
+                            # The current embedding is authoritative. Previous
+                            # frame and known-face memory must never assign an
+                            # identity when this frame did not pass recognition.
 
                             # Known face memory
                             # ------------------------------------
@@ -2972,11 +2843,6 @@ def camera_worker(camera_config, rtsp_url=None):
                                 seen_unknown_in_frame = True
                                 unknown_count_in_frame += 1
 
-                        candidate_face_memory[:] = [
-                            candidate
-                            for candidate in candidate_face_memory
-                            if candidate["matched_this_cycle"]
-                        ]
 
                         roi_person_boxes = [
                             person_box
