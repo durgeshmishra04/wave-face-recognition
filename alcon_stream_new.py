@@ -2856,22 +2856,6 @@ def camera_worker(camera_config, rtsp_url=None):
                                 or person_box in vehicle_person_boxes
                             )
                         ]
-                        known_person_boxes = [
-                            person_box
-                            for person_box in roi_person_boxes
-                            if any(
-                                getattr(
-                                    face,
-                                    "recognized_name",
-                                    "Unknown"
-                                ) != "Unknown"
-                                and face_inside_person(
-                                    face.bbox.astype(int),
-                                    person_box,
-                                )
-                                for face in last_faces
-                            )
-                        ]
                         last_event_people = []
                         for person_box in roi_person_boxes:
                             matched_face = next(
@@ -2913,24 +2897,17 @@ def camera_worker(camera_config, rtsp_url=None):
                                         ),
                                     )
                                 )
-                        unmatched_person_count = max(
-                            0,
-                            len(roi_person_boxes)
-                            -
-                            len(known_person_boxes)
-                        )
                         unknown_vehicle_person_detected = any(
-                            person_box in vehicle_person_boxes
-                            and person_box not in known_person_boxes
-                            for person_box in roi_person_boxes
-                        )
-
-                        if unmatched_person_count:
-                            seen_unknown_in_frame = True
-                            unknown_count_in_frame = max(
-                                unknown_count_in_frame,
-                                unmatched_person_count,
+                            getattr(face, "recognized_name", "Unknown") == "Unknown"
+                            and any(
+                                face_inside_person(
+                                    face.bbox.astype(int),
+                                    person_box,
+                                )
+                                for person_box in vehicle_person_boxes
                             )
+                            for face in last_faces
+                        )
 
                         if now - last_detection_log_time >= 5.0:
 
