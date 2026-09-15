@@ -41,6 +41,70 @@ def test_recognize_face_uses_best_individual_template(monkeypatch):
     assert face.person_id == "E-1"
 
 
+def test_recognize_face_uses_second_best_person_for_margin(monkeypatch):
+    monkeypatch.setattr(
+        alcon_stream_new,
+        "known_face_templates",
+        {
+            "REG_1": [
+                np.array([1.0, 0.0], dtype=np.float32),
+                np.array([0.99, 0.1], dtype=np.float32),
+            ],
+            "REG_2": [np.array([0.98, 0.2], dtype=np.float32)],
+        },
+    )
+    monkeypatch.setattr(
+        alcon_stream_new,
+        "known_person_metadata",
+        {
+            "REG_1": {"employee_name": "Alice", "employee_id": "E-1"},
+            "REG_2": {"employee_name": "Bob", "employee_id": "E-2"},
+        },
+    )
+
+    face = SimpleNamespace(
+        embedding=np.array([1.0, 0.0], dtype=np.float32), person_id=None
+    )
+    name, score = alcon_stream_new.recognize_face(face, camera_id="CAM01")
+
+    assert name == "Unknown"
+    assert score == pytest.approx(1.0)
+    assert face.recognition_second_score == pytest.approx(0.98)
+    assert face.recognition_margin == pytest.approx(0.02)
+    assert face.recognition_decision == "PENDING"
+
+
+def test_recognize_face_keeps_candidate_and_unknown_distinct(monkeypatch):
+    monkeypatch.setattr(
+        alcon_stream_new,
+        "known_face_templates",
+        {"REG_1": [np.array([1.0, 0.0], dtype=np.float32)]},
+    )
+    monkeypatch.setattr(
+        alcon_stream_new,
+        "known_person_metadata",
+        {"REG_1": {"employee_name": "Alice", "employee_id": "E-1"}},
+    )
+
+    weak_face = SimpleNamespace(
+        embedding=np.array([0.46, np.sqrt(1 - 0.46**2)], dtype=np.float32),
+        person_id=None,
+    )
+    name, _ = alcon_stream_new.recognize_face(weak_face, camera_id="CAM01")
+    assert name == "Unknown"
+    assert weak_face.recognition_candidate_name == "Alice"
+    assert weak_face.recognition_decision == "PENDING"
+
+    unknown_face = SimpleNamespace(
+        embedding=np.array([0.38, np.sqrt(1 - 0.38**2)], dtype=np.float32),
+        person_id=None,
+    )
+    name, _ = alcon_stream_new.recognize_face(unknown_face, camera_id="CAM01")
+    assert name == "Unknown"
+    assert unknown_face.recognition_candidate_name == "Alice"
+    assert unknown_face.recognition_decision == "UNKNOWN"
+
+
 def test_refresh_known_faces_cache_reloads_when_forced(monkeypatch):
     calls = {"count": 0}
 
