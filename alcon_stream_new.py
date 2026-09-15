@@ -2118,7 +2118,7 @@ def is_plausible_face_detection(face):
     x1, y1, x2, y2 = box
     width = max(x2 - x1, 1.0)
     height = max(y2 - y1, 1.0)
-    if width / height < 0.35 or width / height > 1.5:
+    if width / height < 0.55 or width / height > 1.30:
         return False
     if np.any(landmarks[:, 0] < x1 - width * 0.15) or np.any(landmarks[:, 0] > x2 + width * 0.15):
         return False
@@ -2127,13 +2127,18 @@ def is_plausible_face_detection(face):
 
     left_eye, right_eye, nose, left_mouth, right_mouth = landmarks
     eye_distance = float(np.linalg.norm(right_eye - left_eye))
-    if eye_distance < width * 0.18:
+    if eye_distance < width * 0.30 or eye_distance > width * 0.85:
         return False
     if abs(float(left_eye[1] - right_eye[1])) > height * 0.30:
         return False
     eye_y = (left_eye[1] + right_eye[1]) / 2.0
     mouth_y = (left_mouth[1] + right_mouth[1]) / 2.0
     if not eye_y < nose[1] < mouth_y:
+        return False
+    mouth_width = abs(float(right_mouth[0] - left_mouth[0]))
+    if mouth_width < width * 0.18 or mouth_width > width * 0.90:
+        return False
+    if nose[1] - eye_y < height * 0.12 or mouth_y - nose[1] < height * 0.08:
         return False
     eye_left, eye_right = sorted((left_eye[0], right_eye[0]))
     if nose[0] < eye_left - eye_distance * 0.60 or nose[0] > eye_right + eye_distance * 0.60:
