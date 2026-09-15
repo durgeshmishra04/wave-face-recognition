@@ -138,6 +138,19 @@ def test_face_association_requires_a_person_box():
     ) is None
 
 
+def test_vehicle_alert_roi_uses_configured_rectangle():
+    assert alcon_stream_new.vehicle_in_roi(
+        np.array([400, 300, 520, 450]),
+        1280,
+        720,
+    )
+    assert not alcon_stream_new.vehicle_in_roi(
+        np.array([400, 520, 520, 700]),
+        1280,
+        720,
+    )
+
+
 def test_refresh_known_faces_cache_reloads_when_forced(monkeypatch):
     calls = {"count": 0}
 
