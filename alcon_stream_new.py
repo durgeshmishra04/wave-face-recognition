@@ -76,6 +76,8 @@ UNKNOWN_FACE_MIN_SCORE = float(
 FACE_RECOGNITION_MIN_DET_SCORE = float(
     os.getenv("FACE_RECOGNITION_MIN_DET_SCORE", "0.40")
 )
+FACE_MIN_WIDTH_RATIO = float(os.getenv("FACE_MIN_WIDTH_RATIO", "0.008"))
+FACE_MIN_HEIGHT_RATIO = float(os.getenv("FACE_MIN_HEIGHT_RATIO", "0.012"))
 KNOWN_IDENTITY_MEMORY_TIMEOUT = float(
     os.getenv("KNOWN_IDENTITY_MEMORY_TIMEOUT", "2.0")
 )
@@ -2183,6 +2185,32 @@ def is_plausible_face_detection(face):
     return True
 
 
+def face_associated_with_person(face_box, person_boxes, frame_shape):
+    """Return the person box containing a face center, with a small margin."""
+    frame_height, frame_width = frame_shape[:2]
+    face_box = np.asarray(face_box, dtype=np.float32)
+    face_width = max(face_box[2] - face_box[0], 0.0)
+    face_height = max(face_box[3] - face_box[1], 0.0)
+    if (
+        face_width < frame_width * FACE_MIN_WIDTH_RATIO
+        or face_height < frame_height * FACE_MIN_HEIGHT_RATIO
+    ):
+        return None
+    margin_ratio = 0.08
+    center_x = (face_box[0] + face_box[2]) / 2.0
+    center_y = (face_box[1] + face_box[3]) / 2.0
+    for person_box in person_boxes:
+        person_box = np.asarray(person_box, dtype=np.float32)
+        person_width = max(person_box[2] - person_box[0], 1.0)
+        person_height = max(person_box[3] - person_box[1], 1.0)
+        if (
+            person_box[0] - person_width * margin_ratio <= center_x <= person_box[2] + person_width * margin_ratio
+            and person_box[1] - person_height * margin_ratio <= center_y <= person_box[3] + person_height * margin_ratio
+        ):
+            return person_box.astype(np.int32)
+    return None
+
+
 def vehicle_in_roi(vehicle_box, frame_width, frame_height):
 
     x1, y1, x2, y2 = vehicle_box
@@ -2774,18 +2802,57 @@ def camera_worker(camera_config, rtsp_url=None):
                                 ),
                             )
 
-                        last_faces = [
-                            face
-                            for face in detected_faces
-                            if float(getattr(face, "det_score", 0.0))
-                            >= FACE_RECOGNITION_MIN_DET_SCORE
-                            and is_plausible_face_detection(face)
-                            and face_in_roi(
-                                face.bbox.astype(int),
+                        now = time.time()
+                        accepted_faces = []
+                        for face in detected_faces:
+                            det_score = float(getattr(face, "det_score", 0.0))
+                            face_box = face.bbox.astype(int)
+                            associated_person_box = face_associated_with_person(
+                                face_box,
+                                person_boxes,
+                                frame.shape,
+                            )
+                            active_track_match = any(
+                                now - remembered_face["last_seen"]
+                                < KNOWN_IDENTITY_MEMORY_TIMEOUT
+                                and _same_face_track(
+                                    face_box,
+                                    remembered_face["box"],
+                                )
+                                for remembered_face in known_face_memory
+                            )
+                            if det_score < FACE_RECOGNITION_MIN_DET_SCORE:
+                                _camera_log(
+                                    camera_id,
+                                    f"[FACE] REJECTED | camera={camera_id} | "
+                                    f"reason=low_detection_confidence | det_score={det_score:.3f}",
+                                )
+                                continue
+                            if not is_plausible_face_detection(face):
+                                _camera_log(
+                                    camera_id,
+                                    f"[FACE] REJECTED | camera={camera_id} | "
+                                    f"reason=invalid_face_geometry | det_score={det_score:.3f}",
+                                )
+                                continue
+                            if not face_in_roi(
+                                face_box,
                                 frame.shape[1],
                                 frame.shape[0],
-                            )
-                        ]
+                            ):
+                                continue
+                            if associated_person_box is None and not active_track_match:
+                                _camera_log(
+                                    camera_id,
+                                    f"[FACE] REJECTED | camera={camera_id} | "
+                                    f"reason=no_person_association | det_score={det_score:.3f}",
+                                )
+                                continue
+                            face.associated_person_box = associated_person_box
+                            face.person_associated = associated_person_box is not None
+                            accepted_faces.append(face)
+
+                        last_faces = accepted_faces
 
                         excluded_face_count = len(detected_faces) - len(last_faces)
                         if excluded_face_count:
@@ -2794,17 +2861,6 @@ def camera_worker(camera_config, rtsp_url=None):
                                 f"[FACE] {excluded_face_count} detected face(s) excluded "
                                 f"by confidence/ROI (min_det_score={FACE_RECOGNITION_MIN_DET_SCORE:.2f})",
                             )
-                        for face in detected_faces:
-                            det_score = float(getattr(face, "det_score", 0.0))
-                            if det_score < FACE_RECOGNITION_MIN_DET_SCORE:
-                                _camera_log(
-                                    camera_id,
-                                    f"[FACE] REJECTED | camera={camera_id} | "
-                                    f"det_score={det_score:.4f} | "
-                                    "reason=low_detection_confidence",
-                                )
-
-                        now = time.time()
 
                         if not detected_faces and now - last_detection_log_time >= 5.0:
                             _camera_log(
@@ -2850,14 +2906,20 @@ def camera_worker(camera_config, rtsp_url=None):
                             current_box = (
                                 face.bbox.astype(int)
                             )
-                            current_body_box = next(
-                                (
-                                    np.asarray(person_box, dtype=np.int32)
-                                    for person_box in person_boxes
-                                    if face_inside_person(current_box, person_box)
-                                ),
+                            current_body_box = getattr(
+                                face,
+                                "associated_person_box",
                                 None,
                             )
+                            if current_body_box is None:
+                                current_body_box = next(
+                                    (
+                                        np.asarray(person_box, dtype=np.int32)
+                                        for person_box in person_boxes
+                                        if face_inside_person(current_box, person_box)
+                                    ),
+                                    None,
+                                )
                             face_is_in_roi = face_in_roi(
                                 current_box,
                                 frame.shape[1],

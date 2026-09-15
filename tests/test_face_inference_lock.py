@@ -122,6 +122,22 @@ def test_identity_track_configuration_preserves_strong_threshold():
     assert alcon_stream_new.KNOWN_IDENTITY_MEMORY_TIMEOUT == pytest.approx(2.0)
 
 
+def test_face_association_requires_a_person_box():
+    face_box = np.array([100, 100, 180, 190], dtype=np.int32)
+    person_box = np.array([60, 60, 240, 400], dtype=np.int32)
+
+    assert alcon_stream_new.face_associated_with_person(
+        face_box,
+        [person_box],
+        (720, 1280, 3),
+    ) is not None
+    assert alcon_stream_new.face_associated_with_person(
+        face_box,
+        [],
+        (720, 1280, 3),
+    ) is None
+
+
 def test_refresh_known_faces_cache_reloads_when_forced(monkeypatch):
     calls = {"count": 0}
 
