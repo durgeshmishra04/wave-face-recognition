@@ -2823,11 +2823,21 @@ def camera_worker(camera_config, rtsp_url=None):
                                     f"reason=invalid_face_geometry | det_score={det_score:.3f}",
                                 )
                                 continue
+                            associated_with_vehicle = (
+                                associated_person_box is not None
+                                and any(
+                                    np.array_equal(
+                                        associated_person_box,
+                                        vehicle_person_box,
+                                    )
+                                    for vehicle_person_box in vehicle_person_boxes
+                                )
+                            )
                             if not face_in_roi(
                                 face_box,
                                 frame.shape[1],
                                 frame.shape[0],
-                            ):
+                            ) and not associated_with_vehicle:
                                 continue
                             if associated_person_box is None and not active_track_match:
                                 _camera_log(
@@ -2838,6 +2848,7 @@ def camera_worker(camera_config, rtsp_url=None):
                                 continue
                             face.associated_person_box = associated_person_box
                             face.person_associated = associated_person_box is not None
+                            face.vehicle_context = associated_with_vehicle
                             accepted_faces.append(face)
 
                         last_faces = accepted_faces
@@ -3051,7 +3062,10 @@ def camera_worker(camera_config, rtsp_url=None):
                                     frame.shape[1],
                                     frame.shape[0],
                                 )
-                                or person_box in vehicle_person_boxes
+                                or any(
+                                    np.array_equal(person_box, vehicle_person_box)
+                                    for vehicle_person_box in vehicle_person_boxes
+                                )
                             )
                         ]
                         last_event_people = []
