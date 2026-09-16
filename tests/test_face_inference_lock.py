@@ -452,6 +452,49 @@ def test_registration_face_inference_retries_larger_detector_size(monkeypatch):
     ]
 
 
+def test_registration_face_inference_retries_with_reflected_padding(monkeypatch):
+    calls = []
+    face = SimpleNamespace(
+        bbox=np.array([60, 45, 160, 145], dtype=np.float32),
+        kps=np.array([[80, 70], [140, 70], [110, 95], [85, 120], [135, 120]], dtype=np.float32),
+        det_score=0.9,
+        embedding=np.ones(512, dtype=np.float32),
+    )
+
+    class FakeFaceApp:
+        models = {}
+
+        def prepare(self, **kwargs):
+            calls.append(("prepare", kwargs["det_size"], kwargs["det_thresh"]))
+
+        def get(self, frame):
+            calls.append(("get", frame.shape))
+            return [face] if len([call for call in calls if call[0] == "get"]) == 3 else []
+
+    monkeypatch.setattr(alcon_stream_new, "face_app", FakeFaceApp())
+    monkeypatch.setattr(
+        alcon_stream_new,
+        "_face_runtime_diagnostics",
+        lambda: {"providers": ["CPUExecutionProvider"]},
+    )
+    monkeypatch.setattr(alcon_stream_new, "REGISTRATION_FALLBACK_PADDING_RATIO", 0.25)
+
+    result = alcon_stream_new.safe_registration_face_inference(
+        np.zeros((100, 200, 3), dtype=np.uint8)
+    )
+
+    assert result == [face]
+    assert calls == [
+        ("get", (100, 200, 3)),
+        ("prepare", alcon_stream_new.REGISTRATION_FALLBACK_DET_SIZE, alcon_stream_new.DET_THRESH),
+        ("get", (100, 200, 3)),
+        ("get", (150, 300, 3)),
+        ("prepare", alcon_stream_new.DET_SIZE, alcon_stream_new.DET_THRESH),
+    ]
+    assert face.bbox.tolist() == [10.0, 20.0, 110.0, 120.0]
+    assert face.kps.tolist() == [[30.0, 45.0], [90.0, 45.0], [60.0, 70.0], [35.0, 95.0], [85.0, 95.0]]
+
+
 def test_detect_vehicle_boxes_rejects_wall_like_false_positive(monkeypatch):
     frame = np.zeros((720, 1280, 3), dtype=np.uint8)
 

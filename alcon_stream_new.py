@@ -80,6 +80,9 @@ REGISTRATION_FALLBACK_DET_SIZE = (
     REGISTRATION_FALLBACK_DET_SIZE_VALUE,
     REGISTRATION_FALLBACK_DET_SIZE_VALUE,
 )
+REGISTRATION_FALLBACK_PADDING_RATIO = float(
+    os.getenv("REGISTRATION_FALLBACK_PADDING_RATIO", "0.25")
+)
 UNKNOWN_FACE_MIN_SCORE = float(
     os.getenv("UNKNOWN_FACE_MIN_SCORE", "0.60")
 )
@@ -1859,7 +1862,7 @@ def safe_face_inference(frame):
 
 
 def safe_registration_face_inference(frame):
-    """Detect registration faces with one controlled larger-scale retry."""
+    """Detect registration faces with safe retries for close-up portraits."""
     if face_app is None:
         return []
 
@@ -1908,7 +1911,26 @@ def safe_registration_face_inference(frame):
                 f"face_count={len(fallback_faces)} "
                 f"faces={_face_detection_summary(fallback_faces)}"
             )
-            return fallback_faces
+            if fallback_faces:
+                return fallback_faces
+
+            padded_frame, pad_x, pad_y = _pad_registration_frame(frame)
+            print(
+                "[REGISTRATION FALLBACK] fallback_faces=0 "
+                "preprocessing=reflect_padding "
+                f"padding={pad_x}x{pad_y} "
+                f"padded_dimensions={padded_frame.shape[1]}x{padded_frame.shape[0]}"
+            )
+            padded_faces = face_app.get(padded_frame)
+            _translate_registration_faces_from_padded_frame(
+                padded_faces, pad_x, pad_y,
+            )
+            print(
+                "[REGISTRATION DETECTION] attempt=padded_fallback "
+                f"face_count={len(padded_faces)} "
+                f"faces={_face_detection_summary(padded_faces)}"
+            )
+            return padded_faces
         finally:
             # Registration is allowed to use a larger detector input, but the
             # shared live pipeline must return to its production configuration.
@@ -1917,6 +1939,37 @@ def safe_registration_face_inference(frame):
                 det_size=DET_SIZE,
                 det_thresh=DET_THRESH,
             )
+
+
+def _pad_registration_frame(frame):
+    """Add reflected context around a close portrait for detector-only retry."""
+    if frame is None or frame.ndim != 3 or not frame.size:
+        raise ValueError("Registration image is not a valid colour frame")
+
+    height, width = frame.shape[:2]
+    padding_ratio = max(REGISTRATION_FALLBACK_PADDING_RATIO, 0.0)
+    pad_x = max(1, int(np.ceil(width * padding_ratio)))
+    pad_y = max(1, int(np.ceil(height * padding_ratio)))
+    padded = cv2.copyMakeBorder(
+        frame,
+        pad_y,
+        pad_y,
+        pad_x,
+        pad_x,
+        cv2.BORDER_REFLECT_101,
+    )
+    return padded, pad_x, pad_y
+
+
+def _translate_registration_faces_from_padded_frame(faces, pad_x, pad_y):
+    """Map real padded-frame detector geometry to the original image space."""
+    offset = np.array([pad_x, pad_y, pad_x, pad_y], dtype=np.float32)
+    landmark_offset = np.array([pad_x, pad_y], dtype=np.float32)
+    for face in faces:
+        face.bbox = np.asarray(face.bbox, dtype=np.float32) - offset
+        landmarks = getattr(face, "kps", None)
+        if landmarks is not None:
+            face.kps = np.asarray(landmarks, dtype=np.float32) - landmark_offset
 
 
 def _face_runtime_diagnostics():
