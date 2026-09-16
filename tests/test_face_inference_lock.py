@@ -259,6 +259,28 @@ def test_person_track_preserves_established_identity_fields():
     assert tracks[0]["employee_name"] == "Ramesh"
 
 
+def test_registration_quality_rejects_tiny_face():
+    image = np.zeros((1000, 1000, 3), dtype=np.uint8)
+    face = SimpleNamespace(
+        bbox=np.array([480, 480, 540, 540], dtype=np.float32),
+        det_score=0.95,
+    )
+
+    with pytest.raises(ValueError, match="too small"):
+        alcon_stream_new._validate_registration_face_quality(face, image, 1)
+
+
+def test_registration_quality_accepts_large_sharp_face():
+    image = np.indices((1000, 1000), dtype=np.uint8).sum(axis=0) % 2
+    image = (np.repeat(image[:, :, None], 3, axis=2) * 255).astype(np.uint8)
+    face = SimpleNamespace(
+        bbox=np.array([250, 200, 750, 800], dtype=np.float32),
+        det_score=0.95,
+    )
+
+    alcon_stream_new._validate_registration_face_quality(face, image, 1)
+
+
 def test_refresh_known_faces_cache_reloads_when_forced(monkeypatch):
     calls = {"count": 0}
 

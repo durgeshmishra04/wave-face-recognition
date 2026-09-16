@@ -80,6 +80,27 @@ FACE_RECOGNITION_MIN_DET_SCORE = float(
 )
 FACE_MIN_WIDTH_RATIO = float(os.getenv("FACE_MIN_WIDTH_RATIO", "0.008"))
 FACE_MIN_HEIGHT_RATIO = float(os.getenv("FACE_MIN_HEIGHT_RATIO", "0.012"))
+REGISTRATION_MIN_FACE_WIDTH_RATIO = float(
+    os.getenv("REGISTRATION_MIN_FACE_WIDTH_RATIO", "0.12")
+)
+REGISTRATION_MIN_FACE_HEIGHT_RATIO = float(
+    os.getenv("REGISTRATION_MIN_FACE_HEIGHT_RATIO", "0.12")
+)
+REGISTRATION_MIN_FACE_PIXELS = int(
+    os.getenv("REGISTRATION_MIN_FACE_PIXELS", "80")
+)
+REGISTRATION_FACE_EDGE_MARGIN = float(
+    os.getenv("REGISTRATION_FACE_EDGE_MARGIN", "0.03")
+)
+REGISTRATION_MIN_DET_SCORE = float(
+    os.getenv("REGISTRATION_MIN_DET_SCORE", "0.40")
+)
+REGISTRATION_MIN_BLUR_SCORE = float(
+    os.getenv("REGISTRATION_MIN_BLUR_SCORE", "40.0")
+)
+REGISTRATION_IDENTICAL_SIMILARITY = float(
+    os.getenv("REGISTRATION_IDENTICAL_SIMILARITY", "0.995")
+)
 KNOWN_IDENTITY_MEMORY_TIMEOUT = float(
     os.getenv("KNOWN_IDENTITY_MEMORY_TIMEOUT", "2.0")
 )
@@ -3954,14 +3975,122 @@ def _validate_registration_images():
             raise ValueError(f"No face detected in image {number}")
         if len(faces) != 1:
             raise ValueError(f"Image {number} must contain exactly one face")
-        embedding = normalize_embedding(faces[0].embedding)
-        if embedding.size == 0:
+        face = faces[0]
+        _validate_registration_face_quality(face, image, number)
+        try:
+            embedding = np.asarray(face.embedding, dtype=np.float32).reshape(-1)
+        except Exception as error:
             raise ValueError(
-                f"Unable to generate face embedding for image {number}"
+                f"Unable to generate face embedding in image {number}"
+            ) from error
+        if embedding.size != 512 or not np.all(np.isfinite(embedding)):
+            raise ValueError(
+                f"Invalid face embedding in image {number}. Expected 512 dimensions."
+            )
+        embedding = normalize_embedding(embedding)
+        if embedding.size != 512 or not np.all(np.isfinite(embedding)):
+            raise ValueError(
+                f"Unable to generate a valid face embedding in image {number}"
             )
         images.append(image)
         embeddings.append(embedding)
+    pairwise_similarities = [
+        float(np.dot(first, second))
+        for index, first in enumerate(embeddings)
+        for second in embeddings[index + 1:]
+    ]
+    if pairwise_similarities and min(pairwise_similarities) >= REGISTRATION_IDENTICAL_SIMILARITY:
+        raise ValueError(
+            "The five face images are nearly identical. "
+            "Please capture the requested different face angles."
+        )
     return images, embeddings
+
+
+def _validate_registration_face_quality(face, image, number):
+    """Reject low-quality registration faces before generating templates."""
+    image_height, image_width = image.shape[:2]
+    try:
+        x1, y1, x2, y2 = (
+            np.asarray(face.bbox, dtype=np.float32).reshape(-1).tolist()
+        )
+    except (TypeError, ValueError):
+        print(f"[REGISTRATION FACE] image={number} quality=FAIL reason=invalid_face_box")
+        raise ValueError(f"Invalid face position in image {number}")
+
+    face_width = x2 - x1
+    face_height = y2 - y1
+    face_width_ratio = face_width / max(float(image_width), 1.0)
+    face_height_ratio = face_height / max(float(image_height), 1.0)
+    det_score = float(getattr(face, "det_score", 0.0))
+
+    if face_width <= 0 or face_height <= 0:
+        reason = "invalid_face_box"
+    elif face_width < REGISTRATION_MIN_FACE_PIXELS or face_height < REGISTRATION_MIN_FACE_PIXELS:
+        reason = "face_too_small"
+    elif (
+        face_width_ratio < REGISTRATION_MIN_FACE_WIDTH_RATIO
+        or face_height_ratio < REGISTRATION_MIN_FACE_HEIGHT_RATIO
+    ):
+        reason = "face_too_small"
+    elif (
+        x1 < image_width * REGISTRATION_FACE_EDGE_MARGIN
+        or y1 < image_height * REGISTRATION_FACE_EDGE_MARGIN
+        or x2 > image_width * (1.0 - REGISTRATION_FACE_EDGE_MARGIN)
+        or y2 > image_height * (1.0 - REGISTRATION_FACE_EDGE_MARGIN)
+    ):
+        reason = "face_partially_outside_frame"
+    elif det_score < REGISTRATION_MIN_DET_SCORE:
+        reason = "low_detection_confidence"
+    else:
+        landmarks = np.asarray(getattr(face, "kps", []), dtype=np.float32)
+        if landmarks.size and (
+            landmarks.shape != (5, 2)
+            or not np.all(np.isfinite(landmarks))
+            or np.any(landmarks[:, 0] < x1 - face_width * 0.20)
+            or np.any(landmarks[:, 0] > x2 + face_width * 0.20)
+            or np.any(landmarks[:, 1] < y1 - face_height * 0.20)
+            or np.any(landmarks[:, 1] > y2 + face_height * 0.20)
+        ):
+            reason = "invalid_face_geometry"
+        else:
+            crop = image[
+                max(0, int(y1)):min(image_height, int(np.ceil(y2))),
+                max(0, int(x1)):min(image_width, int(np.ceil(x2))),
+            ]
+            crop = np.asarray(crop, dtype=np.uint8)
+            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.size else None
+            blur_score = (
+                float(cv2.Laplacian(gray, cv2.CV_64F).var())
+                if gray is not None and gray.size
+                else 0.0
+            )
+            if blur_score < REGISTRATION_MIN_BLUR_SCORE:
+                reason = "face_blurry"
+            else:
+                reason = None
+
+    blur_score = locals().get("blur_score", 0.0)
+    print(
+        f"[REGISTRATION FACE] image={number} face_count=1 "
+        f"face_width={face_width:.1f} face_height={face_height:.1f} "
+        f"face_ratio={face_width_ratio:.4f}x{face_height_ratio:.4f} "
+        f"det_score={det_score:.3f} blur_score={blur_score:.1f} "
+        f"quality={'FAIL' if reason else 'PASS'}"
+        + (f" reason={reason}" if reason else "")
+    )
+    if reason == "face_too_small":
+        raise ValueError(f"Face is too small in image {number}. Please move closer.")
+    if reason == "face_partially_outside_frame":
+        raise ValueError(f"Face is partially outside the frame in image {number}.")
+    if reason == "low_detection_confidence":
+        raise ValueError(f"Face detection confidence is too low in image {number}.")
+    if reason == "face_blurry":
+        raise ValueError(f"Face is blurry in image {number}. Please hold the phone steady.")
+    if reason == "invalid_face_geometry":
+        raise ValueError(f"Face geometry is invalid in image {number}.")
+    if reason:
+        raise ValueError(f"Invalid face quality in image {number}.")
 
 
 def _save_registered_person(gate_no, employee_name, designation, employee_id,

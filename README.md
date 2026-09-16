@@ -140,6 +140,15 @@ vehicle polygon. Vehicle detection checks the box center and bottom-center
 against `vehicle.points` using point-in-polygon; detections outside the
 polygon are ignored.
 
+Registration quality is configured separately from live recognition. The
+backend keeps the existing `image1` through `image5` contract but rejects
+faces that are too small, too close to the image edge, below the registration
+detection score, blurry, non-finite, or not 512-dimensional. The settings are
+`REGISTRATION_MIN_FACE_WIDTH_RATIO`, `REGISTRATION_MIN_FACE_HEIGHT_RATIO`,
+`REGISTRATION_MIN_FACE_PIXELS`, `REGISTRATION_FACE_EDGE_MARGIN`,
+`REGISTRATION_MIN_DET_SCORE`, `REGISTRATION_MIN_BLUR_SCORE`, and
+`REGISTRATION_IDENTICAL_SIMILARITY`. None changes live recognition.
+
 ## End-to-End Workflow
 
 ### Startup
