@@ -124,17 +124,21 @@ CAMERA_ROIS["CAM001"]["points"] = np.array([
 ], dtype=np.float32)
 
 CAMERA_ROIS["CAM001"]["vehicle"] = {
-	"left": 0.00,
-	"top": 0.35,
-	"right": 1.00,
-	"bottom": 0.70,
+	"points": np.array([
+		[0.00, 0.35],
+		[1.00, 0.35],
+		[1.00, 0.70],
+		[0.00, 0.70],
+	], dtype=np.float32),
 }
 ```
 
 `get_camera_roi(camera_id)` returns a copy, and the worker passes its own
 camera ID into every ROI check. Changing `CAM001` therefore cannot modify
 `CAM002`. The initial values are the exact existing production polygon and
-vehicle rectangle. No new coordinates were introduced.
+vehicle polygon. Vehicle detection checks the box center and bottom-center
+against `vehicle.points` using point-in-polygon; detections outside the
+polygon are ignored.
 
 ## End-to-End Workflow
 

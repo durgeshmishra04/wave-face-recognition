@@ -30,12 +30,25 @@ VEHICLE_ROI = {
     "bottom": float(os.getenv("VEHICLE_ROI_BOTTOM", "0.70")),
 }
 
+VEHICLE_ROI_POINTS = np.array(
+    [
+        [VEHICLE_ROI["left"], VEHICLE_ROI["top"]],
+        [VEHICLE_ROI["right"], VEHICLE_ROI["top"]],
+        [VEHICLE_ROI["right"], VEHICLE_ROI["bottom"]],
+        [VEHICLE_ROI["left"], VEHICLE_ROI["bottom"]],
+    ],
+    dtype=np.float32,
+)
+
 
 def _new_roi():
     return {
         "enabled": True,
         "points": PERSON_ROI_POLYGON.copy(),
-        "vehicle": VEHICLE_ROI.copy(),
+        "vehicle": {
+            **VEHICLE_ROI,
+            "points": VEHICLE_ROI_POINTS.copy(),
+        },
     }
 
 
@@ -67,18 +80,19 @@ CAMERA_ROIS = {
 },
     "CAM002": _new_roi(),
     "CAM003": {
-    "enabled": True,
-
-    "points": np.array([
-        [0.339, 0.529],
-        [0.589, 0.548],
-        [0.586, 0.595],
-        [0.599, 0.983],
-        [0.040, 0.983],
-    ], dtype=np.float32),
-
-    
-},
+        "enabled": True,
+        "points": np.array([
+            [0.339, 0.529],
+            [0.589, 0.548],
+            [0.586, 0.595],
+            [0.599, 0.983],
+            [0.040, 0.983],
+        ], dtype=np.float32),
+        "vehicle": {
+            **VEHICLE_ROI,
+            "points": VEHICLE_ROI_POINTS.copy(),
+        },
+    },
     "CAM004": _new_roi(),
     "CAM005": _new_roi(),
     "CAM006": _new_roi(),
@@ -121,10 +135,20 @@ def get_camera_roi(camera_id):
     """Return an isolated copy of the selected camera's ROI configuration."""
     normalized_id = str(camera_id or "").strip().upper()
     configured = CAMERA_ROIS.get(normalized_id, _new_roi())
+    configured_vehicle = configured.get("vehicle", {})
+    vehicle_points = configured_vehicle.get("points", VEHICLE_ROI_POINTS)
     return {
         "enabled": bool(configured.get("enabled", True)),
         "points": np.asarray(configured["points"], dtype=np.float32).copy(),
-        "vehicle": dict(configured.get("vehicle", VEHICLE_ROI)),
+        "vehicle": {
+            **VEHICLE_ROI,
+            **{
+                key: value
+                for key, value in configured_vehicle.items()
+                if key != "points"
+            },
+            "points": np.asarray(vehicle_points, dtype=np.float32).copy(),
+        },
     }
 
 
@@ -132,5 +156,6 @@ __all__ = [
     "CAMERA_ROIS",
     "PERSON_ROI_POLYGON",
     "VEHICLE_ROI",
+    "VEHICLE_ROI_POINTS",
     "get_camera_roi",
 ]

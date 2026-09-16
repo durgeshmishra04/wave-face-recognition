@@ -2132,18 +2132,24 @@ def vehicle_in_roi(vehicle_box, frame_width, frame_height, camera_id=None):
     vehicle_center_y = (y1 + y2) / 2.0
     vehicle_bottom_y = float(y2)
     vehicle_roi = get_camera_roi(camera_id)["vehicle"]
-    roi_left = vehicle_roi["left"] * frame_width
-    roi_top = vehicle_roi["top"] * frame_height
-    roi_right = vehicle_roi["right"] * frame_width
-    roi_bottom = vehicle_roi["bottom"] * frame_height
+    polygon = (
+        np.asarray(vehicle_roi["points"], dtype=np.float32)
+        * np.array([frame_width, frame_height], dtype=np.float32)
+    ).astype(np.float32)
+    if polygon.shape[0] < 3:
+        return False
 
-    return (
-        roi_left <= vehicle_center_x <= roi_right
-        and roi_top <= vehicle_center_y <= roi_bottom
-    ) or (
-        roi_left <= vehicle_center_x <= roi_right
-        and roi_top <= vehicle_bottom_y <= roi_bottom
-    )
+    center_inside = cv2.pointPolygonTest(
+        polygon,
+        (float(vehicle_center_x), float(vehicle_center_y)),
+        False,
+    ) >= 0
+    bottom_center_inside = cv2.pointPolygonTest(
+        polygon,
+        (float(vehicle_center_x), vehicle_bottom_y),
+        False,
+    ) >= 0
+    return center_inside or bottom_center_inside
 
 
 def _is_plausible_human_box(box, frame_shape):

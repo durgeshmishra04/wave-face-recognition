@@ -152,6 +152,32 @@ def test_vehicle_alert_roi_uses_configured_rectangle():
     )
 
 
+def test_vehicle_roi_rejects_box_outside_configured_polygon(monkeypatch):
+    original_vehicle = CAMERA_ROIS["CAM002"]["vehicle"]
+    CAMERA_ROIS["CAM002"]["vehicle"] = {
+        "points": np.array([
+            [0.10, 0.10],
+            [0.90, 0.10],
+            [0.10, 0.90],
+        ], dtype=np.float32),
+    }
+    try:
+        assert alcon_stream_new.vehicle_in_roi(
+            np.array([100, 100, 180, 180]),
+            1000,
+            1000,
+            camera_id="CAM002",
+        )
+        assert not alcon_stream_new.vehicle_in_roi(
+            np.array([700, 700, 780, 780]),
+            1000,
+            1000,
+            camera_id="CAM002",
+        )
+    finally:
+        CAMERA_ROIS["CAM002"]["vehicle"] = original_vehicle
+
+
 def test_camera_rois_are_isolated(monkeypatch):
     original_cam001 = get_camera_roi("CAM001")
     original_cam002 = get_camera_roi("CAM002")
@@ -165,7 +191,11 @@ def test_camera_rois_are_isolated(monkeypatch):
         assert cam001["points"][0].tolist() == [0.5, 0.5]
         assert cam001["vehicle"]["left"] == pytest.approx(0.25)
         assert cam002["points"][0].tolist() == original_cam002["points"][0].tolist()
-        assert cam002["vehicle"] == original_cam002["vehicle"]
+        assert cam002["vehicle"]["left"] == original_cam002["vehicle"]["left"]
+        np.testing.assert_array_equal(
+            cam002["vehicle"]["points"],
+            original_cam002["vehicle"]["points"],
+        )
     finally:
         CAMERA_ROIS["CAM001"] = original_cam001
 
