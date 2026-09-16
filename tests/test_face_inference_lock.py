@@ -229,6 +229,36 @@ def test_vehicle_deduplication_keeps_separate_nearby_vehicles():
     assert len(vehicles) == 2
 
 
+def test_person_track_preserves_established_identity_fields():
+    tracks = []
+    next_track_id = alcon_stream_new._update_person_tracks(
+        tracks,
+        [np.array([100, 100, 300, 500])],
+        now=1.0,
+        next_track_id=1,
+    )
+    tracks[0].update({
+        "identity_status": "KNOWN",
+        "employee_name": "Ramesh",
+        "employee_id": "E-1",
+        "last_verified_score": 0.65,
+        "annotation_box": np.array([150, 130, 250, 240]),
+    })
+
+    next_track_id = alcon_stream_new._update_person_tracks(
+        tracks,
+        [np.array([108, 105, 305, 505])],
+        now=2.0,
+        next_track_id=next_track_id,
+    )
+
+    assert next_track_id == 2
+    assert len(tracks) == 1
+    assert tracks[0]["track_id"] == 1
+    assert tracks[0]["identity_status"] == "KNOWN"
+    assert tracks[0]["employee_name"] == "Ramesh"
+
+
 def test_refresh_known_faces_cache_reloads_when_forced(monkeypatch):
     calls = {"count": 0}
 

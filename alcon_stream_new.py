@@ -83,6 +83,9 @@ FACE_MIN_HEIGHT_RATIO = float(os.getenv("FACE_MIN_HEIGHT_RATIO", "0.012"))
 KNOWN_IDENTITY_MEMORY_TIMEOUT = float(
     os.getenv("KNOWN_IDENTITY_MEMORY_TIMEOUT", "2.0")
 )
+PERSON_TRACK_TIMEOUT = float(
+    os.getenv("PERSON_TRACK_TIMEOUT", str(KNOWN_IDENTITY_MEMORY_TIMEOUT))
+)
 PERSON_MODEL = os.getenv("PERSON_MODEL", "yolo11n.pt")
 PERSON_CONFIDENCE = float(os.getenv("PERSON_CONFIDENCE", "0.45"))
 PERSON_IOU = float(os.getenv("PERSON_IOU", "0.45"))
@@ -2034,6 +2037,75 @@ def _same_face_track(current_box, remembered_box):
     return iou >= 0.20 or center_distance <= current_scale * 0.75
 
 
+def _match_person_track(person_tracks, box):
+    """Find the closest active body track using the existing continuity rule."""
+    best_track = None
+    best_score = -1.0
+    current = np.asarray(box, dtype=np.float32)
+    for track in person_tracks:
+        previous = np.asarray(track["box"], dtype=np.float32)
+        iou = _box_iou(current, previous)
+        current_center = _box_center(current)
+        previous_center = _box_center(previous)
+        scale = max(
+            current[2] - current[0],
+            current[3] - current[1],
+            previous[2] - previous[0],
+            previous[3] - previous[1],
+            1.0,
+        )
+        distance = float(np.hypot(
+            current_center[0] - previous_center[0],
+            current_center[1] - previous_center[1],
+        ))
+        if iou < 0.10 and distance > max(100.0, scale * 1.5):
+            continue
+        score = iou - distance / (scale * 10.0)
+        if score > best_score:
+            best_track = track
+            best_score = score
+    return best_track
+
+
+def _update_person_tracks(person_tracks, person_boxes, now, next_track_id):
+    """Associate current YOLO bodies to camera-local identity tracks."""
+    for track in person_tracks:
+        track["matched_this_frame"] = False
+    for box in person_boxes:
+        track = _match_person_track(
+            [item for item in person_tracks if not item["matched_this_frame"]],
+            box,
+        )
+        if track is None:
+            track = {
+                "track_id": next_track_id,
+                "box": np.asarray(box, dtype=np.int32),
+                "last_seen": now,
+                "matched_this_frame": True,
+                "identity_status": "UNVERIFIED",
+                "employee_id": None,
+                "employee_name": None,
+                "last_verified_score": 0.0,
+                "annotation_box": None,
+                "recognition_score": 0.0,
+                "unknown_evidence": False,
+            }
+            person_tracks.append(track)
+            next_track_id += 1
+        else:
+            track.update({
+                "box": np.asarray(box, dtype=np.int32),
+                "last_seen": now,
+                "matched_this_frame": True,
+            })
+    person_tracks[:] = [
+        track
+        for track in person_tracks
+        if now - track["last_seen"] < PERSON_TRACK_TIMEOUT
+    ]
+    return next_track_id
+
+
 def _box_iou(first_box, second_box):
     left = max(float(first_box[0]), float(second_box[0]))
     top = max(float(first_box[1]), float(second_box[1]))
@@ -2597,6 +2669,8 @@ def camera_worker(camera_config, rtsp_url=None):
     last_vehicles = []
 
     known_face_memory = []
+    person_tracks = []
+    next_person_track_id = 1
 
     unknown_frame_history = deque(maxlen=5)
     max_unknown_count = 0
@@ -2741,6 +2815,12 @@ def camera_worker(camera_config, rtsp_url=None):
                     try:
 
                         person_boxes = detect_person_boxes(frame)
+                        next_person_track_id = _update_person_tracks(
+                            person_tracks,
+                            person_boxes,
+                            time.time(),
+                            next_person_track_id,
+                        )
 
                         if (
                             camera_config.get("kpi") == "vehicle"
@@ -2970,6 +3050,10 @@ def camera_worker(camera_config, rtsp_url=None):
                                     ),
                                     None,
                                 )
+                            person_track = _match_person_track(
+                                person_tracks,
+                                current_body_box,
+                            ) if current_body_box is not None else None
                             face_is_in_roi = face_in_roi(
                                 current_box,
                                 frame.shape[1],
@@ -3011,6 +3095,16 @@ def camera_worker(camera_config, rtsp_url=None):
 
                             if current_strong_match:
                                 metadata = known_person_metadata.get(candidate_key, {})
+                                if person_track is not None:
+                                    person_track.update({
+                                        "identity_status": "KNOWN",
+                                        "employee_id": metadata.get("employee_id"),
+                                        "employee_name": name,
+                                        "last_verified_score": score,
+                                        "annotation_box": current_box.copy(),
+                                        "recognition_score": score,
+                                        "unknown_evidence": True,
+                                    })
                                 matching_memory = next(
                                     (
                                         remembered_face
@@ -3054,6 +3148,23 @@ def camera_worker(camera_config, rtsp_url=None):
                                     f"[FACE] KNOWN | name={name} | "
                                     f"current_similarity={score:.4f} | source=current_match",
                                 )
+                            elif person_track is not None and person_track.get("identity_status") == "KNOWN":
+                                name = person_track["employee_name"]
+                                face.person_id = person_track.get("employee_id")
+                                person_track.update({
+                                    "annotation_box": current_box.copy(),
+                                    "recognition_score": score,
+                                    "unknown_evidence": True,
+                                })
+                                face.recognition_decision = "RETAINED"
+                                _camera_log(
+                                    camera_id,
+                                    f"[IDENTITY] camera={camera_id} "
+                                    f"track={person_track['track_id']} "
+                                    f"current={getattr(face, 'recognition_candidate_name', 'UNKNOWN')} "
+                                    f"established={name} final=KNOWN "
+                                    "reason=retain_active_known_track",
+                                )
                             elif retained_memory is not None:
                                 name = retained_memory["name"]
                                 face.person_id = retained_memory.get("employee_id")
@@ -3080,6 +3191,14 @@ def camera_worker(camera_config, rtsp_url=None):
                                 name = "Unknown"
                                 face.person_id = None
 
+                            if person_track is not None and name == "Unknown":
+                                person_track.update({
+                                    "identity_status": "UNKNOWN",
+                                    "annotation_box": current_box.copy(),
+                                    "recognition_score": score,
+                                    "unknown_evidence": True,
+                                })
+
                             face.recognized_name = name
 
                             face.recognition_score = score
@@ -3100,9 +3219,7 @@ def camera_worker(camera_config, rtsp_url=None):
                                 and face_detection_score
                                 >= UNKNOWN_FACE_MIN_SCORE
                             ):
-
                                 seen_unknown_in_frame = True
-                                unknown_count_in_frame += 1
 
 
                         roi_person_boxes = [
@@ -3123,19 +3240,18 @@ def camera_worker(camera_config, rtsp_url=None):
                         ]
                         last_event_people = []
                         for person_box in roi_person_boxes:
-                            matched_face = next(
-                                (
-                                    face
-                                    for face in last_faces
-                                    if getattr(face, "unknown_evidence", False)
-                                    if face_inside_person(
-                                        face.bbox.astype(int),
-                                        person_box,
-                                    )
-                                ),
-                                None,
+                            person_track = _match_person_track(
+                                person_tracks,
+                                person_box,
                             )
-                            if matched_face is not None:
+                            if person_track is not None and person_track.get(
+                                "annotation_box"
+                            ) is not None:
+                                identity_name = (
+                                    person_track.get("employee_name")
+                                    if person_track.get("identity_status") == "KNOWN"
+                                    else "Unknown"
+                                )
                                 last_event_people.append(
                                     SimpleNamespace(
                                         # Keep the body box only for stable
@@ -3144,23 +3260,14 @@ def camera_worker(camera_config, rtsp_url=None):
                                         bbox=np.array(person_box),
                                         annotation_box=tuple(
                                             int(value)
-                                            for value in matched_face.bbox
+                                            for value in person_track["annotation_box"]
                                         ),
-                                        recognized_name=getattr(
-                                            matched_face,
-                                            "recognized_name",
-                                            "Unknown",
+                                        recognized_name=identity_name,
+                                        recognition_score=float(
+                                            person_track.get("recognition_score", 0.0)
                                         ),
-                                        recognition_score=float(getattr(
-                                            matched_face,
-                                            "recognition_score",
-                                            0.0,
-                                        )),
-                                        person_id=getattr(
-                                            matched_face,
-                                            "person_id",
-                                            None,
-                                        ),
+                                        person_id=person_track.get("employee_id"),
+                                        track_id=person_track["track_id"],
                                     )
                                 )
 
