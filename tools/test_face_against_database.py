@@ -8,6 +8,7 @@ import sqlite3
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
@@ -53,14 +54,14 @@ def _import_production_face_helpers():
     original_database_class = detection_database.DetectionDatabase
     detection_database.DetectionDatabase = ReadOnlyDatabaseImportStub
     try:
+        import alcon_stream_new
         from alcon_stream_new import (
             DET_SIZE,
             DET_THRESH,
             RECOGNITION_THRESHOLD,
-            face_app,
             initialize_face_model,
             normalize_embedding,
-            safe_face_inference,
+            safe_registration_face_inference,
         )
     finally:
         detection_database.DetectionDatabase = original_database_class
@@ -69,11 +70,29 @@ def _import_production_face_helpers():
         "det_size": DET_SIZE,
         "det_thresh": DET_THRESH,
         "threshold": RECOGNITION_THRESHOLD,
-        "face_app": face_app,
+        "module": alcon_stream_new,
         "initialize_face_model": initialize_face_model,
         "normalize_embedding": normalize_embedding,
-        "safe_face_inference": safe_face_inference,
+        "safe_registration_face_inference": safe_registration_face_inference,
     }
+
+
+def _initialize_face_stack_only(helpers):
+    """Initialize Buffalo_L using production setup without unrelated YOLO I/O.
+
+    The registration diagnostic needs the exact shared registration detector,
+    but should not require downloading/loading the person and vehicle models.
+    """
+    module = helpers["module"]
+    if module.face_app is not None:
+        return
+
+    original_yolo = module.YOLO
+    module.YOLO = lambda _model_path: SimpleNamespace()
+    try:
+        helpers["initialize_face_model"]()
+    finally:
+        module.YOLO = original_yolo
 
 
 def _decode_embedding(blob, employee_name, image_number, normalize_embedding):
@@ -200,16 +219,21 @@ def main():
     if image_path is None:
         image_path = Path(input("Enter image path: ").strip().strip('"'))
 
-    image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+    try:
+        raw = image_path.read_bytes()
+    except OSError as error:
+        print(f"[TEST] ERROR: Unable to read image: {error}")
+        return 1
+
+    helpers = _import_production_face_helpers()
+    image, orientation = helpers["module"]._decode_registration_image(raw)
     if image is None:
         print("[TEST] ERROR: Unable to read image")
         return 1
 
     try:
-        helpers = _import_production_face_helpers()
-        if helpers["face_app"] is None:
-            helpers["initialize_face_model"]()
-        faces = helpers["safe_face_inference"](image)
+        _initialize_face_stack_only(helpers)
+        faces = helpers["safe_registration_face_inference"](image)
     except Exception as error:
         print(f"[TEST] ERROR: Unable to initialize or run Buffalo_L: {error}")
         return 1
@@ -219,6 +243,12 @@ def main():
         return 1
     if len(faces) > 1:
         print("[TEST] ERROR: Multiple faces detected. Please provide an image containing one face.")
+        return 1
+
+    try:
+        helpers["module"]._validate_registration_face_quality(faces[0], image, 1)
+    except ValueError as error:
+        print(f"[TEST] ERROR: Registration quality check failed: {error}")
         return 1
 
     try:
@@ -234,6 +264,12 @@ def main():
 
     print(
         f"[TEST]\nImage                  : {image_path}\n"
+        f"Decoded dimensions     : {image.shape[1]}x{image.shape[0]}\n"
+        f"EXIF orientation       : {orientation}\n"
+        f"Detector size          : {helpers['det_size']} (fallback: registration-only)\n"
+        f"Detector threshold     : {helpers['det_thresh']:.2f}\n"
+        f"Detection score        : {float(faces[0].det_score):.4f}\n"
+        f"Face bounding box      : {faces[0].bbox.tolist()}\n"
         "Face detected          : YES\n"
         f"Embedding dimension    : {test_embedding.size}\n"
         f"Embedding dtype        : {test_embedding.dtype}\n"
