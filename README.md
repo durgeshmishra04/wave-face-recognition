@@ -1,20 +1,322 @@
 # ALCON Surveillance Backend
 
-Start the application with:
+Wave VMS is a Flask and Socket.IO surveillance service. It reads NVR RTSP
+streams, runs shared YOLO and InsightFace models, associates faces with
+person detections, recognizes registered employees, tracks ROI visits, saves
+finalized detection events, and sends live frames and alerts to the Android
+client.
+
+This repository is being refactored incrementally. The active behavior still
+lives in `alcon_stream_new.py`; the package modules introduced so far are
+compatibility boundaries and small ownership modules. That distinction is
+intentional: moving a stateful function is only safe after its shared state
+and import dependencies have been identified.
+
+## Run
+
+Use the project virtual environment on Windows:
 
 ```powershell
-python app.py
+.\.venv\Scripts\python.exe app.py
 ```
 
-Camera selection is configuration-driven. Set `ENABLED_CAMERAS` in `.env`:
+The server listens on `0.0.0.0:5000` by default. `python app.py` imports the
+`main()` entry point from `alcon_stream_new.py`, initializes Firebase, loads
+the models and database, starts enabled camera workers, and runs Flask-
+Socket.IO with the threaded async mode.
+
+## Current Architecture
+
+```text
+app.py
+  -> alcon_stream_new.main()
+		 -> Firebase initialization
+		 -> camera configuration and state initialization
+		 -> shared YOLO person model
+		 -> shared YOLO vehicle model
+		 -> one InsightFace buffalo_l instance
+		 -> registered-face cache and auth accounts
+		 -> one DetectionEventManager per enabled camera
+		 -> CameraManager
+				-> one camera_worker thread per enabled camera
+					  -> RTSP read/reconnect
+					  -> person detection
+					  -> optional vehicle detection
+					  -> InsightFace detection
+					  -> face/person/ROI validation
+					  -> individual-template recognition
+					  -> camera-local identity memory
+					  -> event manager and Socket.IO frame output
+```
+
+`app.py` is already a small launcher. `camera/manager.py` owns worker
+lifecycle. `events/detection_events.py` owns the packaged
+`DetectionEventManager`, and `database/detection_database.py` owns persisted
+detection records. `camera/rtsp.py`, `ai/models.py`, and the root-level
+compatibility files currently re-export behavior from the active monolith.
+
+## Project Map
+
+| Area | Current owner | Important symbols and behavior |
+|---|---|---|
+| Entrypoint | `app.py`, `alcon_stream_new.py` | `main`, Flask app, Socket.IO setup, signal shutdown |
+| Settings | `config/settings.py`, `alcon_stream_new.py` | Paths, environment values, thresholds, model names |
+| Cameras | `config/cameras.py`, `config/cameras.json` | `load_cameras`, `CAMERAS`, `enabled_cameras`, NVR/channel/subtype/KPI |
+| ROI | `roi/camera_rois.py` | `PERSON_ROI_POLYGON`, `VEHICLE_ROI`, `get_camera_roi` |
+| RTSP | `alcon_stream_new.py`, `camera/rtsp.py` | `build_rtsp_url`, `configure_h264_stream`, OpenCV capture and reconnect |
+| Camera lifecycle | `camera/manager.py` | `CameraManager`, `ManagedWorker` |
+| Frame pipeline | `alcon_stream_new.py` | `camera_worker` |
+| GPU/model execution | `alcon_stream_new.py`, `ai/models.py` | one `gpu_inference_lock`, one person YOLO, one vehicle YOLO, one FaceAnalysis |
+| Person detection | `alcon_stream_new.py`, `ai/person.py` | `safe_person_inference`, `detect_person_boxes` |
+| Vehicle detection | `alcon_stream_new.py`, `ai/vehicle.py` | `safe_vehicle_inference`, `detect_vehicle_boxes`, vehicle ROI and validation |
+| Face detection | `alcon_stream_new.py`, `ai/face.py` | `safe_face_inference`, InsightFace geometry checks |
+| Recognition | `alcon_stream_new.py` | `normalize_embedding`, `recognize_face`, five individual templates per person |
+| Identity memory | `alcon_stream_new.py` | `_same_face_track`, camera-local `known_face_memory`, timeout and retention |
+| Face cache | `alcon_stream_new.py` | `load_known_faces`, `refresh_known_faces_cache`, `known_face_templates`, metadata |
+| Database | `database/detection_database.py`, `alcon_stream_new.py` | detection records plus registration, embeddings, auth, FCM token SQL |
+| Events | `events/detection_events.py` | ROI tracking, exit confirmation, deduplication, image and event persistence |
+| Notifications | `alcon_stream_new.py`, `notifications/firebase.py` | Firebase initialization, token queries, FCM payloads |
+| Storage | `alcon_stream_new.py`, `events/detection_events.py` | `known_faces/<storage_key>/image_N.jpg`, alert images |
+| API and Socket.IO | `alcon_stream_new.py` | Flask routes, `face_frame`, `face_alert`, `detection_event`, camera rooms |
+
+## Shared Runtime State
+
+The following process-wide objects must remain singletons during the staged
+refactor:
+
+- `CAMERAS`
+- `camera_states`, `camera_captures`, `latest_annotated_frames`
+- `camera_event_managers`
+- `known_embeddings`, `known_face_templates`, `known_person_metadata`
+- `person_detector`, `vehicle_detector`, `face_app`
+- `gpu_inference_lock` and its face-inference compatibility alias
+- `alert_history`, `connected_clients`, `shutdown_event`, `camera_manager`
+
+Camera worker state such as unknown presence, last vehicles, last faces, and
+identity memory is deliberately local to each worker. Do not replace it with
+a process-wide dictionary unless the behavior is kept camera-specific.
+
+## Configuration
+
+Camera definitions remain in `config/cameras.json`. Each item contains the
+camera ID, display name, NVR address, KPI, enabled flag, channel, and subtype.
+Environment overrides are supported for each camera:
 
 ```env
-ENABLED_CAMERAS=CAM001
-ENABLED_CAMERAS=CAM001,CAM002,CAM003
-ENABLED_CAMERAS=ALL
+ENABLED_CAMERAS=CAM001,CAM003
+CAM001_NVR_IP=115.247.225.82
+CAM001_CHANNEL=1
+CAM001_SUBTYPE=2
+CAM001_ENABLED=true
 ```
 
-Camera definitions are stored in `config/cameras.json`. The existing AI,
-tracking, event, database, notification, API, and Socket.IO implementations
-remain behaviorally compatible while the package structure is introduced in
-stages.
+`ENABLED_CAMERAS=ALL` enables every configured camera. Invalid camera IDs are
+rejected. `config/cameras.py` is now the owner of this loading behavior.
+
+The active ROI values are in `roi/camera_rois.py`. `CAMERA_ROIS` contains one
+independent entry for every configured camera. Edit only the camera you want:
+
+```python
+CAMERA_ROIS["CAM001"]["points"] = np.array([
+	[0.10, 1.00],
+	[0.12, 0.82],
+	# ... normalized [x, y] points ...
+], dtype=np.float32)
+
+CAMERA_ROIS["CAM001"]["vehicle"] = {
+	"left": 0.00,
+	"top": 0.35,
+	"right": 1.00,
+	"bottom": 0.70,
+}
+```
+
+`get_camera_roi(camera_id)` returns a copy, and the worker passes its own
+camera ID into every ROI check. Changing `CAM001` therefore cannot modify
+`CAM002`. The initial values are the exact existing production polygon and
+vehicle rectangle. No new coordinates were introduced.
+
+## End-to-End Workflow
+
+### Startup
+
+1. `app.py` imports `main` and calls it.
+2. `.env` is loaded and paths are resolved relative to the project directory.
+3. Firebase is initialized from `FIREBASE_SERVICE_ACCOUNT` or `pythonai.json`.
+4. Enabled camera records are loaded and camera state dictionaries are created.
+5. H.264 configuration is requested from each enabled NVR using HTTP digest auth.
+6. The person YOLO model, InsightFace `buffalo_l`, and vehicle YOLO model are
+	loaded once per process.
+7. One `DetectionEventManager` is created for each enabled camera.
+8. The SQLite schema is checked without replacing the existing database.
+9. Registered face embeddings and metadata are loaded into the live cache.
+10. Default admin/user accounts are inserted only when absent.
+11. `CameraManager` starts one daemon worker per enabled camera.
+12. Flask-SocketIO starts and signal handlers stop workers on shutdown.
+
+### Per-camera frame processing
+
+Each worker repeatedly opens its configured RTSP URL and reconnects after
+repeated read failures. Every second frame is processed. The worker:
+
+1. Detects person boxes with YOLO class `0` and existing plausibility checks.
+2. Runs vehicle YOLO only for vehicle-KPI cameras at the existing cadence.
+3. Filters vehicles through the existing rectangle ROI.
+4. Runs InsightFace under the one global inference lock.
+5. Rejects low-confidence, geometrically invalid, out-of-ROI, or
+	non-person-associated faces.
+6. Matches the live embedding against every stored template for every person.
+7. Establishes or retains identity only when spatial continuity confirms the
+	same active track. Memory expires after the configured timeout.
+8. Builds known, unknown, vehicle, and camera-specific event payloads.
+9. Passes tracked events to `DetectionEventManager`.
+10. Draws annotations, resizes and JPEG-encodes the frame, updates camera
+	 state, and emits `face_frame`.
+
+### Recognition
+
+Registration requires exactly five uploads named `image1` through `image5`.
+Each image must contain exactly one InsightFace detection. Each embedding is
+normalized and stored independently in `registered_face_embeddings`.
+Recognition compares the live normalized embedding against every template,
+keeps the best score per person, ranks people globally, and applies the
+existing threshold and margin. It does not average templates for live
+recognition. `known_embeddings` remains as a legacy compatibility cache.
+
+### Event and alert workflow
+
+`DetectionEventManager` tracks person and vehicle boxes within each camera's
+ROI. Events are finalized on confirmed exits, use the configured historical
+frame offset for the image, and are written through `DetectionDatabase`.
+Unknown groups are held until the last member exits. Alert deduplication,
+unknown presence timing, and vehicle context remain camera-aware.
+
+Finalized events emit `detection_event`. Person alerts are appended to the
+bounded in-memory `alert_history`, emitted as `face_alert`, and sent to all
+active FCM devices using the existing payload fields.
+
+## HTTP API Contract
+
+The following routes currently exist. Methods, paths, request fields, status
+codes, and response shapes are compatibility contracts.
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/api/register-person` | Register five face images and employee metadata; returns `201` |
+| PATCH | `/api/update-person/<registration_id>` | Update supplied employee fields |
+| DELETE | `/api/delete-person/<registration_id>` | Delete registration, embeddings, and image folder |
+| POST | `/api/admin/login` | Admin login and FCM token registration |
+| POST | `/api/user/login` | User login and FCM token registration |
+| POST | `/api/admin/logout` | Deactivate an admin FCM token |
+| POST | `/api/user/logout` | Deactivate a user FCM token |
+| GET | `/alerts/<filename>` | Serve finalized alert images |
+| GET | `/known-faces/<storage_key>/<filename>` | Serve registered face images |
+| GET | `/api/cameras` | List configured cameras and status |
+| GET | `/api/cameras/<camera_id>` | Return one camera |
+| GET | `/api/status` | Return selected camera status and frame availability |
+| GET | `/api/mobile` | Combined Android response with alerts, detections, cameras, and snapshot |
+| GET | `/api/known-faces` | List known storage keys |
+| GET | `/api/registered-employees` | List registered employee records and images |
+| GET | `/api/registered-employees/<registration_id>` | Return one employee |
+| GET | `/api/alerts` | Return in-memory alert history |
+| GET | `/api/detections` | Return persisted detection events |
+| GET | `/api/snapshot` | Return the latest selected-camera JPEG as base64 |
+| POST | `/api/test-notification` | Send a test alert using the latest default-camera frame |
+
+Socket.IO handlers are `connect`, `disconnect`, `join_camera`, and
+`leave_camera`. The server emits `face_frame`, `face_alert`, and
+`detection_event`. Camera rooms use the `camera:<camera_id>` naming convention.
+
+## Database and Files
+
+The existing database is `known_faces/known_faces.db`. It contains the
+registered-person, five-template embedding, legacy embedding, authentication,
+FCM token, detection-event, and detection-record data used by the service.
+The refactor does not create a replacement database or regenerate embeddings.
+
+Registered images remain at:
+
+```text
+known_faces/<storage_key>/image_1.jpg
+known_faces/<storage_key>/image_2.jpg
+known_faces/<storage_key>/image_3.jpg
+known_faces/<storage_key>/image_4.jpg
+known_faces/<storage_key>/image_5.jpg
+```
+
+Alert images remain in `alert_images/` and are exposed under `/alerts/`.
+
+## Refactor Status and Migration Map
+
+The completed safe phase is configuration and ROI ownership:
+
+- `config/cameras.py` owns camera JSON parsing and enabled-camera selection.
+- `roi/camera_rois.py` owns the exact active person and vehicle ROI values.
+- `alcon_stream_new.py` imports those values instead of defining duplicates.
+- Existing callers and API behavior remain unchanged.
+
+The next migrations should proceed in this order:
+
+1. Introduce `state/runtime_state.py` and move mutable dictionaries as one
+	object, while retaining compatibility aliases for tests and callers.
+2. Move the single GPU lock and safe inference wrappers to `detection/gpu.py`.
+3. Move database connection/schema helpers and registration SQL into
+	`database/connection.py`, `database/persons.py`, and `database/embeddings.py`.
+4. Move face detection, cache, recognition, and identity tracking as units;
+	each must receive the same state and model objects.
+5. Move person/vehicle detection and vehicle tracking without changing model
+	arguments or thresholds.
+6. Move the worker body to `camera/worker.py`; keep RTSP ownership separate.
+7. Move event/alert and Firebase/Socket.IO services.
+8. Move routes into an API blueprint only after an automated endpoint map
+	comparison passes.
+9. Reduce `alcon_stream_new.py` to application assembly and shutdown.
+
+At every step, copy or re-export first, validate imports and behavior, then
+remove the old definition. Never instantiate models per worker and never make
+separate cache or GPU-lock objects in different modules.
+
+## Circular Import Risks
+
+The main risk is a route module importing the worker while the worker imports
+route globals. The intended dependency direction is:
+
+```text
+config -> database/state/utils -> detection/face/services
+		 -> camera worker -> camera manager -> API -> app
+```
+
+Application assembly should pass model, state, socket, database, and event
+manager references downward. Mutable process state should be accessed through
+one module object, not copied with reassignment-prone `from module import
+value` imports.
+
+## Validation
+
+Run the focused suite with:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q
+```
+
+Current validation after the configuration/ROI phase: 10 tests pass. Two
+existing tests still fail in the GPU helper compatibility area: one patches
+`face_inference_lock` while the implementation uses `gpu_inference_lock`, and
+one expects an empty YOLO kwargs dictionary even though the production call
+must preserve its configured class/confidence/IoU arguments. These failures
+were present before this phase and are recorded rather than hidden.
+
+RTSP, Firebase, GPU model loading, and Android delivery require the matching
+deployment environment and live services; they are not exercised by the
+offline test suite. Before production rollout, verify startup logs, enabled
+camera isolation, five-template recognition, event deduplication, FCM
+delivery, Socket.IO payloads, and graceful shutdown.
+
+## Files Modified in the Current Phase
+
+- `config/cameras.py`: new camera configuration owner.
+- `roi/camera_rois.py`: new ROI configuration owner.
+- `alcon_stream_new.py`: imports centralized camera and ROI values and uses
+  the centralized vehicle ROI mapping.
+- `README.md`: complete architecture, workflow, API, state, migration, and
+  validation documentation.

@@ -39,6 +39,8 @@ from insightface.app import FaceAnalysis
 from detection_database import DetectionDatabase
 from detection_events import DetectionEventManager
 from camera.manager import CameraManager
+from config.cameras import CAMERAS, enabled_cameras
+from roi.camera_rois import get_camera_roi
 
 
 # ============================================================
@@ -120,63 +122,6 @@ PORT = 5000
 CAMERA_CONFIG_PATH = PROJECT_DIR / "config" / "cameras.json"
 
 
-def _load_camera_config():
-    """Load camera identity/config without changing the existing pipeline."""
-    with CAMERA_CONFIG_PATH.open("r", encoding="utf-8") as config_file:
-        configured = json.load(config_file)
-
-    cameras = []
-    for item in configured:
-        camera_id = str(item["camera_id"]).strip()
-        if not camera_id or any(
-            camera_id == existing["camera_id"] for existing in cameras
-        ):
-            raise ValueError(f"Duplicate or empty camera_id: {camera_id!r}")
-        cameras.append({
-            "camera_id": camera_id,
-            "name": str(item["name"]).strip(),
-            # Preserve the existing NVR/channel RTSP flow.
-            "nvr_ip": os.getenv(
-                f"{camera_id}_NVR_IP",
-                item.get("nvr_ip", DEFAULT_NVR_IP),
-            ),
-            "channel": int(os.getenv(
-                f"{camera_id}_CHANNEL", str(item.get("channel", 1))
-            )),
-            "subtype": int(os.getenv(
-                f"{camera_id}_SUBTYPE", str(item.get("subtype", 1))
-            )),
-            "kpi": str(item.get("kpi", "person")).strip().lower(),
-            "enabled": os.getenv(
-                f"{camera_id}_ENABLED",
-                "true" if item.get("enabled", True) else "false",
-            ).strip().lower() not in {"false", "0", "no", "off"},
-        })
-
-    enabled_override = os.getenv("ENABLED_CAMERAS", "").strip()
-    if enabled_override:
-        selected = {
-            value.strip().upper()
-            for value in enabled_override.split(",")
-            if value.strip()
-        }
-        if selected != {"ALL"}:
-            known_ids = {camera["camera_id"] for camera in cameras}
-            unknown = selected - known_ids
-            if unknown:
-                raise ValueError(
-                    "Unknown camera IDs in ENABLED_CAMERAS: "
-                    + ", ".join(sorted(unknown))
-                )
-            for camera in cameras:
-                camera["enabled"] = camera["camera_id"] in selected
-
-    return cameras
-
-
-CAMERAS = _load_camera_config()
-
-
 # ============================================================
 # PUBLIC IMAGE CONFIGURATION
 # ============================================================
@@ -218,33 +163,6 @@ ALERT_DEDUP_TIME = 10.0
 EXIT_CONFIRM_SECONDS = float(os.getenv("EXIT_CONFIRM_SECONDS", "1.0"))
 # Final API/Firebase image is selected from confirmed exit frame - 6.
 EXIT_FRAME_OFFSET = int(os.getenv("EXIT_FRAME_OFFSET", "6"))
-
-# Region of interest for Person and Face Detection: defined by the custom polygon
-ROI_LEFT = float(os.getenv("ROI_LEFT", "0.10"))
-ROI_TOP = 0.54
-ROI_RIGHT = 0.995
-ROI_BOTTOM = 0.99
-# Shared gate ROI for all cameras: this is the actual entry path / gate
-# approach zone. Keep the same polygon for every camera so alerts and
-# tracking decisions remain consistent across the whole site.
-PERSON_ROI_POLYGON = np.array(
-    [
-        [0.10, 1.00],
-        [0.12, 0.82],
-        [0.18, 0.64],
-        [0.28, 0.55],
-        [0.42, 0.54],
-        [0.62, 0.55],
-        [0.76, 0.58],
-        [0.88, 0.62],
-        [0.94, 1.00],
-    ],
-    dtype=np.float32,
-)
-VEHICLE_ROI_LEFT = float(os.getenv("VEHICLE_ROI_LEFT", "0.00"))
-VEHICLE_ROI_TOP = float(os.getenv("VEHICLE_ROI_TOP", "0.35"))
-VEHICLE_ROI_RIGHT = float(os.getenv("VEHICLE_ROI_RIGHT", "1.00"))
-VEHICLE_ROI_BOTTOM = float(os.getenv("VEHICLE_ROI_BOTTOM", "0.70"))
 
 MAX_ALERT_HISTORY = 100
 
@@ -325,12 +243,7 @@ connected_clients = 0
 
 
 def _enabled_cameras():
-
-    return [
-        camera
-        for camera in CAMERAS
-        if camera.get("enabled", True)
-    ]
+    return enabled_cameras()
 
 
 def _default_camera():
@@ -2112,7 +2025,7 @@ def face_inside_person(face_box, person_box):
     )
 
 
-def face_in_roi(face_box, frame_width, frame_height):
+def face_in_roi(face_box, frame_width, frame_height, camera_id=None):
 
     x1, y1, x2, y2 = face_box
 
@@ -2121,7 +2034,7 @@ def face_in_roi(face_box, frame_width, frame_height):
     face_bottom_y = float(y2)
 
     poly_px = (
-        PERSON_ROI_POLYGON
+        get_camera_roi(camera_id)["points"]
         * np.array([frame_width, frame_height], dtype=np.float32)
     ).astype(np.int32)
 
@@ -2211,17 +2124,18 @@ def face_associated_with_person(face_box, person_boxes, frame_shape):
     return None
 
 
-def vehicle_in_roi(vehicle_box, frame_width, frame_height):
+def vehicle_in_roi(vehicle_box, frame_width, frame_height, camera_id=None):
 
     x1, y1, x2, y2 = vehicle_box
 
     vehicle_center_x = (x1 + x2) / 2.0
     vehicle_center_y = (y1 + y2) / 2.0
     vehicle_bottom_y = float(y2)
-    roi_left = VEHICLE_ROI_LEFT * frame_width
-    roi_top = VEHICLE_ROI_TOP * frame_height
-    roi_right = VEHICLE_ROI_RIGHT * frame_width
-    roi_bottom = VEHICLE_ROI_BOTTOM * frame_height
+    vehicle_roi = get_camera_roi(camera_id)["vehicle"]
+    roi_left = vehicle_roi["left"] * frame_width
+    roi_top = vehicle_roi["top"] * frame_height
+    roi_right = vehicle_roi["right"] * frame_width
+    roi_bottom = vehicle_roi["bottom"] * frame_height
 
     return (
         roi_left <= vehicle_center_x <= roi_right
@@ -2761,6 +2675,7 @@ def camera_worker(camera_config, rtsp_url=None):
                                     vehicle["box"],
                                     frame.shape[1],
                                     frame.shape[0],
+                                    camera_id=camera_id,
                                 )
                             ]
                         elif camera_config.get("kpi") != "vehicle":
@@ -2837,6 +2752,7 @@ def camera_worker(camera_config, rtsp_url=None):
                                 face_box,
                                 frame.shape[1],
                                 frame.shape[0],
+                                camera_id=camera_id,
                             ) and not associated_with_vehicle:
                                 continue
                             if associated_person_box is None and not active_track_match:
@@ -2923,6 +2839,7 @@ def camera_worker(camera_config, rtsp_url=None):
                                 current_box,
                                 frame.shape[1],
                                 frame.shape[0],
+                                camera_id=camera_id,
                             )
 
 
@@ -3061,6 +2978,7 @@ def camera_worker(camera_config, rtsp_url=None):
                                     person_box,
                                     frame.shape[1],
                                     frame.shape[0],
+                                    camera_id=camera_id,
                                 )
                                 or any(
                                     np.array_equal(person_box, vehicle_person_box)

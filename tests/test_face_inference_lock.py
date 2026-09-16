@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 import alcon_stream_new
+from roi.camera_rois import CAMERA_ROIS, get_camera_roi
 
 
 def test_recognize_face_uses_best_individual_template(monkeypatch):
@@ -149,6 +150,24 @@ def test_vehicle_alert_roi_uses_configured_rectangle():
         1280,
         720,
     )
+
+
+def test_camera_rois_are_isolated(monkeypatch):
+    original_cam001 = get_camera_roi("CAM001")
+    original_cam002 = get_camera_roi("CAM002")
+    try:
+        CAMERA_ROIS["CAM001"]["points"][0] = [0.50, 0.50]
+        CAMERA_ROIS["CAM001"]["vehicle"]["left"] = 0.25
+
+        cam001 = get_camera_roi("CAM001")
+        cam002 = get_camera_roi("CAM002")
+
+        assert cam001["points"][0].tolist() == [0.5, 0.5]
+        assert cam001["vehicle"]["left"] == pytest.approx(0.25)
+        assert cam002["points"][0].tolist() == original_cam002["points"][0].tolist()
+        assert cam002["vehicle"] == original_cam002["vehicle"]
+    finally:
+        CAMERA_ROIS["CAM001"] = original_cam001
 
 
 def test_refresh_known_faces_cache_reloads_when_forced(monkeypatch):
