@@ -73,6 +73,13 @@ PROCESS_EVERY_N_FRAMES = 2
 DET_SIZE_VALUE = int(os.getenv("DET_SIZE", "800"))
 DET_SIZE = (DET_SIZE_VALUE, DET_SIZE_VALUE)
 DET_THRESH = float(os.getenv("DET_THRESH", "0.40"))
+REGISTRATION_FALLBACK_DET_SIZE_VALUE = int(
+    os.getenv("REGISTRATION_FALLBACK_DET_SIZE", "1200")
+)
+REGISTRATION_FALLBACK_DET_SIZE = (
+    REGISTRATION_FALLBACK_DET_SIZE_VALUE,
+    REGISTRATION_FALLBACK_DET_SIZE_VALUE,
+)
 UNKNOWN_FACE_MIN_SCORE = float(
     os.getenv("UNKNOWN_FACE_MIN_SCORE", "0.60")
 )
@@ -1851,6 +1858,67 @@ def safe_face_inference(frame):
         return face_app.get(frame)
 
 
+def safe_registration_face_inference(frame):
+    """Detect registration faces with one controlled larger-scale retry."""
+    if face_app is None:
+        return []
+
+    with face_inference_lock:
+        primary_faces = face_app.get(frame)
+        primary_diagnostics = _face_runtime_diagnostics()
+        print(
+            "[REGISTRATION DETECTION] attempt=primary "
+            f"detector={primary_diagnostics.get('detector_name')} "
+            f"model_input={primary_diagnostics.get('model_input_shape')} "
+            f"providers={primary_diagnostics.get('providers', [])} "
+            f"det_size={primary_diagnostics.get('det_size', DET_SIZE)} "
+            f"det_thresh={primary_diagnostics.get('det_thresh', DET_THRESH):.3f} "
+            f"face_count={len(primary_faces)} "
+            f"faces={_face_detection_summary(primary_faces)}"
+        )
+        if primary_faces:
+            return primary_faces
+
+        diagnostics = _face_runtime_diagnostics()
+        providers = diagnostics["providers"]
+        fallback_ctx_id = (
+            CUDA_DEVICE_ID
+            if "CUDAExecutionProvider" in providers
+            else -1
+        )
+        print(
+            "[REGISTRATION FALLBACK] primary_faces=0 "
+            f"det_size={DET_SIZE} -> fallback_det_size={REGISTRATION_FALLBACK_DET_SIZE}"
+        )
+        face_app.prepare(
+            ctx_id=fallback_ctx_id,
+            det_size=REGISTRATION_FALLBACK_DET_SIZE,
+            det_thresh=DET_THRESH,
+        )
+        try:
+            fallback_faces = face_app.get(frame)
+            fallback_diagnostics = _face_runtime_diagnostics()
+            print(
+                "[REGISTRATION DETECTION] attempt=fallback "
+                f"detector={fallback_diagnostics.get('detector_name')} "
+                f"model_input={fallback_diagnostics.get('model_input_shape')} "
+                f"providers={fallback_diagnostics.get('providers', [])} "
+                f"det_size={fallback_diagnostics.get('det_size', REGISTRATION_FALLBACK_DET_SIZE)} "
+                f"det_thresh={fallback_diagnostics.get('det_thresh', DET_THRESH):.3f} "
+                f"face_count={len(fallback_faces)} "
+                f"faces={_face_detection_summary(fallback_faces)}"
+            )
+            return fallback_faces
+        finally:
+            # Registration is allowed to use a larger detector input, but the
+            # shared live pipeline must return to its production configuration.
+            face_app.prepare(
+                ctx_id=fallback_ctx_id,
+                det_size=DET_SIZE,
+                det_thresh=DET_THRESH,
+            )
+
+
 def _face_runtime_diagnostics():
     """Return safe InsightFace runtime metadata without exposing credentials."""
     detector = getattr(face_app, "models", {}).get("detection") if face_app else None
@@ -1862,8 +1930,47 @@ def _face_runtime_diagnostics():
     )
     return {
         "providers": providers,
-        "det_size": DET_SIZE,
-        "det_thresh": DET_THRESH,
+        "detector_name": type(detector).__name__ if detector is not None else None,
+        "model_input_shape": (
+            list(session.get_inputs()[0].shape)
+            if session is not None and hasattr(session, "get_inputs")
+            and session.get_inputs()
+            else None
+        ),
+        "det_size": getattr(detector, "input_size", DET_SIZE),
+        "det_thresh": float(getattr(detector, "det_thresh", DET_THRESH)),
+    }
+
+
+def _face_detection_summary(faces):
+    """Return only the detector outputs needed by registration diagnostics."""
+    return [
+        {
+            "bbox": [round(float(value), 2) for value in face.bbox.tolist()],
+            "score": round(float(getattr(face, "det_score", 0.0)), 4),
+        }
+        for face in faces
+    ]
+
+
+def _registration_image_diagnostics(raw, image, orientation):
+    """Log source and decoded image properties before Buffalo_L inference."""
+    original_size = None
+    original_mode = None
+    try:
+        with Image.open(io.BytesIO(raw)) as uploaded:
+            original_size = uploaded.size
+            original_mode = uploaded.mode
+    except Exception:
+        pass
+    return {
+        "original_dimensions": original_size,
+        "original_mode": original_mode,
+        "decoded_dimensions": tuple(image.shape[:2]) if image is not None else None,
+        "channels": int(image.shape[2]) if image is not None and image.ndim == 3 else 0,
+        "dtype": str(image.dtype) if image is not None else None,
+        "decode_succeeded": image is not None,
+        "exif_orientation": orientation,
     }
 
 
@@ -4000,19 +4107,33 @@ def _validate_registration_images():
     for number, field in enumerate(expected, start=1):
         raw = request.files[field].read()
         image, orientation = _decode_registration_image(raw)
+        image_diagnostics = _registration_image_diagnostics(
+            raw,
+            image,
+            orientation,
+        )
+        runtime_diagnostics = _face_runtime_diagnostics()
         print(
             f"[REGISTRATION IMAGE] image={number} bytes={len(raw)} "
-            f"decoded={image is not None} shape={getattr(image, 'shape', None)} "
-            f"exif_orientation={orientation} "
-            f"providers={_face_runtime_diagnostics()['providers']} "
-            f"det_size={DET_SIZE} det_thresh={DET_THRESH}"
+            f"original_dimensions={image_diagnostics['original_dimensions']} "
+            f"original_mode={image_diagnostics['original_mode']} "
+            f"decoded_dimensions={image_diagnostics['decoded_dimensions']} "
+            f"channels={image_diagnostics['channels']} "
+            f"dtype={image_diagnostics['dtype']} "
+            f"decode_succeeded={image_diagnostics['decode_succeeded']} "
+            f"exif_orientation={image_diagnostics['exif_orientation']} "
+            f"providers={runtime_diagnostics['providers']} "
+            f"detector={runtime_diagnostics['detector_name']} "
+            f"model_input={runtime_diagnostics['model_input_shape']} "
+            f"det_size={runtime_diagnostics['det_size']} "
+            f"det_thresh={runtime_diagnostics['det_thresh']:.3f}"
         )
         if image is None:
             raise ValueError(f"Image {number} is not a valid image")
-        faces = safe_face_inference(image)
+        faces = safe_registration_face_inference(image)
         print(
             f"[REGISTRATION DETECTION] image={number} face_count={len(faces)} "
-            f"faces={[(face.bbox.tolist(), float(getattr(face, 'det_score', 0.0))) for face in faces]}"
+            f"faces={_face_detection_summary(faces)}"
         )
         if not faces:
             raise ValueError(f"No face detected in image {number}")

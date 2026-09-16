@@ -158,6 +158,13 @@ unchanged fields `gate_no`, `employee_name`, `designation`, optional
 The response remains `201` with `success`, `registration_id`, and
 `images_registered: 5` after all five images pass.
 
+If the primary registration detector returns zero faces, the backend retries
+the same Buffalo_L detector once at `REGISTRATION_FALLBACK_DET_SIZE` (default
+`1200`). The retry runs under the existing shared face/GPU lock and the live
+detector is restored to `DET_SIZE` and `DET_THRESH` immediately afterward.
+Zero faces still fail, and multiple faces still fail the existing
+exactly-one-face rule.
+
 ## End-to-End Workflow
 
 ### Startup

@@ -358,7 +358,16 @@ def test_gpu_inference_helpers_serialize_all_gpu_models(monkeypatch):
 
     assert result == ["person"]
     assert events[0] == "lock-enter"
-    assert events[1] == ("predict", "frame-person", {})
+    assert events[1] == (
+        "predict",
+        "frame-person",
+        {
+            "classes": [0],
+            "conf": alcon_stream_new.PERSON_CONFIDENCE,
+            "iou": alcon_stream_new.PERSON_IOU,
+            "verbose": False,
+        },
+    )
     assert events[-1] == "lock-exit"
 
 
@@ -403,6 +412,44 @@ def test_registration_decoder_returns_opencv_image():
     assert image.shape[2] == 3
     assert image.dtype == np.uint8
     assert orientation is None
+
+
+def test_registration_face_inference_retries_larger_detector_size(monkeypatch):
+    calls = []
+    face = SimpleNamespace(
+        bbox=np.array([10, 10, 100, 100], dtype=np.float32),
+        det_score=0.9,
+        embedding=np.ones(512, dtype=np.float32),
+    )
+
+    class FakeFaceApp:
+        models = {}
+
+        def prepare(self, **kwargs):
+            calls.append(("prepare", kwargs["det_size"], kwargs["det_thresh"]))
+
+        def get(self, _frame):
+            calls.append(("get",))
+            return [] if len([call for call in calls if call[0] == "get"]) == 1 else [face]
+
+    monkeypatch.setattr(alcon_stream_new, "face_app", FakeFaceApp())
+    monkeypatch.setattr(
+        alcon_stream_new,
+        "_face_runtime_diagnostics",
+        lambda: {"providers": ["CPUExecutionProvider"]},
+    )
+
+    result = alcon_stream_new.safe_registration_face_inference(
+        np.zeros((200, 200, 3), dtype=np.uint8)
+    )
+
+    assert result == [face]
+    assert calls == [
+        ("get",),
+        ("prepare", alcon_stream_new.REGISTRATION_FALLBACK_DET_SIZE, alcon_stream_new.DET_THRESH),
+        ("get",),
+        ("prepare", alcon_stream_new.DET_SIZE, alcon_stream_new.DET_THRESH),
+    ]
 
 
 def test_detect_vehicle_boxes_rejects_wall_like_false_positive(monkeypatch):
