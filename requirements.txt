@@ -1,4 +1,5 @@
 opencv-python==4.10.0.84
+Pillow>=10.0.0
 numpy==1.26.4
 
 # InsightFace 0.7.3 requires the classic ONNX Runtime InferenceSession API.

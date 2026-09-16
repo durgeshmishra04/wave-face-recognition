@@ -24,6 +24,7 @@ from firebase_admin import credentials, messaging
 import cv2
 import numpy as np
 import onnxruntime as ort
+from PIL import Image, ImageOps
 
 try:
     from ultralytics import YOLO
@@ -1848,6 +1849,22 @@ def safe_face_inference(frame):
         return []
     with face_inference_lock:
         return face_app.get(frame)
+
+
+def _face_runtime_diagnostics():
+    """Return safe InsightFace runtime metadata without exposing credentials."""
+    detector = getattr(face_app, "models", {}).get("detection") if face_app else None
+    session = getattr(detector, "session", None)
+    providers = (
+        session.get_providers()
+        if session is not None and hasattr(session, "get_providers")
+        else []
+    )
+    return {
+        "providers": providers,
+        "det_size": DET_SIZE,
+        "det_thresh": DET_THRESH,
+    }
 
 
 def safe_person_inference(frame):
@@ -3944,6 +3961,24 @@ def camera_worker(camera_config, rtsp_url=None):
 # ANDROID PERSON REGISTRATION
 # ============================================================
 
+def _decode_registration_image(raw):
+    """Decode an upload and apply EXIF orientation before face inference."""
+    if not raw:
+        return None, None
+    try:
+        with Image.open(io.BytesIO(raw)) as uploaded:
+            orientation = uploaded.getexif().get(274)
+            corrected = ImageOps.exif_transpose(uploaded).convert("RGB")
+            rgb = np.asarray(corrected)
+        return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), orientation
+    except Exception:
+        image = cv2.imdecode(
+            np.frombuffer(raw, dtype=np.uint8),
+            cv2.IMREAD_COLOR,
+        )
+        return image, None
+
+
 def _validate_registration_images():
     """Decode five uploads and create compatible InsightFace embeddings."""
 
@@ -3964,13 +3999,21 @@ def _validate_registration_images():
     images, embeddings = [], []
     for number, field in enumerate(expected, start=1):
         raw = request.files[field].read()
-        image = cv2.imdecode(
-            np.frombuffer(raw, dtype=np.uint8),
-            cv2.IMREAD_COLOR,
-        ) if raw else None
+        image, orientation = _decode_registration_image(raw)
+        print(
+            f"[REGISTRATION IMAGE] image={number} bytes={len(raw)} "
+            f"decoded={image is not None} shape={getattr(image, 'shape', None)} "
+            f"exif_orientation={orientation} "
+            f"providers={_face_runtime_diagnostics()['providers']} "
+            f"det_size={DET_SIZE} det_thresh={DET_THRESH}"
+        )
         if image is None:
             raise ValueError(f"Image {number} is not a valid image")
         faces = safe_face_inference(image)
+        print(
+            f"[REGISTRATION DETECTION] image={number} face_count={len(faces)} "
+            f"faces={[(face.bbox.tolist(), float(getattr(face, 'det_score', 0.0))) for face in faces]}"
+        )
         if not faces:
             raise ValueError(f"No face detected in image {number}")
         if len(faces) != 1:

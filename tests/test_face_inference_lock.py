@@ -1,4 +1,5 @@
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -386,6 +387,22 @@ def test_register_person_refreshes_known_face_cache(monkeypatch):
 
     assert response.status_code == 201
     assert called["count"] == 1
+
+
+def test_registration_decoder_returns_opencv_image():
+    image_path = Path(__file__).parents[1] / "tools" / "image" / "r.jpeg"
+    if not image_path.is_file():
+        pytest.skip("registration diagnostic image is not present")
+
+    image, orientation = alcon_stream_new._decode_registration_image(
+        image_path.read_bytes()
+    )
+
+    assert image is not None
+    assert image.ndim == 3
+    assert image.shape[2] == 3
+    assert image.dtype == np.uint8
+    assert orientation is None
 
 
 def test_detect_vehicle_boxes_rejects_wall_like_false_positive(monkeypatch):

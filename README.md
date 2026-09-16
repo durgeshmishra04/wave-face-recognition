@@ -149,6 +149,15 @@ detection score, blurry, non-finite, or not 512-dimensional. The settings are
 `REGISTRATION_MIN_DET_SCORE`, `REGISTRATION_MIN_BLUR_SCORE`, and
 `REGISTRATION_IDENTICAL_SIMILARITY`. None changes live recognition.
 
+Registration diagnostics are printed without embedding values. For each
+upload they include decoded byte count and shape, EXIF orientation, active
+ONNX session providers, detector size and threshold, face count, face boxes,
+and detection scores. Test with Postman using `multipart/form-data` and the
+unchanged fields `gate_no`, `employee_name`, `designation`, optional
+`employee_id`, and exactly one file for each of `image1` through `image5`.
+The response remains `201` with `success`, `registration_id`, and
+`images_registered: 5` after all five images pass.
+
 ## End-to-End Workflow
 
 ### Startup
