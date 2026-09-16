@@ -322,7 +322,7 @@ delivery, Socket.IO payloads, and graceful shutdown.
 - `config/cameras.py`: new camera configuration owner.
 - `roi/camera_rois.py`: new ROI configuration owner.
 - `alcon_stream_new.py`: imports centralized camera and ROI values, validates
-	vehicle detections against camera-specific polygons, and emits recognition
-	diagnostics.
+	vehicle detections against camera-specific polygons, emits recognition
+	diagnostics, and deduplicates person/vehicle detections.
 - `README.md`: complete architecture, workflow, API, state, migration, and
   validation documentation.

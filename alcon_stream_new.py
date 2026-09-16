@@ -86,6 +86,7 @@ KNOWN_IDENTITY_MEMORY_TIMEOUT = float(
 PERSON_MODEL = os.getenv("PERSON_MODEL", "yolo11n.pt")
 PERSON_CONFIDENCE = float(os.getenv("PERSON_CONFIDENCE", "0.45"))
 PERSON_IOU = float(os.getenv("PERSON_IOU", "0.45"))
+PERSON_DEDUP_IOU = float(os.getenv("PERSON_DEDUP_IOU", "0.50"))
 
 USE_GPU = os.getenv("USE_GPU", "auto").strip().lower()
 CUDA_DEVICE_ID = int(os.getenv("CUDA_DEVICE_ID", "0"))
@@ -101,6 +102,7 @@ FOUR_WHEELER_CLASSES = {
     "truck"
 }
 VEHICLE_PROCESS_EVERY_N_FRAMES = 2
+VEHICLE_DEDUP_IOU = float(os.getenv("VEHICLE_DEDUP_IOU", "0.50"))
 
 AUTH_PASSWORD_HASH_ITERATIONS = int(
     os.getenv("AUTH_PASSWORD_HASH_ITERATIONS", "210000")
@@ -2044,6 +2046,46 @@ def _box_iou(first_box, second_box):
     return intersection / union if union else 0.0
 
 
+def deduplicate_person_boxes(boxes, scores=None, iou_threshold=None):
+    """Keep one highest-confidence YOLO box for each same-frame person."""
+    if not boxes:
+        return []
+    threshold = PERSON_DEDUP_IOU if iou_threshold is None else float(iou_threshold)
+    normalized_scores = list(scores or [0.0] * len(boxes))
+    candidates = sorted(
+        zip(boxes, normalized_scores),
+        key=lambda item: float(item[1]),
+        reverse=True,
+    )
+    kept = []
+    for box, score in candidates:
+        if any(_box_iou(box, kept_box) >= threshold for kept_box, _ in kept):
+            continue
+        kept.append((np.asarray(box, dtype=np.int32), score))
+    return [box for box, _ in kept]
+
+
+def deduplicate_vehicle_detections(vehicles, iou_threshold=None):
+    """Suppress duplicate same-frame vehicle boxes without merging classes."""
+    if not vehicles:
+        return []
+    threshold = VEHICLE_DEDUP_IOU if iou_threshold is None else float(iou_threshold)
+    kept = []
+    for vehicle in sorted(
+        vehicles,
+        key=lambda item: float(item.get("confidence", 0.0)),
+        reverse=True,
+    ):
+        if any(
+            vehicle["vehicle_type"] == existing["vehicle_type"]
+            and _box_iou(vehicle["box"], existing["box"]) >= threshold
+            for existing in kept
+        ):
+            continue
+        kept.append(vehicle)
+    return kept
+
+
 def face_inside_person(face_box, person_box):
 
     face_x1, face_y1, face_x2, face_y2 = face_box
@@ -2220,16 +2262,18 @@ def detect_person_boxes(frame):
     if not results or results[0].boxes is None:
         return []
 
+    raw_boxes = results[0].boxes.xyxy.cpu().numpy()
+    raw_scores = results[0].boxes.conf.cpu().numpy()
     person_boxes = [
-        box.astype(int)
-        for box in results[0].boxes.xyxy.cpu().numpy()
-    ]
-
-    return [
-        box
-        for box in person_boxes
+        (box.astype(int), float(score))
+        for box, score in zip(raw_boxes, raw_scores)
         if _is_plausible_human_box(box, frame.shape)
     ]
+    deduplicated = deduplicate_person_boxes(
+        [box for box, _ in person_boxes],
+        [score for _, score in person_boxes],
+    )
+    return deduplicated
 
 
 def _is_plausible_vehicle_box(box, frame_shape):
@@ -2310,7 +2354,7 @@ def detect_vehicle_boxes(frame):
             "confidence": float(confidence),
         })
 
-    return vehicles
+    return deduplicate_vehicle_detections(vehicles)
 
 
 def annotate_alert_frame(frame, faces):
@@ -2832,7 +2876,33 @@ def camera_worker(camera_config, rtsp_url=None):
                             face.vehicle_context = associated_with_vehicle
                             accepted_faces.append(face)
 
-                        last_faces = accepted_faces
+                        faces_by_person = {}
+                        unassociated_faces = []
+                        for face in accepted_faces:
+                            associated_box = getattr(face, "associated_person_box", None)
+                            if associated_box is None:
+                                unassociated_faces.append(face)
+                                continue
+                            person_key = tuple(int(value) for value in associated_box)
+                            current_best = faces_by_person.get(person_key)
+                            if current_best is None or float(getattr(
+                                face, "det_score", 0.0
+                            )) > float(getattr(current_best, "det_score", 0.0)):
+                                faces_by_person[person_key] = face
+                        last_faces = list(faces_by_person.values())
+                        for face in unassociated_faces:
+                            if not any(
+                                _same_face_track(face.bbox, existing.bbox)
+                                for existing in last_faces
+                            ):
+                                last_faces.append(face)
+                        if len(accepted_faces) != len(last_faces):
+                            _camera_log(
+                                camera_id,
+                                f"[FACE ASSOCIATION] camera={camera_id} "
+                                f"accepted={len(accepted_faces)} "
+                                f"unique_person_faces={len(last_faces)}",
+                            )
 
                         excluded_face_count = len(detected_faces) - len(last_faces)
                         if excluded_face_count:
@@ -3093,6 +3163,19 @@ def camera_worker(camera_config, rtsp_url=None):
                                         ),
                                     )
                                 )
+
+                        unique_unknown_people = [
+                            person
+                            for person in last_event_people
+                            if getattr(person, "recognized_name", "Unknown") == "Unknown"
+                        ]
+                        unknown_count_in_frame = len(unique_unknown_people)
+                        seen_unknown_in_frame = bool(unique_unknown_people)
+                        _camera_log(
+                            camera_id,
+                            f"[UNKNOWN COUNT] camera={camera_id} "
+                            f"unique_tracks={unknown_count_in_frame}",
+                        )
                         unknown_vehicle_person_detected = any(
                             getattr(face, "recognized_name", "Unknown") == "Unknown"
                             and any(

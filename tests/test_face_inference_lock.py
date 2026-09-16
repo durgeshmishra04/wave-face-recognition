@@ -200,6 +200,35 @@ def test_camera_rois_are_isolated(monkeypatch):
         CAMERA_ROIS["CAM001"] = original_cam001
 
 
+def test_person_box_deduplication_keeps_highest_confidence():
+    boxes = alcon_stream_new.deduplicate_person_boxes(
+        [
+            np.array([100, 100, 300, 500]),
+            np.array([110, 105, 295, 495]),
+            np.array([500, 100, 700, 500]),
+        ],
+        [0.60, 0.90, 0.70],
+        iou_threshold=0.50,
+    )
+
+    assert len(boxes) == 2
+    assert any(np.array_equal(box, np.array([110, 105, 295, 495])) for box in boxes)
+    assert any(np.array_equal(box, np.array([500, 100, 700, 500])) for box in boxes)
+
+
+def test_vehicle_deduplication_keeps_separate_nearby_vehicles():
+    vehicles = alcon_stream_new.deduplicate_vehicle_detections(
+        [
+            {"box": np.array([100, 100, 300, 300]), "vehicle_type": "four_wheeler", "confidence": 0.60},
+            {"box": np.array([110, 105, 295, 295]), "vehicle_type": "four_wheeler", "confidence": 0.90},
+            {"box": np.array([500, 100, 700, 300]), "vehicle_type": "four_wheeler", "confidence": 0.70},
+        ],
+        iou_threshold=0.50,
+    )
+
+    assert len(vehicles) == 2
+
+
 def test_refresh_known_faces_cache_reloads_when_forced(monkeypatch):
     calls = {"count": 0}
 
