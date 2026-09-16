@@ -165,7 +165,8 @@ repeated read failures. Every second frame is processed. The worker:
 
 1. Detects person boxes with YOLO class `0` and existing plausibility checks.
 2. Runs vehicle YOLO only for vehicle-KPI cameras at the existing cadence.
-3. Filters vehicles through the existing rectangle ROI.
+3. Filters vehicles through the current camera's `vehicle.points` polygon;
+	the box center or bottom-center must be inside the polygon.
 4. Runs InsightFace under the one global inference lock.
 5. Rejects low-confidence, geometrically invalid, out-of-ROI, or
 	non-person-associated faces.
@@ -320,7 +321,8 @@ delivery, Socket.IO payloads, and graceful shutdown.
 
 - `config/cameras.py`: new camera configuration owner.
 - `roi/camera_rois.py`: new ROI configuration owner.
-- `alcon_stream_new.py`: imports centralized camera and ROI values and uses
-  the centralized vehicle ROI mapping.
+- `alcon_stream_new.py`: imports centralized camera and ROI values, validates
+	vehicle detections against camera-specific polygons, and emits recognition
+	diagnostics.
 - `README.md`: complete architecture, workflow, API, state, migration, and
   validation documentation.

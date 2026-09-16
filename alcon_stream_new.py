@@ -1659,10 +1659,15 @@ def _load_registered_embeddings_from_db():
 
         buf = io.BytesIO(blob)
         buf.seek(0)
-        embedding = np.load(buf, allow_pickle=False).astype(np.float32)
-        grouped[storage_key]["embeddings"].append(
-            normalize_embedding(embedding)
-        )
+        try:
+            embedding = np.load(buf, allow_pickle=False).astype(np.float32)
+        except Exception as error:
+            print(
+                f"[KNOWN LOAD] invalid database embedding for "
+                f"{storage_key} image_{row[5]}: {error}"
+            )
+            continue
+        grouped[storage_key]["embeddings"].append(embedding)
 
     return grouped
 
@@ -1680,6 +1685,13 @@ def _validated_template_embedding(embedding, person_key, image_label=None):
         return None
     if not np.all(np.isfinite(array)):
         print(f"[KNOWN LOAD] non-finite embedding for {person_key} ({image_label})")
+        return None
+
+    if array.size != 512:
+        print(
+            f"[KNOWN LOAD] invalid dimension for {person_key} "
+            f"({image_label}): {array.size}, expected 512"
+        )
         return None
 
     norm = float(np.linalg.norm(array))
@@ -1753,6 +1765,15 @@ def load_known_faces():
             f"dimension={valid_templates[0].shape[0]} status=OK"
         )
 
+    print(f"[FACE CACHE] persons={person_count} templates={total_templates}")
+    for person_key, templates in known_face_templates.items():
+        dimensions = sorted({int(template.shape[0]) for template in templates})
+        employee_name = known_person_metadata[person_key]["employee_name"]
+        print(
+            f"[FACE CACHE] employee={employee_name} "
+            f"templates={len(templates)} dimensions={dimensions} "
+            f"valid={len(templates)}"
+        )
     print(
         f"[INFO] Loaded {person_count} registered person(s) with "
         f"{total_templates} individual face templates."
@@ -1799,7 +1820,8 @@ def safe_face_inference(frame):
     """Serialize GPU InsightFace calls across all camera workers."""
     if face_app is None:
         return []
-    return safe_gpu_inference(face_app.get, frame)
+    with face_inference_lock:
+        return face_app.get(frame)
 
 
 def safe_person_inference(frame):
@@ -1877,6 +1899,17 @@ def recognize_face(face, camera_id=None):
     face.recognition_second_score = second_score
     face.recognition_margin = margin
     face.recognition_template = person_templates.get(best_key)
+
+    print(
+        f"[FACE LIVE] camera={camera_id or 'unknown'} "
+        f"det_score={float(getattr(face, 'det_score', 0.0)):.3f} "
+        f"face_box={getattr(face, 'bbox', None)} "
+        f"embedding_dim={query.size} "
+        f"best={recognized_name or 'None'} "
+        f"template=image_{person_templates.get(best_key, 'None')} "
+        f"score={best_score:.4f} second={second_score:.4f} "
+        f"margin={margin:.4f} threshold={RECOGNITION_THRESHOLD:.2f}"
+    )
 
     if best_key is not None and best_score >= RECOGNITION_THRESHOLD and margin >= RECOGNITION_MARGIN:
         face.person_id = metadata.get("employee_id")
@@ -2721,6 +2754,21 @@ def camera_worker(camera_config, rtsp_url=None):
                                 person_boxes,
                                 frame.shape,
                             )
+                            if associated_person_box is None:
+                                _camera_log(
+                                    camera_id,
+                                    f"[FACE ASSOCIATION] camera={camera_id} "
+                                    f"face_box={tuple(int(value) for value in face_box)} "
+                                    "result=REJECT reason=no_person_association",
+                                )
+                            else:
+                                _camera_log(
+                                    camera_id,
+                                    f"[FACE ASSOCIATION] camera={camera_id} "
+                                    f"face_box={tuple(int(value) for value in face_box)} "
+                                    f"person_box={tuple(int(value) for value in associated_person_box)} "
+                                    "result=PASS",
+                                )
                             active_track_match = any(
                                 now - remembered_face["last_seen"]
                                 < KNOWN_IDENTITY_MEMORY_TIMEOUT
@@ -2754,13 +2802,24 @@ def camera_worker(camera_config, rtsp_url=None):
                                     for vehicle_person_box in vehicle_person_boxes
                                 )
                             )
-                            if not face_in_roi(
+                            face_roi_pass = face_in_roi(
                                 face_box,
                                 frame.shape[1],
                                 frame.shape[0],
                                 camera_id=camera_id,
-                            ) and not associated_with_vehicle:
+                            )
+                            if not face_roi_pass and not associated_with_vehicle:
+                                _camera_log(
+                                    camera_id,
+                                    f"[FACE ROI] camera={camera_id} result=REJECT "
+                                    "reason=outside_roi",
+                                )
                                 continue
+                            _camera_log(
+                                camera_id,
+                                f"[FACE ROI] camera={camera_id} result=PASS"
+                                + (" reason=vehicle_context" if associated_with_vehicle and not face_roi_pass else ""),
+                            )
                             if associated_person_box is None and not active_track_match:
                                 _camera_log(
                                     camera_id,
@@ -3798,6 +3857,18 @@ def _save_registered_person(gate_no, employee_name, designation, employee_id,
                 json.dumps([str(path) for path in final_paths]), fingerprint, now,
             ),
         )
+        stored_template_count = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM registered_face_embeddings
+            WHERE registration_id = ?
+            """,
+            (registration_id,),
+        ).fetchone()[0]
+        if stored_template_count != 5:
+            raise RuntimeError(
+                "Registration integrity check failed: expected 5 face templates"
+            )
         conn.commit()
     except Exception:
         if conn is not None:
