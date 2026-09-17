@@ -3982,13 +3982,18 @@ def camera_worker(camera_config, rtsp_url=None):
 
 
                     if detection_manager is not None:
+                        # The tracker retains frames until a detection exits the
+                        # ROI, then draws that detection once on the selected
+                        # frame.  Supplying send_frame here would retain the
+                        # preview overlays as well, so the final draw produced
+                        # stale/misplaced annotations and a second vehicle box.
                         detection_manager.process_frame(
-                            frame=send_frame,
+                            frame=frame,
                             faces=last_event_people,
                             vehicles=last_vehicles,
                             gate_name=gate_name,
                             detected_at=now,
-                            alert_frame=send_frame,
+                            alert_frame=frame,
                         )
 
 
