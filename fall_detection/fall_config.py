@@ -2,7 +2,12 @@
 
 import os
 
-FALL_ENABLED = os.getenv("FALL_DETECTION_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+# FALL_DETECTION_ENABLED is the deployment-facing global switch. FALL_ENABLED
+# remains the existing package-level alias used by the pipeline.
+FALL_DETECTION_ENABLED = os.getenv(
+    "FALL_DETECTION_ENABLED", "true"
+).strip().lower() in {"1", "true", "yes", "on"}
+FALL_ENABLED = FALL_DETECTION_ENABLED
 FALL_MODEL_PATH = os.getenv("FALL_MODEL_PATH", "yolo11m-pose.pt")
 FALL_CONFIDENCE = float(os.getenv("FALL_CONFIDENCE", "0.35"))
 FALL_POSE_CONFIDENCE = float(os.getenv("FALL_POSE_CONFIDENCE", "0.35"))

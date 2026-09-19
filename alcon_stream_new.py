@@ -32,6 +32,11 @@ except ImportError:
     YOLO = None
 
 from dotenv import load_dotenv
+
+# Load deployment switches before importing camera and KPI configuration
+# modules, which read their values at module initialization time.
+load_dotenv()
+
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 from flask_socketio import SocketIO, join_room, leave_room
@@ -43,22 +48,25 @@ from camera.manager import CameraManager
 from config.cameras import CAMERAS, enabled_cameras
 from roi.camera_rois import get_camera_roi
 from fall_detection import FallDetector
-from fall_detection.fall_config import FALL_ENABLED, FALL_MODEL_PATH
+from fall_detection.fall_config import (
+    FALL_DETECTION_ENABLED,
+    FALL_ENABLED,
+    FALL_MODEL_PATH,
+)
 from ppe_detection import PPEDetector
-from ppe_detection.ppe_config import PPE_ANNOTATION_ENABLED, PPE_ENABLED, PPE_MODEL_PATH
+from ppe_detection.ppe_config import (
+    HELMET_DETECTION_ENABLED,
+    PPE_ANNOTATION_ENABLED,
+    PPE_ENABLED,
+    PPE_MODEL_PATH,
+)
 from smoke_fire_detection import SmokeFireDetector
 from smoke_fire_detection.smoke_fire_config import (
+    FIRE_DETECTION_ENABLED,
     SMOKE_FIRE_ENABLED,
     SMOKE_FIRE_MODEL_PATH,
     SMOKE_FIRE_TEST_MODE,
 )
-
-
-# ============================================================
-# ENVIRONMENT
-# ============================================================
-
-load_dotenv()
 
 
 # ============================================================
@@ -670,13 +678,14 @@ def initialize_fall_detector():
     print(f"[INFO] Loading fall pose detector: {FALL_MODEL_PATH}...")
     fall_detector = FallDetector(FALL_MODEL_PATH, YOLO)
     print("[OK] Fall pose detector loaded.")
+    print("[FALL] ENABLED | scope=ALL_ENABLED_CAMERAS")
 
 
 def initialize_ppe_detector():
     """Load PPE once and fail closed without affecting established KPIs."""
     global ppe_detector
     if not PPE_ENABLED:
-        print("[INFO] PPE detection disabled by PPE_DETECTION_ENABLED.")
+        print("[INFO] PPE detection disabled by HELMET_DETECTION_ENABLED.")
         return
     if YOLO is None:
         print("[WARNING] PPE detection disabled: ultralytics is unavailable.")
@@ -691,6 +700,7 @@ def initialize_ppe_detector():
         print(f"[PPE MODEL] classes={actual_classes}")
         print(f"[PPE MODEL] supported={supported} missing={missing}")
         print("[OK] PPE detector loaded (only confirmed Helmet sessions alert).")
+        print("[HELMET] ENABLED | scope=ALL_ENABLED_CAMERAS")
     except Exception as error:
         ppe_detector = None
         print(f"[WARNING] PPE detection disabled; model load failed: {error}")
@@ -700,7 +710,7 @@ def initialize_smoke_fire_detector():
     """Load the independent smoke/fire model once without interrupting other KPIs."""
     global smoke_fire_detector
     if not SMOKE_FIRE_ENABLED:
-        print("[INFO] Smoke/fire detection disabled by SMOKE_FIRE_ENABLED.")
+        print("[INFO] Smoke/fire detection disabled by FIRE_DETECTION_ENABLED.")
         return
     if YOLO is None:
         print("[WARNING] Smoke/fire detection disabled: ultralytics is unavailable.")
@@ -712,6 +722,7 @@ def initialize_smoke_fire_detector():
             "[OK] Smoke/fire detector loaded "
             f"(test_mode={SMOKE_FIRE_TEST_MODE})."
         )
+        print("[FIRE] ENABLED | scope=ALL_ENABLED_CAMERAS")
     except Exception as error:
         smoke_fire_detector = None
         print(f"[WARNING] Smoke/fire detection disabled; model load failed: {error}")
@@ -2929,6 +2940,16 @@ def camera_worker(camera_config, rtsp_url=None):
     gate_name = camera_name
     detection_manager = camera_event_managers.get(camera_id)
     state = camera_states.get(camera_id)
+
+    # CameraManager creates workers exclusively from _enabled_cameras(). The
+    # three global switches therefore apply to every enabled worker and never
+    # to a disabled camera, without maintaining per-KPI camera lists.
+    if fall_detector is not None and FALL_DETECTION_ENABLED:
+        _camera_log(camera_id, "[FALL] ENABLED | scope=ALL_ENABLED_CAMERAS")
+    if smoke_fire_detector is not None and FIRE_DETECTION_ENABLED:
+        _camera_log(camera_id, "[FIRE] ENABLED | scope=ALL_ENABLED_CAMERAS")
+    if ppe_detector is not None and HELMET_DETECTION_ENABLED:
+        _camera_log(camera_id, "[HELMET] ENABLED | scope=ALL_ENABLED_CAMERAS")
 
     if rtsp_url is None:
         rtsp_url = build_rtsp_url(camera_config)

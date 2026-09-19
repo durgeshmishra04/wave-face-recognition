@@ -2,7 +2,13 @@
 
 import os
 
-SMOKE_FIRE_ENABLED = os.getenv("SMOKE_FIRE_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+# FIRE_DETECTION_ENABLED is the deployment-facing global switch. Keep the
+# existing SMOKE_FIRE_ENABLED name as a backwards-compatible alias.
+FIRE_DETECTION_ENABLED = os.getenv(
+    "FIRE_DETECTION_ENABLED",
+    os.getenv("SMOKE_FIRE_ENABLED", "true"),
+).strip().lower() in {"1", "true", "yes", "on"}
+SMOKE_FIRE_ENABLED = FIRE_DETECTION_ENABLED
 SMOKE_FIRE_TEST_MODE = os.getenv("SMOKE_FIRE_TEST_MODE", "false").strip().lower() in {"1", "true", "yes", "on"}
 SMOKE_FIRE_MODEL_PATH = os.getenv("SMOKE_FIRE_MODEL_PATH", "Salahyolo26.pt")
 SMOKE_CONFIDENCE_THRESHOLD = float(os.getenv("SMOKE_CONFIDENCE_THRESHOLD", "0.40"))
