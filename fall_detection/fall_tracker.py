@@ -6,7 +6,8 @@ import time
 
 from .fall_config import (
     FALL_CONFIRMATION_FRAMES, FALL_HISTORY_SIZE, FALL_MIN_NORMAL_FRAMES,
-    FALL_RECOVERY_FRAMES, FALL_TRACK_TIMEOUT_SECONDS,
+    FALL_RECOVERY_FRAMES, FALL_REQUIRE_UPRIGHT_TRANSITION,
+    FALL_TRACK_TIMEOUT_SECONDS,
 )
 
 
@@ -26,10 +27,12 @@ class FallTracker:
     def __init__(self, confirmation_frames=FALL_CONFIRMATION_FRAMES,
                  recovery_frames=FALL_RECOVERY_FRAMES,
                  min_normal_frames=FALL_MIN_NORMAL_FRAMES,
+                 require_upright_transition=FALL_REQUIRE_UPRIGHT_TRANSITION,
                  timeout_seconds=FALL_TRACK_TIMEOUT_SECONDS):
         self.confirmation_frames = confirmation_frames
         self.recovery_frames_required = recovery_frames
         self.min_normal_frames = min_normal_frames
+        self.require_upright_transition = require_upright_transition
         self.timeout_seconds = timeout_seconds
         self.states = {}
 
@@ -49,8 +52,10 @@ class FallTracker:
 
         if state.state == "NORMAL":
             if posture == "fallen" and state.normal_frames == 0:
-                # A fall may only start after an observed upright posture.
-                if upright_transition_ready:
+                # A person can enter the view already down. Several consistent
+                # fallen frames are still required; only the unseen upright
+                # transition is optional.
+                if not self.require_upright_transition or upright_transition_ready:
                     state.state, state.candidate_frames = "CANDIDATE", 1
             return False
 
