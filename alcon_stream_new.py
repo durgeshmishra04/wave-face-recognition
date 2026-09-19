@@ -2346,9 +2346,14 @@ def _update_person_tracks(person_tracks, person_boxes, now, next_track_id):
             box,
         )
         if track is None:
+            body_box = np.asarray(box, dtype=np.int32)
             track = {
                 "track_id": next_track_id,
-                "box": np.asarray(box, dtype=np.int32),
+                # ``box`` remains the body box for the existing association
+                # and event-tracking code. It is never a rendering source.
+                "box": body_box,
+                "body_box": body_box.copy(),
+                "face_box": None,
                 "last_seen": now,
                 "matched_this_frame": True,
                 "identity_status": "UNVERIFIED",
@@ -2362,8 +2367,10 @@ def _update_person_tracks(person_tracks, person_boxes, now, next_track_id):
             person_tracks.append(track)
             next_track_id += 1
         else:
+            body_box = np.asarray(box, dtype=np.int32)
             track.update({
-                "box": np.asarray(box, dtype=np.int32),
+                "box": body_box,
+                "body_box": body_box.copy(),
                 "last_seen": now,
                 "matched_this_frame": True,
             })
@@ -3500,6 +3507,11 @@ def camera_worker(camera_config, rtsp_url=None):
                                         "employee_id": metadata.get("employee_id"),
                                         "employee_name": name,
                                         "last_verified_score": score,
+                                        "body_box": (
+                                            current_body_box.copy()
+                                            if current_body_box is not None else None
+                                        ),
+                                        "face_box": current_box.copy(),
                                         "annotation_box": current_box.copy(),
                                         "recognition_score": score,
                                         "unknown_evidence": True,
@@ -3551,6 +3563,12 @@ def camera_worker(camera_config, rtsp_url=None):
                                 name = person_track["employee_name"]
                                 face.person_id = person_track.get("employee_id")
                                 person_track.update({
+                                    "body_box": (
+                                        current_body_box.copy()
+                                        if current_body_box is not None
+                                        else person_track.get("body_box")
+                                    ),
+                                    "face_box": current_box.copy(),
                                     "annotation_box": current_box.copy(),
                                     "recognition_score": score,
                                     "unknown_evidence": True,
@@ -3593,6 +3611,11 @@ def camera_worker(camera_config, rtsp_url=None):
                             if person_track is not None and name == "Unknown":
                                 person_track.update({
                                     "identity_status": "UNKNOWN",
+                                    "body_box": (
+                                        current_body_box.copy()
+                                        if current_body_box is not None else None
+                                    ),
+                                    "face_box": current_box.copy(),
                                     "annotation_box": current_box.copy(),
                                     "recognition_score": score,
                                     "unknown_evidence": True,
