@@ -134,7 +134,13 @@ class DetectionEventManager:
 
     @staticmethod
     def _draw_event(frame, event):
-        if event["detection_type"] == "vehicle":
+        if event["detection_type"] == "fall_detected":
+            x1, y1, x2, y2 = event["box"]
+            label, color = "FALL DETECTED", (0, 0, 255)
+        elif event["detection_type"] == "helmet_detected":
+            x1, y1, x2, y2 = event["box"]
+            label, color = "HELMET DETECTED", (0, 215, 255)
+        elif event["detection_type"] == "vehicle":
             x1, y1, x2, y2 = event["box"]
             label, color = f"{event['vehicle_type'].replace('_', ' ').title()} | {event['vehicle_class']} | {event['confidence']:.2f}", (0, 140, 255)
         elif event["detection_type"] == "known_person":
@@ -199,6 +205,10 @@ class DetectionEventManager:
                 event.get("vehicle_type"),
                 event.get("vehicle_class"),
             )
+        if detection_type == "fall_detected":
+            return ("fall_detected", camera_id, event.get("track_id"))
+        if detection_type == "helmet_detected":
+            return ("helmet_detected", camera_id, event.get("track_id"))
         # Unknown entries must collapse to one alert per camera/gate while the
         # same person is still being tracked in the ROI. Counting multiple
         # unknown frames as distinct dedupe keys caused duplicate notifications
@@ -217,6 +227,12 @@ class DetectionEventManager:
             return True
         self._recent_event_cache[key] = now
         return False
+
+    def publish_immediate(self, event, frame, notify=True):
+        """Publish a confirmed non-exit event through existing persistence/IO."""
+        image = frame.copy()
+        self._draw_event(image, event)
+        return self._publish(event, image, notify=notify)
 
     def _notify(self, event):
         image_url = event["image_url"]

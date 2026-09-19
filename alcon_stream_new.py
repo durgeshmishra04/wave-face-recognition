@@ -42,6 +42,16 @@ from detection_events import DetectionEventManager
 from camera.manager import CameraManager
 from config.cameras import CAMERAS, enabled_cameras
 from roi.camera_rois import get_camera_roi
+from fall_detection import FallDetector
+from fall_detection.fall_config import FALL_ENABLED, FALL_MODEL_PATH
+from ppe_detection import PPEDetector
+from ppe_detection.ppe_config import PPE_ANNOTATION_ENABLED, PPE_ENABLED, PPE_MODEL_PATH
+from smoke_fire_detection import SmokeFireDetector
+from smoke_fire_detection.smoke_fire_config import (
+    SMOKE_FIRE_ENABLED,
+    SMOKE_FIRE_MODEL_PATH,
+    SMOKE_FIRE_TEST_MODE,
+)
 
 
 # ============================================================
@@ -268,6 +278,9 @@ face_app = None
 person_detector = None
 vehicle_detector = None
 detection_events = None
+fall_detector = None
+ppe_detector = None
+smoke_fire_detector = None
 
 unknown_present = False
 unknown_first_seen = 0.0
@@ -644,6 +657,64 @@ def initialize_face_model():
 
     print("[OK] Face model loaded.")
     print(f"[FACE MODEL] embedding_dimension={face_app.model.get_output_dim() if hasattr(face_app, 'model') and hasattr(face_app.model, 'get_output_dim') else 'unknown'}")
+
+
+def initialize_fall_detector():
+    """Load the independent pose model once; existing models remain untouched."""
+    global fall_detector
+    if not FALL_ENABLED:
+        print("[INFO] Fall detection disabled by FALL_DETECTION_ENABLED.")
+        return
+    if YOLO is None:
+        raise RuntimeError("Fall detection requires ultralytics.")
+    print(f"[INFO] Loading fall pose detector: {FALL_MODEL_PATH}...")
+    fall_detector = FallDetector(FALL_MODEL_PATH, YOLO)
+    print("[OK] Fall pose detector loaded.")
+
+
+def initialize_ppe_detector():
+    """Load PPE once and fail closed without affecting established KPIs."""
+    global ppe_detector
+    if not PPE_ENABLED:
+        print("[INFO] PPE detection disabled by PPE_DETECTION_ENABLED.")
+        return
+    if YOLO is None:
+        print("[WARNING] PPE detection disabled: ultralytics is unavailable.")
+        return
+    try:
+        print(f"[INFO] Loading PPE detector: {PPE_MODEL_PATH}...")
+        ppe_detector = PPEDetector(PPE_MODEL_PATH, YOLO)
+        actual_classes = list(ppe_detector.class_names.values())
+        supported = sorted(set(ppe_detector.supported_classes.values()))
+        required = {"Helmet", "Safety Vest", "Gloves", "Mask", "Safety Boots"}
+        missing = sorted(required - set(supported))
+        print(f"[PPE MODEL] classes={actual_classes}")
+        print(f"[PPE MODEL] supported={supported} missing={missing}")
+        print("[OK] PPE detector loaded (only confirmed Helmet sessions alert).")
+    except Exception as error:
+        ppe_detector = None
+        print(f"[WARNING] PPE detection disabled; model load failed: {error}")
+
+
+def initialize_smoke_fire_detector():
+    """Load the independent smoke/fire model once without interrupting other KPIs."""
+    global smoke_fire_detector
+    if not SMOKE_FIRE_ENABLED:
+        print("[INFO] Smoke/fire detection disabled by SMOKE_FIRE_ENABLED.")
+        return
+    if YOLO is None:
+        print("[WARNING] Smoke/fire detection disabled: ultralytics is unavailable.")
+        return
+    try:
+        print(f"[INFO] Loading smoke/fire detector: {SMOKE_FIRE_MODEL_PATH}...")
+        smoke_fire_detector = SmokeFireDetector(SMOKE_FIRE_MODEL_PATH, YOLO)
+        print(
+            "[OK] Smoke/fire detector loaded "
+            f"(test_mode={SMOKE_FIRE_TEST_MODE})."
+        )
+    except Exception as error:
+        smoke_fire_detector = None
+        print(f"[WARNING] Smoke/fire detection disabled; model load failed: {error}")
 
 
 # ============================================================
@@ -2865,6 +2936,8 @@ def camera_worker(camera_config, rtsp_url=None):
     last_faces = []
     last_event_people = []
     last_vehicles = []
+    last_ppe_detections = []
+    last_smoke_fire_detections = []
 
     known_face_memory = []
     person_tracks = []
@@ -3019,6 +3092,134 @@ def camera_worker(camera_config, rtsp_url=None):
                             time.time(),
                             next_person_track_id,
                         )
+
+                        # Pose analysis consumes only authoritative person
+                        # tracks.  The pose model never creates a person or
+                        # track, and the existing polygon ROI remains master.
+                        if fall_detector is not None:
+                            roi_points = get_camera_roi(camera_id)["points"]
+                            roi_polygon = roi_points * np.array(
+                                [frame.shape[1], frame.shape[0]], dtype=np.float32
+                            )
+                            confirmed_falls = fall_detector.process(
+                                frame=frame,
+                                camera_id=camera_id,
+                                person_tracks=person_tracks,
+                                roi_polygon=roi_polygon,
+                                inference=safe_gpu_inference,
+                                now=time.time(),
+                            )
+                            for fall in confirmed_falls:
+                                if detection_manager is not None:
+                                    detection_manager.publish_immediate(
+                                        {
+                                            "detected_at": time.time(),
+                                            "detection_type": "fall_detected",
+                                            "track_id": fall.track_id,
+                                            "person_name": "Unknown",
+                                            "confidence": fall.confidence,
+                                            "gate_name": gate_name,
+                                            "camera_id": camera_id,
+                                            "camera_name": camera_name,
+                                            "box": fall.box,
+                                            "title": "Fall Detected",
+                                            "message": f"Fall detected at {gate_name}",
+                                        },
+                                        frame,
+                                        notify=True,
+                                    )
+
+                        # PPE receives authoritative person tracks and the
+                        # existing polygon ROI. Only confirmed helmet sessions
+                        # use the established event/FCM/evidence path.
+                        if ppe_detector is not None:
+                            roi_points = get_camera_roi(camera_id)["points"]
+                            roi_polygon = roi_points * np.array(
+                                [frame.shape[1], frame.shape[0]], dtype=np.float32
+                            )
+                            last_ppe_detections, confirmed_helmets = ppe_detector.process(
+                                frame=frame,
+                                camera_id=camera_id,
+                                person_tracks=person_tracks,
+                                roi_polygon=roi_polygon,
+                                inference=safe_gpu_inference,
+                                now=time.time(),
+                            )
+                            for helmet in confirmed_helmets:
+                                if detection_manager is not None:
+                                    detection_manager.publish_immediate(
+                                        {
+                                            "detected_at": time.time(),
+                                            "detection_type": "helmet_detected",
+                                            "track_id": helmet.track_id,
+                                            "person_name": "Unknown",
+                                            "confidence": helmet.confidence,
+                                            "gate_name": gate_name,
+                                            "camera_id": camera_id,
+                                            "camera_name": camera_name,
+                                            "box": helmet.box,
+                                            "title": "Helmet Detected",
+                                            "message": f"Helmet detected on {camera_id}.",
+                                        },
+                                        frame,
+                                        notify=True,
+                                    )
+                                    _camera_log(camera_id, f"[PPE] HELMET ALERT_SENT | track={helmet.track_id} | confidence={helmet.confidence:.2f}")
+
+                        # Smoke/fire is camera-local, uses the existing ROI,
+                        # and publishes only temporally-confirmed incidents.
+                        if smoke_fire_detector is not None:
+                            roi_points = get_camera_roi(camera_id)["points"]
+                            roi_polygon = roi_points * np.array(
+                                [frame.shape[1], frame.shape[0]], dtype=np.float32
+                            )
+                            last_smoke_fire_detections, confirmed_incidents = smoke_fire_detector.process(
+                                frame=frame,
+                                camera_id=camera_id,
+                                roi_polygon=roi_polygon,
+                                inference=safe_gpu_inference,
+                                now=time.time(),
+                            )
+                            for incident in confirmed_incidents:
+                                incident_label = incident.type.title()
+                                _camera_log(
+                                    camera_id,
+                                    "[SMOKE/FIRE] INCIDENT_CONFIRMED "
+                                    f"| id={incident.incident_id} "
+                                    f"| type={incident.type} "
+                                    f"| confidence={incident.confidence:.2f}",
+                                )
+                                if detection_manager is not None and not SMOKE_FIRE_TEST_MODE:
+                                    detection_manager.publish_immediate(
+                                        {
+                                            "detected_at": time.time(),
+                                            "detection_type": f"{incident.type}_detected",
+                                            "incident_id": incident.incident_id,
+                                            "person_name": "Unknown",
+                                            "confidence": incident.confidence,
+                                            "gate_name": gate_name,
+                                            "camera_id": camera_id,
+                                            "camera_name": camera_name,
+                                            "box": incident.box,
+                                            "smoke_present": incident.smoke_present,
+                                            "fire_present": incident.fire_present,
+                                            "title": f"{incident_label} Detected",
+                                            "message": f"{incident_label} detected at {gate_name}",
+                                        },
+                                        frame,
+                                        notify=True,
+                                    )
+                                    _camera_log(
+                                        camera_id,
+                                        f"[SMOKE/FIRE] {incident_label.upper()} ALERT_SENT "
+                                        f"| incident={incident.incident_id}",
+                                    )
+                                elif SMOKE_FIRE_TEST_MODE:
+                                    _camera_log(
+                                        camera_id,
+                                        "[SMOKE/FIRE] test mode: alert not published "
+                                        f"| incident={incident.incident_id}",
+                                    )
 
                         if (
                             camera_config.get("kpi") == "vehicle"
@@ -3783,6 +3984,12 @@ def camera_worker(camera_config, rtsp_url=None):
                     last_emit_time = now
 
                     send_frame = frame.copy()
+
+                    if ppe_detector is not None and PPE_ANNOTATION_ENABLED:
+                        ppe_detector.annotate(send_frame, last_ppe_detections)
+
+                    if smoke_fire_detector is not None:
+                        smoke_fire_detector.annotate(send_frame, last_smoke_fire_detections)
 
                     for face in last_faces:
 
@@ -4987,6 +5194,9 @@ def api_mobile():
         "known_person",
         "unknown_person",
         "vehicle",
+        "fall_detected",
+        "smoke_detected",
+        "fire_detected",
     }
     if detection_type not in valid_detection_types:
         detection_type = ""
@@ -5023,6 +5233,18 @@ def api_mobile():
         ),
         "vehicle_events": sum(
             item["type"] == "vehicle"
+            for item in all_detections
+        ),
+        "fall_events": sum(
+            item["type"] == "fall_detected"
+            for item in all_detections
+        ),
+        "smoke_events": sum(
+            item["type"] == "smoke_detected"
+            for item in all_detections
+        ),
+        "fire_events": sum(
+            item["type"] == "fire_detected"
             for item in all_detections
         ),
     }
@@ -5084,6 +5306,9 @@ def api_mobile():
                     "known_person",
                     "unknown_person",
                     "vehicle",
+                    "fall_detected",
+                    "smoke_detected",
+                    "fire_detected",
                 ],
                 "vehicle_types": [
                     "two_wheeler",
@@ -5383,6 +5608,9 @@ def main():
         configure_h264_stream(camera_config)
 
     initialize_face_model()
+    initialize_fall_detector()
+    initialize_ppe_detector()
+    initialize_smoke_fire_detector()
     initialize_detection_events()
 
 

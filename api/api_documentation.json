@@ -1,0 +1,198 @@
+{
+  "title": "Wave FR API Reference",
+  "version": "1.0",
+  "base_url": "http://<server-ip>:5000",
+  "api_base_url": "http://<server-ip>:5000/api",
+  "content_types": {
+    "json": "application/json",
+    "multipart": "multipart/form-data"
+  },
+  "authentication": {
+    "enforced": false,
+    "note": "Login validates credentials and registers an FCM device token. The current REST routes do not enforce a session or Bearer token."
+  },
+  "common_errors": [
+    {"status": 400, "body": {"success": false, "message": "Invalid or missing input"}},
+    {"status": 401, "body": {"success": false, "message": "Invalid credentials"}},
+    {"status": 404, "body": {"success": false, "message": "Resource not found"}},
+    {"status": 500, "body": {"success": false, "message": "Server-side operation failed"}}
+  ],
+  "rest_apis": [
+    {
+      "method": "POST",
+      "path": "/api/register-person",
+      "purpose": "Registers an employee, validates five face images, saves face embeddings, and makes the employee available to live recognition.",
+      "request": {
+        "content_type": "multipart/form-data",
+        "required_fields": {"gate_no": "Gate 1", "employee_name": "John Doe", "designation": "Operator", "image1": "<file>", "image2": "<file>", "image3": "<file>", "image4": "<file>", "image5": "<file>"},
+        "optional_fields": {"employee_id": "EMP001"},
+        "notes": ["Exactly five files named image1 through image5 are required.", "Each image must contain exactly one acceptable face."]
+      },
+      "success": {"status": 201, "body": {"success": true, "message": "Employee registered successfully", "registration_id": "REG_ABC123", "gate_no": "Gate 1", "employee_id": "EMP001", "employee_name": "John Doe", "designation": "Operator", "images_registered": 5}},
+      "errors": [400, 503, 500]
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/update-person/{registration_id}",
+      "purpose": "Updates one or more employee metadata fields without changing registered face images.",
+      "request": {"content_type": "application/json or multipart/form-data", "example": {"employee_name": "John Smith", "designation": "Supervisor"}, "accepted_fields": ["gate_no", "employee_name", "designation", "employee_id"], "notes": ["At least one field is required.", "Send an empty employee_id to clear it."]},
+      "success": {"status": 200, "body": {"success": true, "message": "Employee updated successfully", "registration_id": "REG_ABC123", "gate_no": "Gate 1", "employee_id": "EMP001", "employee_name": "John Smith", "designation": "Supervisor"}},
+      "errors": [400, 404, 500]
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/delete-person/{registration_id}",
+      "purpose": "Deletes an employee's record, embeddings, stored images, and live-recognition cache entry.",
+      "request": {"body": null},
+      "success": {"status": 200, "body": {"success": true, "message": "Employee deleted successfully", "registration_id": "REG_ABC123"}},
+      "errors": [404, 500]
+    },
+    {
+      "method": "POST",
+      "path": "/api/admin/login",
+      "purpose": "Authenticates an administrator and registers the device FCM token for notifications.",
+      "request": {"content_type": "application/json or multipart/form-data", "example": {"username": "admin", "password": "password", "fcm_token": "firebase-device-token"}},
+      "success": {"status": 200, "body": {"success": true, "message": "Login successful", "role": "admin", "username": "admin", "account_id": 1, "admin_id": 1, "fcm_token": "firebase-device-token"}},
+      "errors": [400, 401]
+    },
+    {
+      "method": "POST",
+      "path": "/api/user/login",
+      "purpose": "Authenticates a user and registers the device FCM token for notifications.",
+      "request": {"content_type": "application/json or multipart/form-data", "example": {"username": "operator", "password": "password", "fcm_token": "firebase-device-token"}},
+      "success": {"status": 200, "body": {"success": true, "message": "Login successful", "role": "user", "username": "operator", "account_id": 2, "user_id": 2, "fcm_token": "firebase-device-token"}},
+      "errors": [400, 401]
+    },
+    {
+      "method": "POST",
+      "path": "/api/admin/logout",
+      "purpose": "Deactivates an administrator's FCM device token, stopping notifications to that device.",
+      "request": {"content_type": "application/json or multipart/form-data", "example": {"admin_id": 1, "fcm_token": "firebase-device-token"}},
+      "success": {"status": 200, "body": {"success": true, "message": "Logout successful", "role": "admin", "admin_id": 1, "fcm_token": "firebase-device-token", "is_active": false}},
+      "errors": [400, 404]
+    },
+    {
+      "method": "POST",
+      "path": "/api/user/logout",
+      "purpose": "Deactivates a user's FCM device token, stopping notifications to that device.",
+      "request": {"content_type": "application/json or multipart/form-data", "example": {"user_id": 2, "fcm_token": "firebase-device-token"}},
+      "success": {"status": 200, "body": {"success": true, "message": "Logout successful", "role": "user", "user_id": 2, "fcm_token": "firebase-device-token", "is_active": false}},
+      "errors": [400, 404]
+    },
+    {
+      "method": "GET",
+      "path": "/api/cameras",
+      "purpose": "Lists all configured cameras, including disabled cameras and their current status.",
+      "request": {"query": {}},
+      "success": {"status": 200, "body": {"success": true, "cameras": [{"camera_id": "CAM001", "name": "MAIN GATE 01", "kpi": "vehicle", "channel": 1, "status": "online", "enabled": true}]}}
+    },
+    {
+      "method": "GET",
+      "path": "/api/cameras/{camera_id}",
+      "purpose": "Returns configuration and runtime status for one camera.",
+      "request": {"path_parameters": {"camera_id": "CAM001"}},
+      "success": {"status": 200, "body": {"success": true, "camera": {"camera_id": "CAM001", "name": "MAIN GATE 01", "kpi": "vehicle", "channel": 1, "status": "online", "enabled": true}}},
+      "errors": [404]
+    },
+    {
+      "method": "GET",
+      "path": "/api/status",
+      "purpose": "Provides a lightweight health check for one selected camera.",
+      "request": {"query": {"camera_id": "CAM001 (optional)", "channel": "1 (optional alternative)"}},
+      "success": {"status": 200, "body": {"camera_id": "CAM001", "camera_name": "MAIN GATE 01", "status": "LIVE", "frame_available": true, "frame_bytes": 123456, "connected_clients": 2, "known_faces_count": 10}},
+      "errors": [404]
+    },
+    {
+      "method": "GET",
+      "path": "/api/snapshot",
+      "purpose": "Returns the latest annotated JPEG frame as Base64 for polling clients.",
+      "request": {"query": {"camera_id": "CAM001 (optional)", "channel": "1 (optional alternative)"}},
+      "success": {"status": 200, "body": {"image": "<base64-jpeg>", "status": "LIVE", "camera_id": "CAM001", "camera_name": "MAIN GATE 01"}},
+      "errors": [404, 503]
+    },
+    {
+      "method": "GET",
+      "path": "/api/alerts",
+      "purpose": "Returns in-memory person-alert history, optionally restricted to one camera.",
+      "request": {"query": {"limit": "20 (optional; default 20)", "camera_id": "CAM001 (optional)"}},
+      "success": {"status": 200, "body": {"alerts": [{"id": "notification-id", "time": 1730000000.0, "message": "New person detected", "gate": "MAIN GATE 01", "camera_id": "CAM001", "camera_name": "MAIN GATE 01", "image_url": "http://server:5000/alerts/image.jpg", "type": "person_detected"}]}}
+    },
+    {
+      "method": "GET",
+      "path": "/api/detections",
+      "purpose": "Returns persisted detection-event history, including person, vehicle, fall, smoke, and fire events.",
+      "request": {"query": {"limit": "0 (optional; 0 means all)", "camera_id": "CAM001 (optional)"}},
+      "success": {"status": 200, "body": {"detections": [{"id": 101, "type": "fall_detected", "person_id": null, "person_name": "Unknown", "vehicle_type": null, "vehicle_class": null, "confidence": 0.91, "unknown_count": null, "camera_id": "CAM001", "camera_name": "MAIN GATE 01", "gate": "MAIN GATE 01", "image_url": "http://server:5000/alerts/image.jpg", "time": "2026-09-19 10:30:00"}]}}
+    },
+    {
+      "method": "GET",
+      "path": "/api/mobile",
+      "purpose": "Combined Android dashboard API: camera state, persisted detections, alert history, counters, camera list, options, and an optional latest snapshot.",
+      "request": {"query": {"limit": "0 (optional; 0 means all)", "type": "known_person | unknown_person | vehicle | fall_detected | smoke_detected | fire_detected (optional)", "camera_id": "CAM001 (optional)", "include_snapshot": "true or false (optional; default true)"}},
+      "success": {"status": 200, "body": {"success": true, "version": 1, "data": {"status": "LIVE", "connected_clients": 2, "known_faces_count": 10, "people": ["john_doe"], "alerts": [], "detections": [], "detection_summary": {"total_events": 12, "known_events": 4, "unknown_events": 2, "unknown_people": 3, "vehicle_events": 1, "fall_events": 2, "smoke_events": 2, "fire_events": 1}, "snapshot": {"mime_type": "image/jpeg", "base64": "<base64-jpeg>"}, "camera_id": "CAM001", "camera_name": "MAIN GATE 01", "cameras": []}, "options": {"gates": [], "people": [], "detection_types": ["known_person", "unknown_person", "vehicle", "fall_detected", "smoke_detected", "fire_detected"], "vehicle_types": ["two_wheeler", "four_wheeler"]}}}
+    },
+    {
+      "method": "GET",
+      "path": "/api/known-faces",
+      "purpose": "Lists face keys currently loaded into the recognition engine.",
+      "request": {"query": {}},
+      "success": {"status": 200, "body": {"people": ["john_doe", "jane_doe"]}}
+    },
+    {
+      "method": "GET",
+      "path": "/api/registered-employees",
+      "purpose": "Lists registered employees and URLs for their face images.",
+      "request": {"query": {}},
+      "success": {"status": 200, "body": {"success": true, "count": 1, "employees": [{"registration_id": "REG_ABC123", "storage_key": "john_doe", "gate_no": "Gate 1", "employee_id": "EMP001", "employee_name": "John Doe", "designation": "Operator", "created_at": 1730000000.0, "updated_at": 1730000000.0, "image_urls": ["http://server:5000/known-faces/john_doe/image1.jpg"], "images": [], "images_count": 5}]}}
+    },
+    {
+      "method": "GET",
+      "path": "/api/registered-employees/{registration_id}",
+      "purpose": "Returns one registered employee and all associated image metadata.",
+      "request": {"path_parameters": {"registration_id": "REG_ABC123"}},
+      "success": {"status": 200, "body": {"success": true, "employee": {"registration_id": "REG_ABC123", "employee_name": "John Doe", "image_urls": ["http://server:5000/known-faces/john_doe/image1.jpg"], "images": [], "images_count": 5}}},
+      "errors": [404]
+    },
+    {
+      "method": "POST",
+      "path": "/api/test-notification",
+      "purpose": "Sends a manual test person notification using the default camera's latest frame.",
+      "request": {"body": null},
+      "success": {"status": 200, "body": {"success": true, "message": "Test notification sent"}},
+      "errors": [503]
+    },
+    {
+      "method": "GET",
+      "path": "/alerts/{filename}",
+      "purpose": "Serves a saved alert evidence image referenced by image_url.",
+      "request": {"path_parameters": {"filename": "uuid.jpg"}},
+      "success": {"status": 200, "body": "JPEG image binary"}
+    },
+    {
+      "method": "GET",
+      "path": "/known-faces/{storage_key}/{filename}",
+      "purpose": "Serves one registered face image.",
+      "request": {"path_parameters": {"storage_key": "john_doe", "filename": "image1.jpg"}},
+      "success": {"status": 200, "body": "JPEG image binary"}
+    }
+  ],
+  "socket_io": {
+    "url": "http://<server-ip>:5000",
+    "client_to_server": [
+      {"event": "connect", "purpose": "Opens a live Socket.IO connection.", "payload": null, "response": null},
+      {"event": "disconnect", "purpose": "Closes the live Socket.IO connection.", "payload": null, "response": null},
+      {"event": "join_camera", "purpose": "Joins the room for a camera.", "payload": {"camera_id": "CAM001"}, "response": {"success": true, "camera_id": "CAM001", "room": "camera_CAM001"}},
+      {"event": "leave_camera", "purpose": "Leaves the room for a camera.", "payload": {"camera_id": "CAM001"}, "response": {"success": true, "camera_id": "CAM001", "room": "camera_CAM001"}}
+    ],
+    "server_to_client": [
+      {"event": "face_frame", "purpose": "Streams live annotated frames.", "payload": {"camera_id": "CAM001", "camera_name": "MAIN GATE 01", "image": "<base64-jpeg>", "width": 1920, "height": 1080, "faces": [], "vehicles": [], "status": "LIVE"}},
+      {"event": "face_alert", "purpose": "Sends an immediate unknown-person/person alert.", "payload": {"id": "notification-id", "time": 1730000000.0, "message": "New person detected", "gate": "MAIN GATE 01", "camera_id": "CAM001", "camera_name": "MAIN GATE 01", "image_url": "http://server:5000/alerts/image.jpg", "type": "person_detected"}},
+      {"event": "detection_event", "purpose": "Sends every persisted detection event, including fall, smoke, and fire.", "payload": {"id": 101, "type": "smoke_detected", "camera_id": "CAM001", "camera_name": "MAIN GATE 01", "gate": "MAIN GATE 01", "confidence": 0.91, "image_url": "http://server:5000/alerts/image.jpg", "title": "Smoke Detected", "message": "Smoke detected at MAIN GATE 01"}}
+    ]
+  },
+  "external_integrations": [
+    {"name": "RTSP/NVR stream", "purpose": "Reads live camera frames. It is not exposed as a public application REST API.", "protocol": "rtsp"},
+    {"name": "NVR configuration endpoint", "purpose": "Configures H.264 stream settings before camera workers start.", "protocol": "http", "path": "/cgi-bin/configManager.cgi"},
+    {"name": "Firebase Cloud Messaging", "purpose": "Delivers push notifications to registered active device tokens.", "protocol": "Firebase Admin SDK"}
+  ]
+}
