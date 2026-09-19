@@ -97,7 +97,16 @@ CAMERA_ROIS = {
     "CAM005": _new_roi(),
     "CAM006": _new_roi(),
     "CAM007": _new_roi(),
-    "CAM008": _new_roi(),
+    "CAMXX": {
+    "enabled": True,
+    "points": np.array([
+        [0.000, 0.553],  # Top-left
+        [1.000, 0.553],  # Top-right
+        [1.000, 1.000],  # Bottom-right
+        [0.000, 1.000],  # Bottom-left
+    ], dtype=np.float32),
+    
+},
     "CAM009": _new_roi(),
     "CAM010": _new_roi(),
     "CAM011": _new_roi(),
