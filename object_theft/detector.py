@@ -80,6 +80,12 @@ class ObjectTheftDetector:
             raw_names = getattr(model, "names", None)
             if raw_names is None:
                 raise ValueError("custom YOLO model has no model.names")
+            model_task = str(getattr(model, "task", "") or "").lower()
+            if model_task and model_task != "segment":
+                raise ValueError(
+                    f"Object Theft requires a YOLO segmentation model; "
+                    f"loaded task={model_task!r}"
+                )
             self.model_names = {
                 int(class_id): str(name) for class_id, name in dict(raw_names).items()
             }
@@ -102,6 +108,7 @@ class ObjectTheftDetector:
 
             print(f"[OBJECT-THEFT] Model source: {self.model_path}")
             print(f"[OBJECT-THEFT] Model classes: {self.model_names}")
+            print(f"[OBJECT-THEFT] Model task: {model_task or 'segment'}")
             print(f"[OBJECT-THEFT] Device: {self.device}")
             if not self.allowed_class_ids:
                 raise ValueError(
@@ -178,6 +185,12 @@ class ObjectTheftDetector:
                             mask = tuple(
                                 (int(point[0]), int(point[1])) for point in points
                             )
+                if mask is None:
+                    print(
+                        "[OBJECT-THEFT] Ignoring detection without a segmentation mask "
+                        f"class={self.model_names[class_id]} confidence={score:.3f}"
+                    )
+                    continue
                 detections.append(
                     {
                         "class_name": self.model_names[class_id],
