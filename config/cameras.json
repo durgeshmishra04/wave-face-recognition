@@ -6,7 +6,7 @@
   {"camera_id": "CAM005", "name": "VIP 03", "ip": "192.168.1.105", "nvr_ip": "115.247.225.82", "kpi": "person", "enabled": false, "channel": 5, "subtype": 2},
   {"camera_id": "CAM006", "name": "VIP 04", "ip": "192.168.1.106", "nvr_ip": "115.247.225.82", "kpi": "person", "enabled": false, "channel": 6, "subtype": 2},
   {"camera_id": "CAM007", "name": "PRIMARY SCHOOL", "ip": "192.168.1.107", "nvr_ip": "115.247.225.82", "kpi": "person", "enabled": false, "channel": 7, "subtype": 2},
-  {"camera_id": "CAM008", "name": "MILLHOUSE GATE 01", "ip": "192.168.1.108", "nvr_ip": "115.247.225.82", "kpi": "person", "enabled": true, "channel": 8, "subtype": 1},
+  {"camera_id": "CAM008", "name": "MILLHOUSE GATE 01", "ip": "192.168.1.108", "nvr_ip": "115.247.225.82", "kpi": "person", "enabled": true, "channel": 8, "subtype": 2},
   {"camera_id": "CAM009", "name": "MILLHOUSE GATE 02", "ip": "192.168.1.109", "nvr_ip": "115.247.225.82", "kpi": "person", "enabled": false, "channel": 9, "subtype": 2},
   {"camera_id": "CAM010", "name": "CLUB GATE", "ip": "192.168.1.110", "nvr_ip": "115.247.225.82", "kpi": "person", "enabled": false, "channel": 10, "subtype": 2},
   {"camera_id": "CAM011", "name": "LABOUR BLOCK 01", "ip": "192.168.1.111", "nvr_ip": "115.247.225.82", "kpi": "person", "enabled": false, "channel": 11, "subtype": 2},

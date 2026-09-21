@@ -230,7 +230,12 @@ class DetectionEventManager:
         if detection_type == "helmet_detected":
             return ("helmet_detected", camera_id, event.get("track_id"))
         if detection_type == "object_theft":
-            return ("object_theft", camera_id, event.get("track_id"), event.get("object_name"), event.get("session_id"))
+            return (
+                "object_theft",
+                camera_id,
+                event.get("track_id"),
+                event.get("session_id"),
+            )
         # Unknown entries must collapse to one alert per camera/gate while the
         # same person is still being tracked in the ROI. Counting multiple
         # unknown frames as distinct dedupe keys caused duplicate notifications
@@ -246,6 +251,13 @@ class DetectionEventManager:
         key = self._dedup_key(event)
         previous = self._recent_event_cache.get(key)
         if previous is not None and (now - previous) < self.exit_confirm_seconds:
+            if event.get("detection_type") == "object_theft":
+                print(
+                    "[OBJECT-THEFT] Duplicate event suppressed "
+                    f"camera={event.get('camera_id', self.camera_id)} "
+                    f"track={event.get('track_id')} "
+                    f"session={event.get('session_id')}"
+                )
             return True
         self._recent_event_cache[key] = now
         return False
