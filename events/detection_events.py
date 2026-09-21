@@ -142,7 +142,8 @@ class DetectionEventManager:
             label, color = "HELMET DETECTED", (0, 215, 255)
         elif event["detection_type"] == "object_theft":
             mask = event.get("mask")
-            if not mask:
+            box = event.get("annotation_box") or event.get("box")
+            if not mask and not box:
                 return
             object_name = str(event.get("object_name") or event.get("person_name") or "object").upper()
             label, color = f"OBJECT THEFT | {object_name} | {event.get('confidence', 0.0):.2f}", (0, 255, 255)
@@ -163,13 +164,17 @@ class DetectionEventManager:
             count = event.get("unknown_count", 1)
             label, color = ("UNKNOWN" if count == 1 else f"UNKNOWN PERSONS: {count}"), (0, 0, 255)
         if event["detection_type"] == "object_theft":
-            points = np.asarray(event["mask"], dtype=np.int32).reshape((-1, 1, 2))
-            overlay = frame.copy()
-            cv2.fillPoly(overlay, [points], color)
-            cv2.addWeighted(overlay, 0.28, frame, 0.72, 0, frame)
-            cv2.polylines(frame, [points], True, color, 2, cv2.LINE_AA)
-            x1, y1 = points[:, 0, :].min(axis=0)
-            x2, y2 = points[:, 0, :].max(axis=0)
+            if event.get("mask"):
+                points = np.asarray(event["mask"], dtype=np.int32).reshape((-1, 1, 2))
+                overlay = frame.copy()
+                cv2.fillPoly(overlay, [points], color)
+                cv2.addWeighted(overlay, 0.28, frame, 0.72, 0, frame)
+                cv2.polylines(frame, [points], True, color, 2, cv2.LINE_AA)
+                x1, y1 = points[:, 0, :].min(axis=0)
+                x2, y2 = points[:, 0, :].max(axis=0)
+            else:
+                x1, y1, x2, y2 = event["annotation_box"] or event["box"]
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
         else:
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
         # A solid color label with thick white text remains readable in the

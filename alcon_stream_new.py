@@ -3281,7 +3281,7 @@ def camera_worker(camera_config, rtsp_url=None):
                                             "camera_id": camera_id,
                                             "camera_name": camera_name,
                                             "box": theft.bbox,
-                                            "annotation_box": None,
+                                            "annotation_box": theft.bbox,
                                             "mask": theft.mask,
                                             "object_name": theft.class_name,
                                             "session_id": theft.session_id,

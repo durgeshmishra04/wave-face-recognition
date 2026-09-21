@@ -80,12 +80,7 @@ class ObjectTheftDetector:
             raw_names = getattr(model, "names", None)
             if raw_names is None:
                 raise ValueError("custom YOLO model has no model.names")
-            model_task = str(getattr(model, "task", "") or "").lower()
-            if model_task and model_task != "segment":
-                raise ValueError(
-                    f"Object Theft requires a YOLO segmentation model; "
-                    f"loaded task={model_task!r}"
-                )
+            model_task = str(getattr(model, "task", "") or "").lower() or "unknown"
             self.model_names = {
                 int(class_id): str(name) for class_id, name in dict(raw_names).items()
             }
@@ -185,12 +180,6 @@ class ObjectTheftDetector:
                             mask = tuple(
                                 (int(point[0]), int(point[1])) for point in points
                             )
-                if mask is None:
-                    print(
-                        "[OBJECT-THEFT] Ignoring detection without a segmentation mask "
-                        f"class={self.model_names[class_id]} confidence={score:.3f}"
-                    )
-                    continue
                 detections.append(
                     {
                         "class_name": self.model_names[class_id],
@@ -211,6 +200,31 @@ class ObjectTheftDetector:
             device=self.device,
         )
 
+    def _log_raw_results(self, results):
+        if not results:
+            return
+        for result in results:
+            boxes = getattr(result, "boxes", None)
+            if boxes is None:
+                continue
+            names = self.model_names
+            for box, score, class_id in zip(
+                getattr(boxes, "xyxy", []),
+                getattr(boxes, "conf", []),
+                getattr(boxes, "cls", []),
+            ):
+                class_id = int(self._value(class_id))
+                coords = tuple(
+                    float(self._value(value)) for value in box
+                )
+                print(
+                    "[OBJECT-THEFT][RAW-DETECTION] "
+                    f"class_id={class_id} "
+                    f"class_name={names.get(class_id, 'UNKNOWN')} "
+                    f"confidence={float(self._value(score)):.4f} "
+                    f"bbox={coords}"
+                )
+
     def process(self, frame, camera_id, roi_polygon=None, inference=None, now=None):
         if (
             not self.enabled
@@ -224,6 +238,8 @@ class ObjectTheftDetector:
             return []
         try:
             results = inference(self._detect, frame)
+            if self.frame_count == self.inference_interval:
+                self._log_raw_results(results)
             detections = self._parse_results(results, frame.shape)
         except Exception as error:
             print(
@@ -237,6 +253,17 @@ class ObjectTheftDetector:
             roi_polygon=roi_polygon,
             now=time.time() if now is None else now,
         )
+        if detections and self.frame_count == self.inference_interval:
+            for detection in detections:
+                print(
+                    "[OBJECT-THEFT][ACCEPTED] "
+                    f"class_name={detection['class_name']} "
+                    f"canonical_class={detection['canonical_class']} "
+                    f"confidence={detection['confidence']:.4f} "
+                    f"bbox={detection['bbox']} "
+                    f"mask_available={detection.get('mask') is not None}"
+                )
+            print("[OBJECT-THEFT] Tracker received detection")
         return [
             ObjectTheftDetection(
                 camera_id=str(camera_id),
