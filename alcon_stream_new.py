@@ -70,8 +70,11 @@ from smoke_fire_detection.smoke_fire_config import (
 from object_theft import ObjectTheftDetector
 from object_theft.config import (
     OBJECT_THEFT_CAMERAS,
+    OBJECT_THEFT_CONFIDENCE_THRESHOLD,
     OBJECT_THEFT_ENABLED,
+    OBJECT_THEFT_IOU_THRESHOLD,
     OBJECT_THEFT_MODEL_PATH,
+    OBJECT_THEFT_ROI_ENABLED,
 )
 
 
@@ -747,27 +750,29 @@ def initialize_smoke_fire_detector():
 
 
 def initialize_object_theft_detector():
-    """Load the isolated object Thef KPI only if it is enabled and scoped to CAM008."""
+    """Load the isolated Object Theft KPI only when it is enabled for CAM008."""
     global object_theft_detector
     if not OBJECT_THEFT_ENABLED:
         print("[OBJECT THEFT] enabled=False")
         object_theft_detector = None
         return
     scopes = ",".join(sorted(OBJECT_THEFT_CAMERAS)) if OBJECT_THEFT_CAMERAS else "CAM008"
-    print(f"[OBJECT THEFT] enabled=True camera_scope={scopes} target_objects=['drum']")
+    print(f"[OBJECT THEFT] enabled=True camera_scope={scopes}")
     try:
         object_theft_detector = ObjectTheftDetector(
             model_path=OBJECT_THEFT_MODEL_PATH or None,
             model_loader=None,
-            confidence=0.35,
-            iou=0.30,
-            targets=["drum"],
+            confidence=OBJECT_THEFT_CONFIDENCE_THRESHOLD,
+            iou=OBJECT_THEFT_IOU_THRESHOLD,
         )
         if object_theft_detector.model is None:
             object_theft_detector = None
             print("[OBJECT THEFT] model_loaded=False camera_scope=CAM008 status=DISABLED")
         else:
-            print(f"[OBJECT THEFT] model_loaded=True model_path={OBJECT_THEFT_MODEL_PATH or 'auto-detect'}")
+            print(
+                f"[OBJECT THEFT] model_loaded=True "
+                f"model_path={OBJECT_THEFT_MODEL_PATH or 'unset'}"
+            )
     except Exception as error:
         object_theft_detector = None
         print(f"[OBJECT THEFT] MODEL LOAD FAILED camera_scope=CAM008 status=DISABLED error={error}")
@@ -3250,10 +3255,12 @@ def camera_worker(camera_config, rtsp_url=None):
                                     _camera_log(camera_id, f"[PPE] HELMET ALERT_SENT | track={helmet.track_id} | confidence={helmet.confidence:.2f}")
 
                         if OBJECT_THEFT_ENABLED and camera_id.upper() in OBJECT_THEFT_CAMERAS and object_theft_detector is not None:
-                            roi_points = get_camera_roi(camera_id)["points"]
-                            roi_polygon = roi_points * np.array(
-                                [frame.shape[1], frame.shape[0]], dtype=np.float32
-                            )
+                            roi_polygon = None
+                            if OBJECT_THEFT_ROI_ENABLED:
+                                roi_points = get_camera_roi(camera_id)["points"]
+                                roi_polygon = roi_points * np.array(
+                                    [frame.shape[1], frame.shape[0]], dtype=np.float32
+                                )
                             theft_alerts = object_theft_detector.process(
                                 frame=frame,
                                 camera_id=camera_id,

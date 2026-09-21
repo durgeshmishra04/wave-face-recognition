@@ -1,25 +1,21 @@
-"""Grounding DINO adapter for object theft detection on CAM008."""
+"""Ultralytics YOLO adapter for the isolated object theft KPI."""
 
 from __future__ import annotations
 
 import os
-import re
 import time
 from dataclasses import dataclass
 
-import cv2
 import numpy as np
 import torch
-from PIL import Image
 
 from .config import (
+    OBJECT_THEFT_CLASS_NAMES,
     OBJECT_THEFT_CONFIDENCE_THRESHOLD,
     OBJECT_THEFT_ENABLED,
+    OBJECT_THEFT_INFERENCE_INTERVAL,
     OBJECT_THEFT_IOU_THRESHOLD,
-    OBJECT_THEFT_LOCAL_FILES_ONLY,
-    OBJECT_THEFT_MODEL_ID,
     OBJECT_THEFT_MODEL_PATH,
-    OBJECT_THEFT_TARGETS,
 )
 from .tracker import ObjectTheftTracker
 
@@ -39,205 +35,189 @@ class ObjectTheftDetection:
 
 
 class ObjectTheftDetector:
-    """Load and run Grounding DINO once, then reuse it for CAM008 frames."""
+    """Load one custom YOLO model and reuse it for CAM008 frames."""
 
     def __init__(
         self,
         model_path=None,
-        model_id=None,
         model_loader=None,
         confidence=OBJECT_THEFT_CONFIDENCE_THRESHOLD,
         iou=OBJECT_THEFT_IOU_THRESHOLD,
-        targets=None,
     ):
         self.enabled = OBJECT_THEFT_ENABLED
         self.model_path = model_path or OBJECT_THEFT_MODEL_PATH
-        self.model_id = model_id or OBJECT_THEFT_MODEL_ID
         self.model_loader = model_loader
         self.confidence = float(confidence)
         self.iou = float(iou)
-        self.targets = list(targets or OBJECT_THEFT_TARGETS)
-        self.local_files_only = OBJECT_THEFT_LOCAL_FILES_ONLY
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.model = None
-        self.processor = None
+        self.model_names = {}
+        self.allowed_class_ids = set()
+        self.inference_interval = OBJECT_THEFT_INFERENCE_INTERVAL
+        self.frame_count = 0
         self.tracker = ObjectTheftTracker(iou_threshold=self.iou)
 
         if self.enabled:
-            self.model, self.processor = self._load_model()
+            self.model = self._load_model()
 
     def _load_model(self):
-        """Load a compatible Grounding DINO backend from a local path or Hugging Face repository."""
         try:
+            if not self.model_path:
+                raise FileNotFoundError(
+                    "OBJECT_THEFT_MODEL_PATH is not configured"
+                )
+            if not os.path.isfile(self.model_path):
+                raise FileNotFoundError(self.model_path)
+
             if self.model_loader is not None:
-                model = self.model_loader(self.model_path or self.model_id)
-                print(f"[OBJECT-THEFT] Model source: {self.model_path or self.model_id}")
-                print(f"[OBJECT-THEFT] Device: {self.device}")
-                return model, None
-
-            from transformers import AutoProcessor, GroundingDinoForObjectDetection
-
-            model_source = self.model_path or self.model_id
-            print("[OBJECT-THEFT] Initializing...")
-            print(f"[OBJECT-THEFT] Model source: {model_source}")
-            if self.model_path and os.path.exists(self.model_path):
-                processor = AutoProcessor.from_pretrained(self.model_path, local_files_only=self.local_files_only)
-                model = GroundingDinoForObjectDetection.from_pretrained(self.model_path, local_files_only=self.local_files_only)
+                model = self.model_loader(self.model_path)
             else:
-                processor = AutoProcessor.from_pretrained(self.model_id, local_files_only=self.local_files_only)
-                model = GroundingDinoForObjectDetection.from_pretrained(self.model_id, local_files_only=self.local_files_only)
-            model.to(self.device)
-            model.eval()
-            print("[OBJECT-THEFT] Model loaded successfully")
+                from ultralytics import YOLO
+
+                model = YOLO(self.model_path)
+
+            raw_names = getattr(model, "names", None)
+            if raw_names is None:
+                raise ValueError("custom YOLO model has no model.names")
+            self.model_names = {
+                int(class_id): str(name) for class_id, name in dict(raw_names).items()
+            }
+            configured_names = OBJECT_THEFT_CLASS_NAMES
+            if configured_names:
+                self.allowed_class_ids = {
+                    class_id
+                    for class_id, name in self.model_names.items()
+                    if name.strip().lower() in configured_names
+                }
+            else:
+                self.allowed_class_ids = {
+                    class_id
+                    for class_id, name in self.model_names.items()
+                    if any(
+                        token in name.strip().lower()
+                        for token in ("drum", "barrel", "container")
+                    )
+                }
+
+            print(f"[OBJECT-THEFT] Model source: {self.model_path}")
+            print(f"[OBJECT-THEFT] Model classes: {self.model_names}")
             print(f"[OBJECT-THEFT] Device: {self.device}")
-            print("[OBJECT-THEFT] Cameras: CAM008")
-            print(f"[OBJECT-THEFT] Targets: {self.targets}")
-            return model, processor
+            if not self.allowed_class_ids:
+                raise ValueError(
+                    "model.names contains no configured drum/barrel/container class"
+                )
+            return model
         except Exception as error:
             print(f"[OBJECT-THEFT] Model unavailable - safely disabled: {error}")
-            return None, None
+            return None
 
     @staticmethod
-    def _canon_label(value):
-        text = str(value or "").strip().lower()
-        if any(token in text for token in ("drum", "barrel", "container")):
-            return CANONICAL_CLASS
-        return text.upper() if text else "UNKNOWN"
-
-    @staticmethod
-    def _normalise(text):
-        text = str(text or "").strip().lower()
-        text = text.replace("-", " ").replace("_", " ")
-        return re.sub(r"\s+", " ", text)
+    def _value(value):
+        if hasattr(value, "detach"):
+            value = value.detach().cpu()
+        if hasattr(value, "item"):
+            return value.item()
+        return value
 
     @staticmethod
     def _merge_detections(detections):
         merged = []
         for detection in detections:
-            matched = False
             for item in merged:
-                box_a = np.asarray(item["bbox"], dtype=np.float32)
-                box_b = np.asarray(detection["bbox"], dtype=np.float32)
                 if item["canonical_class"] != detection["canonical_class"]:
                     continue
-                left = max(float(box_a[0]), float(box_b[0]))
-                top = max(float(box_a[1]), float(box_b[1]))
-                right = min(float(box_a[2]), float(box_b[2]))
-                bottom = min(float(box_a[3]), float(box_b[3]))
-                inter = max(0.0, right - left) * max(0.0, bottom - top)
-                area_a = max(float(box_a[2] - box_a[0]), 0.0) * max(float(box_a[3] - box_a[1]), 0.0)
-                area_b = max(float(box_b[2] - box_b[0]), 0.0) * max(float(box_b[3] - box_b[1]), 0.0)
-                iou = inter / max(area_a + area_b - inter, 1e-6)
-                if iou >= 0.35:
-                    item["bbox"] = tuple(int(v) for v in np.asarray([box_a, box_b]).min(axis=0).tolist()) + tuple(int(v) for v in np.asarray([box_a, box_b]).max(axis=0).tolist())
-                    item["confidence"] = max(item["confidence"], detection["confidence"])
-                    matched = True
+                a = np.asarray(item["bbox"], dtype=np.float32)
+                b = np.asarray(detection["bbox"], dtype=np.float32)
+                left, top = np.maximum(a[:2], b[:2])
+                right, bottom = np.minimum(a[2:], b[2:])
+                intersection = max(0.0, right - left) * max(0.0, bottom - top)
+                area_a = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
+                area_b = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+                overlap = intersection / max(area_a + area_b - intersection, 1e-6)
+                if overlap >= 0.35:
+                    if detection["confidence"] > item["confidence"]:
+                        item.update(detection)
                     break
-            if not matched:
+            else:
                 merged.append(detection)
         return merged
 
-    @staticmethod
-    def _as_list(value):
-        if value is None:
-            return []
-        if hasattr(value, "cpu"):
-            value = value.cpu()
-        if hasattr(value, "tolist"):
-            return value.tolist()
-        return list(value)
-
-    def _parse_grounding_dino_results(self, results):
+    def _parse_results(self, results, frame_shape):
+        height, width = frame_shape[:2]
         detections = []
-        if not results:
-            return detections
-
-        for result in results:
-            if not isinstance(result, dict):
+        for result in results or []:
+            boxes = getattr(result, "boxes", None)
+            if boxes is None:
                 continue
-
-            boxes = self._as_list(result.get("boxes"))
-            scores = self._as_list(result.get("scores"))
-            labels = self._as_list(result.get("labels"))
-            if boxes or scores or labels:
-                for box, score, label in zip(boxes, scores, labels):
-                    label_text = self._normalise(label)
-                    if score < self.confidence:
-                        continue
-                    if any(target in label_text for target in [self._normalise(t) for t in self.targets]):
-                        canonical = self._canon_label(label_text)
-                        box_coords = tuple(float(v) for v in np.asarray(box).reshape(-1)[:4])
-                        detections.append({
-                            "class_name": label_text,
-                            "canonical_class": canonical,
-                            "confidence": float(score),
-                            "bbox": (int(min(box_coords[0], box_coords[2])), int(min(box_coords[1], box_coords[3])), int(max(box_coords[0], box_coords[2])), int(max(box_coords[1], box_coords[3]))),
-                        })
-                continue
-
-            annotations = result.get("annotations", [])
-            for annotation in annotations:
-                boxes = self._as_list(annotation.get("boxes"))
-                scores = self._as_list(annotation.get("scores"))
-                labels = self._as_list(annotation.get("labels"))
-                for box, score, label in zip(boxes, scores, labels):
-                    label_text = self._normalise(label)
-                    if score < self.confidence:
-                        continue
-                    if any(target in label_text for target in [self._normalise(t) for t in self.targets]):
-                        canonical = self._canon_label(label_text)
-                        box_coords = tuple(float(v) for v in np.asarray(box).reshape(-1)[:4])
-                        detections.append({
-                            "class_name": label_text,
-                            "canonical_class": canonical,
-                            "confidence": float(score),
-                            "bbox": (int(min(box_coords[0], box_coords[2])), int(min(box_coords[1], box_coords[3])), int(max(box_coords[0], box_coords[2])), int(max(box_coords[1], box_coords[3]))),
-                        })
+            xyxy = getattr(boxes, "xyxy", [])
+            scores = getattr(boxes, "conf", [])
+            class_ids = getattr(boxes, "cls", [])
+            for box, score, class_id in zip(xyxy, scores, class_ids):
+                class_id = int(self._value(class_id))
+                score = float(self._value(score))
+                if class_id not in self.allowed_class_ids or score < self.confidence:
+                    continue
+                coords = [float(self._value(value)) for value in box]
+                x1 = max(0, min(width, int(coords[0])))
+                y1 = max(0, min(height, int(coords[1])))
+                x2 = max(0, min(width, int(coords[2])))
+                y2 = max(0, min(height, int(coords[3])))
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                detections.append(
+                    {
+                        "class_name": self.model_names[class_id],
+                        "canonical_class": CANONICAL_CLASS,
+                        "confidence": score,
+                        "bbox": (x1, y1, x2, y2),
+                    }
+                )
         return self._merge_detections(detections)
 
-    def _detect(self, frame, prompts=None, threshold=None):
-        if self.model is None or self.processor is None:
-            return []
-        prompts = prompts or self.targets
-        image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        text = list(dict.fromkeys([str(p).strip() for p in prompts if str(p).strip()]))
-        inputs = self.processor(text=text, images=image, return_tensors="pt")
-        inputs = {key: value.to(self.device) for key, value in inputs.items()}
-        with torch.no_grad():
-            outputs = self.model(**inputs)
-        target_sizes = torch.tensor([image.size[::-1]], device=self.device)
-        results = self.processor.post_process_grounded_object_detection(
-            outputs,
-            threshold=threshold or self.confidence,
-            text_threshold=threshold or self.confidence,
-            target_sizes=target_sizes,
+    def _detect(self, frame):
+        return self.model.predict(
+            frame,
+            conf=self.confidence,
+            iou=self.iou,
+            verbose=False,
+            device=self.device,
         )
-        return results
 
     def process(self, frame, camera_id, roi_polygon=None, inference=None, now=None):
-        now = time.time() if now is None else now
-        if not self.enabled or self.model is None or self.processor is None:
+        if (
+            not self.enabled
+            or self.model is None
+            or str(camera_id or "").upper() != "CAM008"
+            or inference is None
+        ):
             return []
-        if inference is None:
+        self.frame_count += 1
+        if self.frame_count % self.inference_interval != 0:
             return []
         try:
-            results = inference(self._detect, frame, prompts=self.targets, threshold=self.confidence)
+            results = inference(self._detect, frame)
+            detections = self._parse_results(results, frame.shape)
         except Exception as error:
-            print(f"[{camera_id}] [OBJECT-THEFT] inference failed; continuing existing pipeline: {error}")
+            print(
+                f"[{camera_id}] [OBJECT-THEFT] inference failed; "
+                f"continuing existing pipeline: {error}"
+            )
             return []
-        detections = self._parse_grounding_dino_results(results)
-        if not detections:
-            return []
-        confirmed = self.tracker.update(camera_id, detections, roi_polygon=roi_polygon, now=now)
-        alerts = []
-        for item in confirmed:
-            alerts.append(ObjectTheftDetection(
+        confirmed = self.tracker.update(
+            camera_id,
+            detections,
+            roi_polygon=roi_polygon,
+            now=time.time() if now is None else now,
+        )
+        return [
+            ObjectTheftDetection(
                 camera_id=str(camera_id),
                 track_id=int(item["track_id"]),
-                class_name=str(item.get("class_name", item.get("canonical_class", "DRUM_CONTAINER"))),
-                canonical_class=str(item.get("canonical_class", "DRUM_CONTAINER")),
+                class_name=str(item.get("class_name", CANONICAL_CLASS)),
+                canonical_class=str(item.get("canonical_class", CANONICAL_CLASS)),
                 confidence=float(item.get("confidence", 0.0)),
                 bbox=tuple(item["bbox"]),
                 session_id=str(item.get("session_id") or "session-unknown"),
-            ))
-        return alerts
+            )
+            for item in confirmed
+        ]

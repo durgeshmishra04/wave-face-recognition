@@ -57,18 +57,22 @@ class ObjectTheftTracker:
         center = ObjectTheftTracker._center(box)
         return cv2.pointPolygonTest(np.asarray(polygon, dtype=np.float32), center, False) >= 0
 
-    def _match_track(self, box, active):
+    def _match_track(self, box, active, roi_polygon=None):
         best = None
         best_score = -1.0
         center = self._center(box)
         for track in active:
-            if not track.get("matched_this_frame"):
-                continue
             track_box = track["bbox"]
             iou = self._iou(box, track_box)
             dist = math.hypot(center[0] - self._center(track_box)[0], center[1] - self._center(track_box)[1])
             score = iou + max(0.0, 1.0 - dist / 100.0)
-            if iou >= self.iou_threshold or (iou <= 0.0 and dist <= 35.0):
+            roi_exit_match = (
+                roi_polygon is not None
+                and track.get("inside_roi", True)
+                and not self._inside_roi(box, roi_polygon)
+                and dist <= max(80.0, self.movement_threshold * 2.0)
+            )
+            if iou >= self.iou_threshold or (iou <= 0.0 and dist <= 35.0) or roi_exit_match:
                 if score > best_score:
                     best, best_score = track, score
         return best
@@ -82,7 +86,7 @@ class ObjectTheftTracker:
         confirmed = []
 
         for detection in detections:
-            matched = self._match_track(detection["bbox"], self.tracks)
+            matched = self._match_track(detection["bbox"], self.tracks, roi_polygon)
             if matched is None:
                 matched = {
                     "track_id": self._next_track_id,
@@ -114,9 +118,24 @@ class ObjectTheftTracker:
                 matched["bbox"] = tuple(int(v) for v in detection["bbox"])
                 matched["confidence"] = float(detection.get("confidence", matched.get("confidence", 0.0)))
                 matched["center"] = self._center(matched["bbox"])
+                previous_roi_state = bool(matched.get("inside_roi", True))
                 matched["inside_roi"] = self._inside_roi(matched["bbox"], roi_polygon)
                 matched["last_seen"] = now
                 matched["camera_id"] = camera_id
+                if previous_roi_state and not matched["inside_roi"] and not matched.get("alert_generated", False):
+                    matched["state"] = "REMOVAL_CONFIRMED"
+                    matched["event_finalized"] = True
+                    matched["alert_generated"] = True
+                    confirmed.append({
+                        "camera_id": camera_id,
+                        "track_id": matched["track_id"],
+                        "class_name": matched.get("canonical_class", matched.get("class_name", "DRUM_CONTAINER")),
+                        "canonical_class": matched.get("canonical_class", "DRUM_CONTAINER"),
+                        "bbox": tuple(int(v) for v in matched["bbox"]),
+                        "confidence": float(matched.get("confidence", 0.0)),
+                        "session_id": matched.get("session_id"),
+                        "state": "REMOVAL_CONFIRMED",
+                    })
 
             matched["canonical_class"] = detection.get("canonical_class", matched.get("canonical_class", "DRUM_CONTAINER"))
             seen.add(matched["track_id"])

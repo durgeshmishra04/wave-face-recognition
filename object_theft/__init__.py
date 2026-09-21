@@ -4,8 +4,7 @@ from .config import (
     OBJECT_THEFT_CAMERAS,
     OBJECT_THEFT_CONFIRM_FRAMES,
     OBJECT_THEFT_ENABLED,
-    OBJECT_THEFT_MODEL_ID,
-    OBJECT_THEFT_TARGETS,
+    OBJECT_THEFT_MODEL_PATH,
 )
 from .detector import ObjectTheftDetection, ObjectTheftDetector
 from .integration import should_process_object_theft
@@ -16,7 +15,6 @@ __all__ = [
     "OBJECT_THEFT_ENABLED",
     "OBJECT_THEFT_CAMERAS",
     "OBJECT_THEFT_CONFIRM_FRAMES",
-    "OBJECT_THEFT_MODEL_ID",
-    "OBJECT_THEFT_TARGETS",
+    "OBJECT_THEFT_MODEL_PATH",
     "should_process_object_theft",
 ]
