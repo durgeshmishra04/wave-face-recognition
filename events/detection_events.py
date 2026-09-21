@@ -140,6 +140,13 @@ class DetectionEventManager:
         elif event["detection_type"] == "helmet_detected":
             x1, y1, x2, y2 = event["box"]
             label, color = "HELMET DETECTED", (0, 215, 255)
+        elif event["detection_type"] == "object_theft":
+            box = event.get("annotation_box") or event.get("box")
+            if not box:
+                return
+            x1, y1, x2, y2 = box
+            object_name = str(event.get("object_name") or event.get("person_name") or "object").upper()
+            label, color = f"OBJECT THEFT | {object_name} | {event.get('confidence', 0.0):.2f}", (0, 255, 255)
         elif event["detection_type"] == "vehicle":
             x1, y1, x2, y2 = event["box"]
             label, color = f"{event['vehicle_type'].replace('_', ' ').title()} | {event['vehicle_class']} | {event['confidence']:.2f}", (0, 140, 255)
@@ -209,6 +216,8 @@ class DetectionEventManager:
             return ("fall_detected", camera_id, event.get("track_id"))
         if detection_type == "helmet_detected":
             return ("helmet_detected", camera_id, event.get("track_id"))
+        if detection_type == "object_theft":
+            return ("object_theft", camera_id, event.get("track_id"), event.get("object_name"), event.get("session_id"))
         # Unknown entries must collapse to one alert per camera/gate while the
         # same person is still being tracked in the ROI. Counting multiple
         # unknown frames as distinct dedupe keys caused duplicate notifications

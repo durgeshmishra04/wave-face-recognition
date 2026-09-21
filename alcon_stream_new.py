@@ -67,6 +67,12 @@ from smoke_fire_detection.smoke_fire_config import (
     SMOKE_FIRE_MODEL_PATH,
     SMOKE_FIRE_TEST_MODE,
 )
+from object_theft import ObjectTheftDetector
+from object_theft.config import (
+    OBJECT_THEFT_CAMERAS,
+    OBJECT_THEFT_ENABLED,
+    OBJECT_THEFT_MODEL_PATH,
+)
 
 
 # ============================================================
@@ -289,6 +295,7 @@ detection_events = None
 fall_detector = None
 ppe_detector = None
 smoke_fire_detector = None
+object_theft_detector = None
 
 unknown_present = False
 unknown_first_seen = 0.0
@@ -737,6 +744,33 @@ def initialize_smoke_fire_detector():
     except Exception as error:
         smoke_fire_detector = None
         print(f"[WARNING] Smoke/fire detection disabled; model load failed: {error}")
+
+
+def initialize_object_theft_detector():
+    """Load the isolated object Thef KPI only if it is enabled and scoped to CAM008."""
+    global object_theft_detector
+    if not OBJECT_THEFT_ENABLED:
+        print("[OBJECT THEFT] enabled=False")
+        object_theft_detector = None
+        return
+    scopes = ",".join(sorted(OBJECT_THEFT_CAMERAS)) if OBJECT_THEFT_CAMERAS else "CAM008"
+    print(f"[OBJECT THEFT] enabled=True camera_scope={scopes} target_objects=['drum']")
+    try:
+        object_theft_detector = ObjectTheftDetector(
+            model_path=OBJECT_THEFT_MODEL_PATH or None,
+            model_loader=None,
+            confidence=0.35,
+            iou=0.30,
+            targets=["drum"],
+        )
+        if object_theft_detector.model is None:
+            object_theft_detector = None
+            print("[OBJECT THEFT] model_loaded=False camera_scope=CAM008 status=DISABLED")
+        else:
+            print(f"[OBJECT THEFT] model_loaded=True model_path={OBJECT_THEFT_MODEL_PATH or 'auto-detect'}")
+    except Exception as error:
+        object_theft_detector = None
+        print(f"[OBJECT THEFT] MODEL LOAD FAILED camera_scope=CAM008 status=DISABLED error={error}")
 
 
 # ============================================================
@@ -3215,6 +3249,42 @@ def camera_worker(camera_config, rtsp_url=None):
                                     )
                                     _camera_log(camera_id, f"[PPE] HELMET ALERT_SENT | track={helmet.track_id} | confidence={helmet.confidence:.2f}")
 
+                        if OBJECT_THEFT_ENABLED and camera_id.upper() in OBJECT_THEFT_CAMERAS and object_theft_detector is not None:
+                            roi_points = get_camera_roi(camera_id)["points"]
+                            roi_polygon = roi_points * np.array(
+                                [frame.shape[1], frame.shape[0]], dtype=np.float32
+                            )
+                            theft_alerts = object_theft_detector.process(
+                                frame=frame,
+                                camera_id=camera_id,
+                                roi_polygon=roi_polygon,
+                                inference=safe_gpu_inference,
+                                now=time.time(),
+                            )
+                            for theft in theft_alerts:
+                                if detection_manager is not None:
+                                    detection_manager.publish_immediate(
+                                        {
+                                            "detected_at": time.time(),
+                                            "detection_type": "object_theft",
+                                            "track_id": theft.track_id,
+                                            "person_name": theft.class_name.title(),
+                                            "confidence": theft.confidence,
+                                            "gate_name": gate_name,
+                                            "camera_id": camera_id,
+                                            "camera_name": camera_name,
+                                            "box": theft.bbox,
+                                            "annotation_box": theft.bbox,
+                                            "object_name": theft.class_name,
+                                            "session_id": theft.session_id,
+                                            "title": "Object Theft Detected",
+                                            "message": f"{theft.class_name.title()} theft confirmed at {gate_name}",
+                                        },
+                                        frame,
+                                        notify=True,
+                                    )
+                            _camera_log(camera_id, f"[OBJECT THEFT] processed | alerts={len(theft_alerts)}")
+
                         # Smoke/fire is camera-local, uses the existing ROI,
                         # and publishes only temporally-confirmed incidents.
                         if smoke_fire_detector is not None:
@@ -5275,6 +5345,7 @@ def api_mobile():
         "fall_detected",
         "smoke_detected",
         "fire_detected",
+        "object_theft",
     }
     if detection_type not in valid_detection_types:
         detection_type = ""
@@ -5323,6 +5394,10 @@ def api_mobile():
         ),
         "fire_events": sum(
             item["type"] == "fire_detected"
+            for item in all_detections
+        ),
+        "object_theft_events": sum(
+            item["type"] == "object_theft"
             for item in all_detections
         ),
     }
@@ -5387,6 +5462,7 @@ def api_mobile():
                     "fall_detected",
                     "smoke_detected",
                     "fire_detected",
+                    "object_theft",
                 ],
                 "vehicle_types": [
                     "two_wheeler",
@@ -5689,6 +5765,7 @@ def main():
     initialize_fall_detector()
     initialize_ppe_detector()
     initialize_smoke_fire_detector()
+    initialize_object_theft_detector()
     initialize_detection_events()
 
 
