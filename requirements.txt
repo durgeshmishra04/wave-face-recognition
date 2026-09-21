@@ -2,6 +2,13 @@ opencv-python==4.10.0.84
 Pillow>=10.0.0
 numpy==1.26.4
 
+# ML runtime requirements for person/face and object-theft detection.
+torch>=2.3.0
+torchvision>=0.18.0
+transformers>=4.45.0
+huggingface_hub>=0.25.0
+groundingdino-py>=0.1.0
+
 # InsightFace 0.7.3 requires the classic ONNX Runtime InferenceSession API.
 onnxruntime-gpu==1.19.2
 insightface==0.7.3
