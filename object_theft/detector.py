@@ -137,27 +137,61 @@ class ObjectTheftDetector:
                 merged.append(detection)
         return merged
 
+    @staticmethod
+    def _as_list(value):
+        if value is None:
+            return []
+        if hasattr(value, "cpu"):
+            value = value.cpu()
+        if hasattr(value, "tolist"):
+            return value.tolist()
+        return list(value)
+
     def _parse_grounding_dino_results(self, results):
         detections = []
         if not results:
             return detections
+
         for result in results:
-            annotations = result.get("annotations", []) if isinstance(result, dict) else []
-            for annotation in annotations:
-                boxes = annotation.get("boxes") or []
-                scores = annotation.get("scores") or []
-                labels = annotation.get("labels") or []
+            if not isinstance(result, dict):
+                continue
+
+            boxes = self._as_list(result.get("boxes"))
+            scores = self._as_list(result.get("scores"))
+            labels = self._as_list(result.get("labels"))
+            if boxes or scores or labels:
                 for box, score, label in zip(boxes, scores, labels):
                     label_text = self._normalise(label)
                     if score < self.confidence:
                         continue
                     if any(target in label_text for target in [self._normalise(t) for t in self.targets]):
                         canonical = self._canon_label(label_text)
+                        box_coords = tuple(float(v) for v in np.asarray(box).reshape(-1)[:4])
                         detections.append({
                             "class_name": label_text,
                             "canonical_class": canonical,
                             "confidence": float(score),
-                            "bbox": tuple(int(v) for v in box),
+                            "bbox": (int(min(box_coords[0], box_coords[2])), int(min(box_coords[1], box_coords[3])), int(max(box_coords[0], box_coords[2])), int(max(box_coords[1], box_coords[3]))),
+                        })
+                continue
+
+            annotations = result.get("annotations", [])
+            for annotation in annotations:
+                boxes = self._as_list(annotation.get("boxes"))
+                scores = self._as_list(annotation.get("scores"))
+                labels = self._as_list(annotation.get("labels"))
+                for box, score, label in zip(boxes, scores, labels):
+                    label_text = self._normalise(label)
+                    if score < self.confidence:
+                        continue
+                    if any(target in label_text for target in [self._normalise(t) for t in self.targets]):
+                        canonical = self._canon_label(label_text)
+                        box_coords = tuple(float(v) for v in np.asarray(box).reshape(-1)[:4])
+                        detections.append({
+                            "class_name": label_text,
+                            "canonical_class": canonical,
+                            "confidence": float(score),
+                            "bbox": (int(min(box_coords[0], box_coords[2])), int(min(box_coords[1], box_coords[3])), int(max(box_coords[0], box_coords[2])), int(max(box_coords[1], box_coords[3]))),
                         })
         return self._merge_detections(detections)
 
