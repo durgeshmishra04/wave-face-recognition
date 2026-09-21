@@ -288,7 +288,13 @@ class DetectionEventManager:
     def _person_event(self, face, gate_name, now):
         name, confidence = getattr(face, "recognized_name", "Unknown"), float(getattr(face, "recognition_score", 0.0))
         known = name != "Unknown"
-        return {"detected_at": now, "detection_type": "known_person" if known else "unknown_person", "person_id": getattr(face, "person_id", None) or self.person_ids.get(name), "person_name": name, "confidence": confidence, "gate_name": gate_name, "camera_id": self.camera_id, "camera_name": self.camera_name, "box": tuple(int(v) for v in face.bbox), "annotation_box": getattr(face, "annotation_box", None), "title": "Known Person Detected" if known else "Unknown Person Detected", "message": f"{name} detected at {gate_name}"}
+        body_box = getattr(face, "associated_person_box", None)
+        if body_box is None:
+            body_box = getattr(face, "bbox", None)
+        annotation_box = getattr(face, "annotation_box", None)
+        if annotation_box is None:
+            annotation_box = getattr(face, "bbox", None)
+        return {"detected_at": now, "detection_type": "known_person" if known else "unknown_person", "person_id": getattr(face, "person_id", None) or self.person_ids.get(name), "person_name": name, "confidence": confidence, "gate_name": gate_name, "camera_id": self.camera_id, "camera_name": self.camera_name, "box": tuple(int(v) for v in body_box) if body_box is not None else None, "annotation_box": tuple(int(v) for v in annotation_box) if annotation_box is not None else None, "body_box": tuple(int(v) for v in body_box) if body_box is not None else None, "title": "Known Person Detected" if known else "Unknown Person Detected", "message": f"{name} detected at {gate_name}"}
 
     def _publish_unknowns(self, unknowns, gate_name, now):
         track, chosen = unknowns[0]

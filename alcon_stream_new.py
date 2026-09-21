@@ -345,6 +345,17 @@ def _camera_log(camera_id, message):
     print(f"[{camera_id}] {message}")
 
 
+def _should_run_kpi(camera_id, kpi_name):
+    """Central KPI scope: fire/smoke/known/unknown run on all enabled cameras,
+    while helmet/fall are restricted to CAM008 only.
+    """
+    camera_ref = str(camera_id or "").upper()
+    restricted_kpis = {"helmet", "fall"}
+    if kpi_name in restricted_kpis:
+        return camera_ref == "CAM008"
+    return True
+
+
 def _create_camera_state(camera_config):
 
     now = time.time()
@@ -678,7 +689,7 @@ def initialize_fall_detector():
     print(f"[INFO] Loading fall pose detector: {FALL_MODEL_PATH}...")
     fall_detector = FallDetector(FALL_MODEL_PATH, YOLO)
     print("[OK] Fall pose detector loaded.")
-    print("[FALL] ENABLED | scope=ALL_ENABLED_CAMERAS")
+    print("[FALL] ENABLED | scope=CAM008_ONLY")
 
 
 def initialize_ppe_detector():
@@ -700,7 +711,7 @@ def initialize_ppe_detector():
         print(f"[PPE MODEL] classes={actual_classes}")
         print(f"[PPE MODEL] supported={supported} missing={missing}")
         print("[OK] PPE detector loaded (only confirmed Helmet sessions alert).")
-        print("[HELMET] ENABLED | scope=ALL_ENABLED_CAMERAS")
+        print("[HELMET] ENABLED | scope=CAM008_ONLY")
     except Exception as error:
         ppe_detector = None
         print(f"[WARNING] PPE detection disabled; model load failed: {error}")
@@ -2360,9 +2371,10 @@ def _update_person_tracks(person_tracks, person_boxes, now, next_track_id):
             body_box = np.asarray(box, dtype=np.int32)
             track = {
                 "track_id": next_track_id,
-                # ``box`` remains the body box for the existing association
-                # and event-tracking code. It is never a rendering source.
+                # ``box`` / ``bbox`` remain the YOLO body box for association
+                # and ROI logic. They are strictly internal and never rendered.
                 "box": body_box,
+                "bbox": body_box.copy(),
                 "body_box": body_box.copy(),
                 "face_box": None,
                 "last_seen": now,
@@ -2381,6 +2393,7 @@ def _update_person_tracks(person_tracks, person_boxes, now, next_track_id):
             body_box = np.asarray(box, dtype=np.int32)
             track.update({
                 "box": body_box,
+                "bbox": body_box.copy(),
                 "body_box": body_box.copy(),
                 "last_seen": now,
                 "matched_this_frame": True,
@@ -2722,17 +2735,23 @@ def annotate_alert_frame(frame, faces):
     frame_height, frame_width = annotated_frame.shape[:2]
 
     for face in faces:
-        x1, y1, x2, y2 = face.bbox.astype(int)
+        annotation_box = getattr(face, "annotation_box", None)
+        if annotation_box is None:
+            annotation_box = getattr(face, "bbox", None)
+        if annotation_box is None:
+            continue
+
+        x1, y1, x2, y2 = np.asarray(annotation_box, dtype=np.int32)
         name = getattr(face, "recognized_name", "Unknown")
         score = float(getattr(face, "recognition_score", 0.0))
 
         color = (0, 0, 255) if name == "Unknown" else (0, 255, 0)
         label = "Unknown" if name == "Unknown" else f"{name}  {score:.2f}"
 
-        x1 = max(0, min(x1, frame_width - 1))
-        y1 = max(0, min(y1, frame_height - 1))
-        x2 = max(0, min(x2, frame_width - 1))
-        y2 = max(0, min(y2, frame_height - 1))
+        x1 = max(0, min(int(x1), frame_width - 1))
+        y1 = max(0, min(int(y1), frame_height - 1))
+        x2 = max(0, min(int(x2), frame_width - 1))
+        y2 = max(0, min(int(y2), frame_height - 1))
 
         cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
         cv2.putText(
@@ -2945,11 +2964,13 @@ def camera_worker(camera_config, rtsp_url=None):
     # three global switches therefore apply to every enabled worker and never
     # to a disabled camera, without maintaining per-KPI camera lists.
     if fall_detector is not None and FALL_DETECTION_ENABLED:
-        _camera_log(camera_id, "[FALL] ENABLED | scope=ALL_ENABLED_CAMERAS")
+        scope = "CAM008_ONLY" if _should_run_kpi(camera_id, "fall") else "DISABLED"
+        _camera_log(camera_id, f"[FALL] ENABLED | scope={scope}")
     if smoke_fire_detector is not None and FIRE_DETECTION_ENABLED:
         _camera_log(camera_id, "[FIRE] ENABLED | scope=ALL_ENABLED_CAMERAS")
     if ppe_detector is not None and HELMET_DETECTION_ENABLED:
-        _camera_log(camera_id, "[HELMET] ENABLED | scope=ALL_ENABLED_CAMERAS")
+        scope = "CAM008_ONLY" if _should_run_kpi(camera_id, "helmet") else "DISABLED"
+        _camera_log(camera_id, f"[HELMET] ENABLED | scope={scope}")
 
     if rtsp_url is None:
         rtsp_url = build_rtsp_url(camera_config)
@@ -3122,9 +3143,9 @@ def camera_worker(camera_config, rtsp_url=None):
                         )
 
                         # Pose analysis consumes only authoritative person
-                        # tracks.  The pose model never creates a person or
+                        # tracks. The pose model never creates a person or
                         # track, and the existing polygon ROI remains master.
-                        if fall_detector is not None:
+                        if fall_detector is not None and _should_run_kpi(camera_id, "fall"):
                             roi_points = get_camera_roi(camera_id)["points"]
                             roi_polygon = roi_points * np.array(
                                 [frame.shape[1], frame.shape[0]], dtype=np.float32
@@ -3160,7 +3181,7 @@ def camera_worker(camera_config, rtsp_url=None):
                         # PPE receives authoritative person tracks and the
                         # existing polygon ROI. Only confirmed helmet sessions
                         # use the established event/FCM/evidence path.
-                        if ppe_detector is not None:
+                        if ppe_detector is not None and _should_run_kpi(camera_id, "helmet"):
                             roi_points = get_camera_roi(camera_id)["points"]
                             roi_polygon = roi_points * np.array(
                                 [frame.shape[1], frame.shape[0]], dtype=np.float32
@@ -3463,6 +3484,7 @@ def camera_worker(camera_config, rtsp_url=None):
                             current_box = (
                                 face.bbox.astype(int)
                             )
+                            face.annotation_box = current_box.copy()
                             current_body_box = getattr(
                                 face,
                                 "associated_person_box",
@@ -3532,6 +3554,10 @@ def camera_worker(camera_config, rtsp_url=None):
                                             current_body_box.copy()
                                             if current_body_box is not None else None
                                         ),
+                                        "bbox": (
+                                            current_body_box.copy()
+                                            if current_body_box is not None else person_track.get("bbox")
+                                        ),
                                         "face_box": current_box.copy(),
                                         "annotation_box": current_box.copy(),
                                         "recognition_score": score,
@@ -3589,6 +3615,10 @@ def camera_worker(camera_config, rtsp_url=None):
                                         if current_body_box is not None
                                         else person_track.get("body_box")
                                     ),
+                                    "bbox": (
+                                        current_body_box.copy()
+                                        if current_body_box is not None else person_track.get("bbox")
+                                    ),
                                     "face_box": current_box.copy(),
                                     "annotation_box": current_box.copy(),
                                     "recognition_score": score,
@@ -3635,6 +3665,10 @@ def camera_worker(camera_config, rtsp_url=None):
                                     "body_box": (
                                         current_body_box.copy()
                                         if current_body_box is not None else None
+                                    ),
+                                    "bbox": (
+                                        current_body_box.copy()
+                                        if current_body_box is not None else person_track.get("bbox")
                                     ),
                                     "face_box": current_box.copy(),
                                     "annotation_box": current_box.copy(),
@@ -4029,7 +4063,7 @@ def camera_worker(camera_config, rtsp_url=None):
 
                     send_frame = frame.copy()
 
-                    if ppe_detector is not None and PPE_ANNOTATION_ENABLED:
+                    if ppe_detector is not None and PPE_ANNOTATION_ENABLED and _should_run_kpi(camera_id, "helmet"):
                         ppe_detector.annotate(send_frame, last_ppe_detections)
 
                     if smoke_fire_detector is not None:
