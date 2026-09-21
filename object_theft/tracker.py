@@ -110,6 +110,7 @@ class ObjectTheftTracker:
                     "session_id": uuid.uuid4().hex[:12],
                     "matched_this_frame": True,
                     "active": True,
+                    "mask": detection.get("mask"),
                 }
                 self.tracks.append(matched)
                 self._next_track_id += 1
@@ -118,6 +119,7 @@ class ObjectTheftTracker:
                 matched["bbox"] = tuple(int(v) for v in detection["bbox"])
                 matched["confidence"] = float(detection.get("confidence", matched.get("confidence", 0.0)))
                 matched["center"] = self._center(matched["bbox"])
+                matched["mask"] = detection.get("mask", matched.get("mask"))
                 previous_roi_state = bool(matched.get("inside_roi", True))
                 matched["inside_roi"] = self._inside_roi(matched["bbox"], roi_polygon)
                 matched["last_seen"] = now
@@ -135,6 +137,7 @@ class ObjectTheftTracker:
                         "confidence": float(matched.get("confidence", 0.0)),
                         "session_id": matched.get("session_id"),
                         "state": "REMOVAL_CONFIRMED",
+                        "mask": matched.get("mask"),
                     })
 
             matched["canonical_class"] = detection.get("canonical_class", matched.get("canonical_class", "DRUM_CONTAINER"))
@@ -176,6 +179,7 @@ class ObjectTheftTracker:
                     "confidence": float(track.get("confidence", 0.0)),
                     "session_id": track.get("session_id"),
                     "state": "REMOVAL_CONFIRMED",
+                    "mask": track.get("mask"),
                 })
             elif track.get("missed_frames", 0) >= max(1, self.max_missed // 2):
                 track["state"] = "REMOVAL_CANDIDATE"

@@ -32,6 +32,7 @@ class ObjectTheftDetection:
     confidence: float
     bbox: tuple
     session_id: str
+    mask: tuple | None = None
 
 
 class ObjectTheftDetector:
@@ -152,7 +153,10 @@ class ObjectTheftDetector:
             xyxy = getattr(boxes, "xyxy", [])
             scores = getattr(boxes, "conf", [])
             class_ids = getattr(boxes, "cls", [])
-            for box, score, class_id in zip(xyxy, scores, class_ids):
+            masks = getattr(getattr(result, "masks", None), "xy", [])
+            for detection_index, (box, score, class_id) in enumerate(
+                zip(xyxy, scores, class_ids)
+            ):
                 class_id = int(self._value(class_id))
                 score = float(self._value(score))
                 if class_id not in self.allowed_class_ids or score < self.confidence:
@@ -164,12 +168,23 @@ class ObjectTheftDetector:
                 y2 = max(0, min(height, int(coords[3])))
                 if x2 <= x1 or y2 <= y1:
                     continue
+                mask = None
+                if len(masks) > detection_index:
+                    points = np.asarray(masks[detection_index], dtype=np.float32)
+                    if points.ndim == 2 and points.shape[1] == 2:
+                        points[:, 0] = np.clip(points[:, 0], 0, width)
+                        points[:, 1] = np.clip(points[:, 1], 0, height)
+                        if len(points) >= 3:
+                            mask = tuple(
+                                (int(point[0]), int(point[1])) for point in points
+                            )
                 detections.append(
                     {
                         "class_name": self.model_names[class_id],
                         "canonical_class": CANONICAL_CLASS,
                         "confidence": score,
                         "bbox": (x1, y1, x2, y2),
+                        "mask": mask,
                     }
                 )
         return self._merge_detections(detections)
@@ -218,6 +233,7 @@ class ObjectTheftDetector:
                 confidence=float(item.get("confidence", 0.0)),
                 bbox=tuple(item["bbox"]),
                 session_id=str(item.get("session_id") or "session-unknown"),
+                mask=item.get("mask"),
             )
             for item in confirmed
         ]
