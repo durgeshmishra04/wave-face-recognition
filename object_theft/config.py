@@ -27,7 +27,7 @@ def _parse_class_names(raw_value):
 
 OBJECT_THEFT_ENABLED = _env_bool("OBJECT_THEFT_ENABLED", "true")
 OBJECT_THEFT_CAMERAS = _parse_cameras(os.getenv("OBJECT_THEFT_CAMERAS", "CAM008"))
-OBJECT_THEFT_MODEL_PATH = os.getenv("OBJECT_THEFT_MODEL_PATH", "").strip()
+OBJECT_THEFT_MODEL_PATH = os.getenv("OBJECT_THEFT_MODEL_PATH", "barrel_seg_best.pt").strip()
 OBJECT_THEFT_CLASS_NAMES = _parse_class_names(
     os.getenv("OBJECT_THEFT_CLASS_NAMES", "")
 )
