@@ -10,7 +10,7 @@ HELMET_DETECTION_ENABLED = os.getenv(
 ).strip().lower() in {"1", "true", "yes", "on"}
 PPE_ENABLED = HELMET_DETECTION_ENABLED
 PPE_MODEL_PATH = os.getenv("PPE_MODEL_PATH", "yolo26n_ppe.pt")
-PPE_CONFIDENCE = float(os.getenv("PPE_CONFIDENCE", "0.65"))
+PPE_CONFIDENCE = float(os.getenv("PPE_CONFIDENCE", "0.55"))
 PPE_IOU = float(os.getenv("PPE_IOU", "0.45"))
 HELMET_ENABLED = os.getenv("HELMET_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 GLOVES_ENABLED = os.getenv("GLOVES_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
