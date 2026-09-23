@@ -13,7 +13,6 @@ class ObjectTheftState:
     baseline_area: float = 0.0
     alert_generated: bool = False
     event_finalized: bool = False
-    moved_frames: int = 0
     missed_frames: int = 0
     removal_confirm_frames: int = 0
     session_id: str | None = None
@@ -25,8 +24,7 @@ class ObjectTheftState:
 class ObjectTheftStateMachine:
     """Simple temporal state machine for object theft decisions."""
 
-    def __init__(self, movement_threshold=50.0, confirm_frames=5, max_missed_frames=15):
-        self.movement_threshold = float(movement_threshold)
+    def __init__(self, confirm_frames=5, max_missed_frames=15):
         self.confirm_frames = max(1, int(confirm_frames))
         self.max_missed_frames = max(1, int(max_missed_frames))
 
@@ -42,25 +40,8 @@ class ObjectTheftStateMachine:
                 track["baseline_area"] = max((track["bbox"][2] - track["bbox"][0]) * (track["bbox"][3] - track["bbox"][1]), 1.0)
                 state = "PRESENT"
 
-            center = track.get("center")
-            baseline = track.get("baseline_center")
-            if center and baseline:
-                dx = abs(center[0] - baseline[0])
-                dy = abs(center[1] - baseline[1])
-                movement = max(dx, dy)
-                if movement > self.movement_threshold:
-                    state = "MOVED"
-                    track["moved_frames"] = int(track.get("moved_frames", 0)) + 1
-                    if track["moved_frames"] >= self.confirm_frames:
-                        state = "REMOVAL_CANDIDATE"
-                    else:
-                        state = "MOVED"
-                else:
-                    track["moved_frames"] = 0
-                    state = "PRESENT"
-
             track["missed_frames"] = 0
-            track["state"] = state
+            track["state"] = "PRESENT"
             track["last_seen"] = now
             return state
 

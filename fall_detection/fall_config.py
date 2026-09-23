@@ -9,8 +9,8 @@ FALL_DETECTION_ENABLED = os.getenv(
 ).strip().lower() in {"1", "true", "yes", "on"}
 FALL_ENABLED = FALL_DETECTION_ENABLED
 FALL_MODEL_PATH = os.getenv("FALL_MODEL_PATH", "yolo11m-pose.pt")
-FALL_CONFIDENCE = float(os.getenv("FALL_CONFIDENCE", "0.30"))
-FALL_POSE_CONFIDENCE = float(os.getenv("FALL_POSE_CONFIDENCE", "0.30"))
+FALL_CONFIDENCE = float(os.getenv("FALL_CONFIDENCE", "0.65"))
+FALL_POSE_CONFIDENCE = float(os.getenv("FALL_POSE_CONFIDENCE", "0.65"))
 FALL_CONFIRMATION_FRAMES = max(2, int(os.getenv("FALL_CONFIRMATION_FRAMES", "2")))
 FALL_RECOVERY_FRAMES = max(2, int(os.getenv("FALL_RECOVERY_FRAMES", "5")))
 FALL_MIN_NORMAL_FRAMES = max(1, int(os.getenv("FALL_MIN_NORMAL_FRAMES", "2")))

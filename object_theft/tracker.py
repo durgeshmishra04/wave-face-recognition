@@ -24,12 +24,10 @@ class ObjectTheftTracker:
         iou_threshold=OBJECT_THEFT_TRACK_IOU,
         confirm_frames=OBJECT_THEFT_CONFIRM_FRAMES,
         max_missed=OBJECT_THEFT_MAX_MISSED_FRAMES,
-        movement_threshold=50.0,
     ):
         self.iou_threshold = float(iou_threshold)
         self.confirm_frames = max(1, int(confirm_frames))
         self.max_missed = max(1, int(max_missed))
-        self.movement_threshold = float(movement_threshold)
         self.tracks = []
         self._next_track_id = 1
 
@@ -81,21 +79,6 @@ class ObjectTheftTracker:
                 center[0] - self._center(track_box)[0],
                 center[1] - self._center(track_box)[1],
             )
-            max_distance = 35.0 + (track.get("missed_frames", 0) * 20.0)
-            if track.get("state") == "REMOVAL_CANDIDATE":
-                max_distance = max(max_distance, 80.0)
-            roi_exit_match = (
-                roi_polygon is not None
-                and track.get("last_seen_inside_roi", False)
-                and not self._inside_roi(box, roi_polygon)
-                and distance <= 80.0
-            )
-            if (
-                iou < self.iou_threshold
-                and distance > max_distance
-                and not roi_exit_match
-            ):
-                continue
             score = iou + max(0.0, 1.0 - distance / 100.0)
             if score > best_score:
                 best, best_score = track, score
@@ -229,20 +212,27 @@ class ObjectTheftTracker:
             if inside:
                 if matched.get("state") == "REMOVAL_CANDIDATE":
                     print(
-                        "[OBJECT-THEFT] Object returned to ROI "
-                        f"camera={camera_id} track={matched['track_id']} "
-                        f"session={matched['session_id']} action=CANCEL_REMOVAL"
+                        "[OBJECT-THEFT][ROI] "
+                        f"track={matched['track_id']} "
+                        f"center={matched['center']} inside_roi=True "
+                        "action=CANCEL_REMOVAL state=PRESENT"
                     )
                 matched["state"] = "PRESENT"
                 matched["removal_confirmations"] = 0
                 matched["missed_frames"] = 0
+                print(
+                    "[OBJECT-THEFT][ROI] "
+                    f"track={matched['track_id']} center={matched['center']} "
+                    "inside_roi=True state=PRESENT"
+                )
             else:
                 matched["state"] = "REMOVAL_CANDIDATE"
                 matched["removal_confirmations"] += 1
                 print(
-                    "[OBJECT-THEFT] "
-                    f"track={matched['track_id']} state=REMOVAL_CANDIDATE "
-                    f"missing={matched['removal_confirmations']}/{self.max_missed}"
+                    "[OBJECT-THEFT][ROI] "
+                    f"track={matched['track_id']} center={matched['center']} "
+                    "inside_roi=False state=REMOVAL_CANDIDATE "
+                    f"outside_count={matched['removal_confirmations']}/{self.max_missed}"
                 )
                 if matched["removal_confirmations"] >= self.max_missed:
                     self._confirm_removal(matched, camera_id, confirmed)
@@ -258,9 +248,10 @@ class ObjectTheftTracker:
             track["state"] = "REMOVAL_CANDIDATE"
             track["removal_confirmations"] += 1
             print(
-                "[OBJECT-THEFT] "
-                f"track={track['track_id']} state=REMOVAL_CANDIDATE "
-                f"missing={track['removal_confirmations']}/{self.max_missed}"
+                "[OBJECT-THEFT][ROI] "
+                f"track={track['track_id']} center={track['center']} "
+                "inside_roi=False state=REMOVAL_CANDIDATE "
+                f"outside_count={track['removal_confirmations']}/{self.max_missed}"
             )
             if track["removal_confirmations"] >= self.max_missed:
                 self._confirm_removal(track, camera_id, confirmed)

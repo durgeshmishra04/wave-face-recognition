@@ -17,14 +17,6 @@ def _parse_cameras(raw_value):
     }
 
 
-def _parse_class_names(raw_value):
-    return {
-        str(item).strip().lower()
-        for item in str(raw_value).split(",")
-        if str(item).strip()
-    }
-
-
 OBJECT_THEFT_ENABLED = _env_bool("OBJECT_THEFT_ENABLED", "true")
 OBJECT_THEFT_CAMERAS = _parse_cameras(os.getenv("OBJECT_THEFT_CAMERAS", "CAM008"))
 OBJECT_THEFT_MODEL_PATH = os.getenv("OBJECT_THEFT_MODEL_PATH", "barrel.pt").strip()
@@ -35,9 +27,6 @@ OBJECT_THEFT_IOU_THRESHOLD = float(
     os.getenv("OBJECT_THEFT_IOU_THRESHOLD", "0.55")
 )
 OBJECT_THEFT_TRACK_IOU = float(os.getenv("OBJECT_THEFT_TRACK_IOU", "0.30"))
-OBJECT_THEFT_MOVEMENT_THRESHOLD = float(
-    os.getenv("OBJECT_THEFT_MOVEMENT_THRESHOLD", "50.0")
-)
 OBJECT_THEFT_CONFIRM_FRAMES = max(
     1, int(os.getenv("OBJECT_THEFT_CONFIRM_FRAMES", "5"))
 )
