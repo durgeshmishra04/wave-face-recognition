@@ -10,7 +10,6 @@ import numpy as np
 import torch
 
 from .config import (
-    OBJECT_THEFT_CLASS_NAMES,
     OBJECT_THEFT_CONFIDENCE_THRESHOLD,
     OBJECT_THEFT_ENABLED,
     OBJECT_THEFT_INFERENCE_INTERVAL,
@@ -56,7 +55,7 @@ class ObjectTheftDetector:
         self.allowed_class_ids = set()
         self.inference_interval = OBJECT_THEFT_INFERENCE_INTERVAL
         self.frame_count = 0
-        self.tracker = ObjectTheftTracker(iou_threshold=self.iou)
+        self.tracker = ObjectTheftTracker()
 
         if self.enabled:
             self.model = self._load_model()
@@ -81,29 +80,26 @@ class ObjectTheftDetector:
             if raw_names is None:
                 raise ValueError("custom YOLO model has no model.names")
             model_task = str(getattr(model, "task", "") or "").lower() or "unknown"
-            self.model_names = {
-                int(class_id): str(name) for class_id, name in dict(raw_names).items()
-            }
-            configured_names = OBJECT_THEFT_CLASS_NAMES
-            if configured_names:
-                self.allowed_class_ids = {
-                    class_id
-                    for class_id, name in self.model_names.items()
-                    if name.strip().lower() in configured_names
-                }
+            if isinstance(raw_names, dict):
+                name_items = raw_names.items()
             else:
-                self.allowed_class_ids = {
-                    class_id
-                    for class_id, name in self.model_names.items()
-                    if any(
-                        token in name.strip().lower()
-                        for token in ("drum", "barrel", "container")
-                    )
-                }
+                name_items = enumerate(raw_names)
+            self.model_names = {
+                int(class_id): str(name) for class_id, name in name_items
+            }
+            self.allowed_class_ids = {
+                class_id
+                for class_id, name in self.model_names.items()
+                if any(
+                    token in name.strip().lower()
+                    for token in ("drum", "barrel", "container")
+                )
+            }
 
             print(f"[OBJECT-THEFT] Model source: {self.model_path}")
+            print(f"[OBJECT-THEFT] Model task: {model_task}")
             print(f"[OBJECT-THEFT] Model classes: {self.model_names}")
-            print(f"[OBJECT-THEFT] Model task: {model_task or 'segment'}")
+            print(f"[OBJECT-THEFT] Target class IDs: {sorted(self.allowed_class_ids)}")
             print(f"[OBJECT-THEFT] Device: {self.device}")
             if not self.allowed_class_ids:
                 raise ValueError(
@@ -111,7 +107,7 @@ class ObjectTheftDetector:
                 )
             return model
         except Exception as error:
-            print(f"[OBJECT-THEFT] Model unavailable - safely disabled: {error}")
+            print(f"[OBJECT-THEFT] Model unavailable: {error}")
             return None
 
     @staticmethod
@@ -218,7 +214,7 @@ class ObjectTheftDetector:
                     float(self._value(value)) for value in box
                 )
                 print(
-                    "[OBJECT-THEFT][RAW-DETECTION] "
+                    "[OBJECT-THEFT][RAW] "
                     f"class_id={class_id} "
                     f"class_name={names.get(class_id, 'UNKNOWN')} "
                     f"confidence={float(self._value(score)):.4f} "
@@ -255,13 +251,20 @@ class ObjectTheftDetector:
         )
         if detections and self.frame_count == self.inference_interval:
             for detection in detections:
+                center = (
+                    (detection["bbox"][0] + detection["bbox"][2]) / 2.0,
+                    (detection["bbox"][1] + detection["bbox"][3]) / 2.0,
+                )
+                inside_roi = ObjectTheftTracker._inside_roi(
+                    detection["bbox"], roi_polygon,
+                )
                 print(
                     "[OBJECT-THEFT][ACCEPTED] "
                     f"class_name={detection['class_name']} "
                     f"canonical_class={detection['canonical_class']} "
                     f"confidence={detection['confidence']:.4f} "
                     f"bbox={detection['bbox']} "
-                    f"mask_available={detection.get('mask') is not None}"
+                    f"center={center} inside_roi={inside_roi}"
                 )
             print("[OBJECT-THEFT] Tracker received detection")
         return [

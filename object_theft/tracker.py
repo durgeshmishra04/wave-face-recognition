@@ -177,8 +177,9 @@ class ObjectTheftTracker:
                 self._next_track_id += 1
                 if inside:
                     print(
-                        "[OBJECT-THEFT] Presence candidate "
-                        f"camera={camera_id} track={matched['track_id']}"
+                        "[OBJECT-THEFT] "
+                        f"track={matched['track_id']} state=PRESENCE_CANDIDATE "
+                        f"inside_roi=True presence=1/{self.confirm_frames}"
                     )
             else:
                 matched["matched_this_frame"] = True
@@ -204,6 +205,7 @@ class ObjectTheftTracker:
             if not matched.get("presence_confirmed"):
                 if inside:
                     matched["presence_confirmations"] += 1
+                    matched["state"] = "PRESENCE_CANDIDATE"
                     if matched["presence_confirmations"] >= self.confirm_frames:
                         matched["presence_confirmed"] = True
                         matched["state"] = "PRESENT"
@@ -215,11 +217,12 @@ class ObjectTheftTracker:
                             1.0,
                         )
                         print(
-                            "[OBJECT-THEFT] PRESENT / BASELINE CONFIRMED "
-                            f"camera={camera_id} track={matched['track_id']} "
-                            f"session={matched['session_id']}"
+                            "[OBJECT-THEFT] "
+                            f"track={matched['track_id']} state=PRESENT "
+                            f"baseline_confirmed=True session={matched['session_id']}"
                         )
                 else:
+                    matched["presence_confirmations"] = 0
                     matched["state"] = "PRESENCE_CANDIDATE"
                 continue
 
@@ -237,10 +240,9 @@ class ObjectTheftTracker:
                 matched["state"] = "REMOVAL_CANDIDATE"
                 matched["removal_confirmations"] += 1
                 print(
-                    "[OBJECT-THEFT] Removal candidate "
-                    f"camera={camera_id} track={matched['track_id']} "
-                    f"session={matched['session_id']} "
-                    f"missed={matched['removal_confirmations']}/{self.max_missed}"
+                    "[OBJECT-THEFT] "
+                    f"track={matched['track_id']} state=REMOVAL_CANDIDATE "
+                    f"missing={matched['removal_confirmations']}/{self.max_missed}"
                 )
                 if matched["removal_confirmations"] >= self.max_missed:
                     self._confirm_removal(matched, camera_id, confirmed)
@@ -250,15 +252,15 @@ class ObjectTheftTracker:
                 continue
             track["missed_frames"] += 1
             if not track.get("presence_confirmed"):
+                track["presence_confirmations"] = 0
                 track["state"] = "PRESENCE_CANDIDATE"
                 continue
             track["state"] = "REMOVAL_CANDIDATE"
             track["removal_confirmations"] += 1
             print(
-                "[OBJECT-THEFT] Removal candidate "
-                f"camera={camera_id} track={track['track_id']} "
-                f"session={track['session_id']} "
-                f"missed={track['removal_confirmations']}/{self.max_missed}"
+                "[OBJECT-THEFT] "
+                f"track={track['track_id']} state=REMOVAL_CANDIDATE "
+                f"missing={track['removal_confirmations']}/{self.max_missed}"
             )
             if track["removal_confirmations"] >= self.max_missed:
                 self._confirm_removal(track, camera_id, confirmed)
