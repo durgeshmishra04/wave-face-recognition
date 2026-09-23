@@ -139,6 +139,18 @@ REGISTRATION_MIN_BLUR_SCORE = float(
 REGISTRATION_IDENTICAL_SIMILARITY = float(
     os.getenv("REGISTRATION_IDENTICAL_SIMILARITY", "0.995")
 )
+REGISTRATION_FACE_CROP_MARGIN = float(
+    os.getenv("REGISTRATION_FACE_CROP_MARGIN", "0.25")
+)
+REGISTRATION_FACE_CROP_MIN_SIZE = int(
+    os.getenv("REGISTRATION_FACE_CROP_MIN_SIZE", "112")
+)
+REGISTRATION_FACE_CROP_MAX_SIZE = int(
+    os.getenv("REGISTRATION_FACE_CROP_MAX_SIZE", "1024")
+)
+REGISTRATION_SAVE_FACE_CROPS = os.getenv(
+    "REGISTRATION_SAVE_FACE_CROPS", "true"
+).strip().lower() in {"1", "true", "yes", "on"}
 KNOWN_IDENTITY_MEMORY_TIMEOUT = float(
     os.getenv("KNOWN_IDENTITY_MEMORY_TIMEOUT", "2.0")
 )
@@ -4508,7 +4520,7 @@ def _decode_registration_image(raw):
 
 
 def _validate_registration_images():
-    """Decode five uploads and create compatible InsightFace embeddings."""
+    """Validate five uploads and embed only their validated face crops."""
 
     expected = [f"image{number}" for number in range(1, 6)]
     supplied = [
@@ -4524,7 +4536,7 @@ def _validate_registration_images():
     if face_app is None:
         raise RuntimeError("Face recognition model is not ready")
 
-    images, embeddings = [], []
+    images, crops, embeddings = [], [], []
     for number, field in enumerate(expected, start=1):
         raw = request.files[field].read()
         image, orientation = _decode_registration_image(raw)
@@ -4551,33 +4563,79 @@ def _validate_registration_images():
         )
         if image is None:
             raise ValueError(f"Image {number} is not a valid image")
-        faces = safe_registration_face_inference(image)
+        faces = safe_face_inference(image)
         print(
             f"[REGISTRATION DETECTION] image={number} face_count={len(faces)} "
             f"faces={_face_detection_summary(faces)}"
         )
         if not faces:
-            raise ValueError(f"No face detected in image {number}")
+            raise ValueError(
+                f"Registration image {number}: no face detected."
+            )
         if len(faces) != 1:
-            raise ValueError(f"Image {number} must contain exactly one face")
+            raise ValueError(
+                f"Registration image {number}: multiple faces detected."
+            )
         face = faces[0]
+        bbox = np.asarray(face.bbox, dtype=np.float32).reshape(-1)
+        print(
+            f"[REGISTRATION][FACE] image={number} faces_detected={len(faces)} "
+            f"bbox=({','.join(f'{value:.1f}' for value in bbox)})"
+        )
         _validate_registration_face_quality(face, image, number)
+        face_crop, crop_bbox = _create_registration_face_crop(
+            face, image, number,
+        )
+        crop_height, crop_width = face_crop.shape[:2]
+        print(
+            f"[REGISTRATION][CROP] image={number} "
+            f"crop_bbox=({','.join(str(value) for value in crop_bbox)}) "
+            f"crop_size={crop_width}x{crop_height} "
+            f"margin={REGISTRATION_FACE_CROP_MARGIN}"
+        )
+        cropped_faces = safe_face_inference(face_crop)
+        if not cropped_faces:
+            # Some close portraits need the existing registration-only padded
+            # detector retry; it still receives only the validated face crop.
+            cropped_faces = safe_registration_face_inference(face_crop)
+        if not cropped_faces:
+            raise ValueError(
+                f"Registration image {number}: unable to generate a valid face embedding."
+            )
+        if len(cropped_faces) != 1:
+            raise ValueError(
+                f"Registration image {number}: multiple faces detected in face crop."
+            )
         try:
-            embedding = np.asarray(face.embedding, dtype=np.float32).reshape(-1)
+            embedding = np.asarray(
+                cropped_faces[0].embedding,
+                dtype=np.float32,
+            ).reshape(-1)
         except Exception as error:
             raise ValueError(
-                f"Unable to generate face embedding in image {number}"
+                f"Registration image {number}: unable to generate a valid face embedding."
             ) from error
         if embedding.size != 512 or not np.all(np.isfinite(embedding)):
             raise ValueError(
-                f"Invalid face embedding in image {number}. Expected 512 dimensions."
+                f"Registration image {number}: unable to generate a valid face embedding."
             )
-        embedding = normalize_embedding(embedding)
-        if embedding.size != 512 or not np.all(np.isfinite(embedding)):
+        norm = float(np.linalg.norm(embedding))
+        if not np.isfinite(norm) or norm <= 0.0:
             raise ValueError(
-                f"Unable to generate a valid face embedding in image {number}"
+                f"Registration image {number}: unable to generate a valid face embedding."
             )
+        embedding = (embedding / norm).astype(np.float32, copy=False)
+        normalized_norm = float(np.linalg.norm(embedding))
+        print(
+            f"[REGISTRATION][EMBEDDING] image={number} "
+            f"original={image.shape[1]}x{image.shape[0]} "
+            f"face_bbox=({','.join(f'{value:.1f}' for value in bbox)}) "
+            f"crop_bbox=({','.join(str(value) for value in crop_bbox)}) "
+            f"crop_size={crop_width}x{crop_height} dimension={embedding.size} "
+            f"norm={normalized_norm:.4f} source=face_crop"
+        )
         images.append(image)
+        crops.append(face_crop)
         embeddings.append(embedding)
     pairwise_similarities = [
         float(np.dot(first, second))
@@ -4589,7 +4647,66 @@ def _validate_registration_images():
             "The five face images are nearly identical. "
             "Please capture the requested different face angles."
         )
-    return images, embeddings
+    return images, crops, embeddings
+
+
+def _create_registration_face_crop(face, image, number):
+    """Create a bounded face crop without upscaling a small detected face."""
+    image_height, image_width = image.shape[:2]
+    try:
+        x1, y1, x2, y2 = (
+            np.asarray(face.bbox, dtype=np.float32).reshape(-1).tolist()
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            f"Registration image {number}: unable to create a valid face crop."
+        ) from error
+
+    face_width = x2 - x1
+    face_height = y2 - y1
+    margin_x = face_width * REGISTRATION_FACE_CROP_MARGIN
+    margin_y = face_height * REGISTRATION_FACE_CROP_MARGIN
+    crop_x1 = max(0, int(np.floor(x1 - margin_x)))
+    crop_y1 = max(0, int(np.floor(y1 - margin_y)))
+    crop_x2 = min(image_width, int(np.ceil(x2 + margin_x)))
+    crop_y2 = min(image_height, int(np.ceil(y2 + margin_y)))
+    crop_width = crop_x2 - crop_x1
+    crop_height = crop_y2 - crop_y1
+
+    if (
+        crop_width < REGISTRATION_FACE_CROP_MIN_SIZE
+        or crop_height < REGISTRATION_FACE_CROP_MIN_SIZE
+    ):
+        raise ValueError(
+            f"Registration image {number}: face is too small. Move closer."
+        )
+    if crop_width <= 0 or crop_height <= 0:
+        raise ValueError(
+            f"Registration image {number}: unable to create a valid face crop."
+        )
+
+    face_crop = image[crop_y1:crop_y2, crop_x1:crop_x2].copy()
+    if not face_crop.size:
+        raise ValueError(
+            f"Registration image {number}: unable to create a valid face crop."
+        )
+    if max(crop_width, crop_height) > REGISTRATION_FACE_CROP_MAX_SIZE:
+        scale = REGISTRATION_FACE_CROP_MAX_SIZE / max(crop_width, crop_height)
+        resized_width = max(1, int(round(crop_width * scale)))
+        resized_height = max(1, int(round(crop_height * scale)))
+        face_crop = cv2.resize(
+            face_crop,
+            (resized_width, resized_height),
+            interpolation=cv2.INTER_AREA,
+        )
+        if (
+            resized_width < REGISTRATION_FACE_CROP_MIN_SIZE
+            or resized_height < REGISTRATION_FACE_CROP_MIN_SIZE
+        ):
+            raise ValueError(
+                f"Registration image {number}: face is too small. Move closer."
+            )
+    return face_crop, (crop_x1, crop_y1, crop_x2, crop_y2)
 
 
 def _validate_registration_face_quality(face, image, number):
@@ -4665,21 +4782,27 @@ def _validate_registration_face_quality(face, image, number):
         + (f" reason={reason}" if reason else "")
     )
     if reason == "face_too_small":
-        raise ValueError(f"Face is too small in image {number}. Please move closer.")
+        raise ValueError(
+            f"Registration image {number}: face is too small. Move closer."
+        )
     if reason == "face_partially_outside_frame":
         raise ValueError(f"Face is partially outside the frame in image {number}.")
     if reason == "low_detection_confidence":
         raise ValueError(f"Face detection confidence is too low in image {number}.")
     if reason == "face_blurry":
-        raise ValueError(f"Face is blurry in image {number}. Please hold the phone steady.")
+        raise ValueError(
+            f"Registration image {number}: face quality is insufficient."
+        )
     if reason == "invalid_face_geometry":
         raise ValueError(f"Face geometry is invalid in image {number}.")
     if reason:
-        raise ValueError(f"Invalid face quality in image {number}.")
+        raise ValueError(
+            f"Registration image {number}: face quality is insufficient."
+        )
 
 
 def _save_registered_person(gate_no, employee_name, designation, employee_id,
-                            images, embeddings):
+                            images, crops, embeddings):
     """Persist a completely validated registration and update the live cache."""
 
     registration_id = f"REG_{uuid.uuid4().hex[:12].upper()}"
@@ -4703,11 +4826,20 @@ def _save_registered_person(gate_no, employee_name, designation, employee_id,
 
         staging_dir.mkdir(parents=True, exist_ok=False)
         image_paths = []
+        crop_paths = []
+        crop_dir = staging_dir / "crops"
+        if REGISTRATION_SAVE_FACE_CROPS:
+            crop_dir.mkdir(parents=True, exist_ok=False)
         for number, image in enumerate(images, start=1):
             image_path = staging_dir / f"image_{number}.jpg"
             if not cv2.imwrite(str(image_path), image):
                 raise RuntimeError(f"Unable to save image {number}")
             image_paths.append(image_path)
+            if REGISTRATION_SAVE_FACE_CROPS:
+                crop_path = crop_dir / f"image_{number}_face.jpg"
+                if not cv2.imwrite(str(crop_path), crops[number - 1]):
+                    raise RuntimeError(f"Unable to save face crop {number}")
+                crop_paths.append(crop_path)
 
         # Move only after every image was safely written. The final directory
         # uses a server-generated key, never an Android filename.
@@ -4827,10 +4959,10 @@ def api_register_person():
             }), 400
     employee_id = request.form.get("employee_id", "").strip() or None
     try:
-        images, embeddings = _validate_registration_images()
+        images, crops, embeddings = _validate_registration_images()
         registration_id = _save_registered_person(
             values["gate_no"], values["employee_name"],
-            values["designation"], employee_id, images, embeddings,
+            values["designation"], employee_id, images, crops, embeddings,
         )
     except ValueError as error:
         return jsonify({"success": False, "message": str(error)}), 400
