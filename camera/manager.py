@@ -97,6 +97,8 @@ class CameraManager:
 
     def start(self):
         for camera_config in self.cameras:
+            if not camera_config.get("enabled", False):
+                continue
             camera_id = camera_config["camera_id"]
             if camera_id in self.workers:
                 continue

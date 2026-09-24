@@ -229,15 +229,6 @@ STREAM_MAX_WIDTH = 800
 STREAM_TARGET_FPS = 10
 SOCKET_LIVE_FPS = float(os.getenv("SOCKET_LIVE_FPS", "8"))
 SOCKET_JPEG_QUALITY = int(os.getenv("SOCKET_JPEG_QUALITY", "70"))
-DUAL_STREAM_ENABLED = os.getenv("DUAL_STREAM_ENABLED", "true").strip().lower() in {
-    "1", "true", "yes", "on"
-}
-_dual_stream_camera_value = os.getenv("DUAL_STREAM_CAMERAS", "").strip()
-DUAL_STREAM_CAMERAS = {
-    item.strip().upper()
-    for item in _dual_stream_camera_value.split(",")
-    if item.strip()
-}
 MAIN_FRAME_MAX_AGE_MS = int(os.getenv("MAIN_FRAME_MAX_AGE_MS", "2000"))
 MAX_AI_FRAME_AGE_MS = int(os.getenv("MAX_AI_FRAME_AGE_MS", "2000"))
 MAX_SOCKET_FRAME_AGE_MS = int(os.getenv("MAX_SOCKET_FRAME_AGE_MS", "2000"))
@@ -316,7 +307,6 @@ camera_event_managers = {}
 camera_state_lock = threading.Lock()
 camera_manager = None
 camera_captures = {}
-camera_stream_captures = {}
 camera_capture_lock = threading.Lock()
 camera_frame_store = LatestFrameStore()
 latest_socket_frames = {}
@@ -507,152 +497,10 @@ def _set_camera_state(camera_id, **updates):
 def _release_camera_capture(camera_id):
     with camera_capture_lock:
         cap = camera_captures.pop(camera_id, None)
-        dual_capture = camera_stream_captures.pop(camera_id, None)
     if cap is not None:
         cap.release()
         _camera_log(camera_id, "RTSP released")
-    if dual_capture is not None:
-        dual_capture.release()
 
-
-def _dual_stream_for_camera(camera_config):
-    if not DUAL_STREAM_ENABLED:
-        return False
-    camera_id = str(camera_config.get("camera_id", "")).upper()
-    return not DUAL_STREAM_CAMERAS or camera_id in DUAL_STREAM_CAMERAS
-
-
-def _build_stream_rtsp_url(camera_config, stream_type):
-    stream = (camera_config.get("streams") or {}).get(stream_type) or {}
-    configured_url = str(stream.get("rtsp_url", "")).strip()
-    if not configured_url:
-        raise RuntimeError(f"{stream_type} stream URL is not configured")
-    if not NVR_PASSWORD:
-        raise RuntimeError("ALCON_PASSWORD environment variable is not set.")
-    parsed = urlsplit(configured_url)
-    scheme = parsed.scheme or "rtsp"
-    port = parsed.port or RTSP_PORT
-    host_path = (
-        f"{camera_config.get('nvr_ip', DEFAULT_NVR_IP)}:{port}{parsed.path}"
-    )
-    user = quote(NVR_USERNAME, safe="")
-    password = quote(NVR_PASSWORD, safe="")
-    return f"{scheme}://{user}:{password}@{host_path}"
-
-
-class _DualStreamCapture:
-    """Continuously capture main/sub streams into one-slot latest buffers."""
-
-    def __init__(self, camera_config):
-        self.camera_config = camera_config
-        self.camera_id = camera_config["camera_id"]
-        self.stop_event = threading.Event()
-        self.threads = []
-
-    def start(self):
-        for stream_type in ("main", "sub"):
-            stream = (self.camera_config.get("streams") or {}).get(stream_type, {})
-            if not stream.get("enabled", True):
-                continue
-            thread = threading.Thread(
-                target=self._capture_stream,
-                args=(stream_type,),
-                name=f"camera-{self.camera_id}-{stream_type}",
-                daemon=True,
-            )
-            self.threads.append(thread)
-            thread.start()
-
-    def _capture_stream(self, stream_type):
-        while not shutdown_event.is_set() and not self.stop_event.is_set():
-            cap = None
-            try:
-                url = _build_stream_rtsp_url(self.camera_config, stream_type)
-                cap = cv2.VideoCapture(
-                    url,
-                    cv2.CAP_FFMPEG,
-                    [
-                        cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 10000,
-                        cv2.CAP_PROP_READ_TIMEOUT_MSEC, 10000,
-                    ],
-                )
-                if not cap.isOpened():
-                    _camera_log(
-                        self.camera_id,
-                        f"[RTSP][{stream_type.upper()}] disconnected",
-                    )
-                    if cap is not None:
-                        cap.release()
-                    self.stop_event.wait(5)
-                    continue
-                _camera_log(
-                    self.camera_id,
-                    f"[RTSP][{stream_type.upper()}] connected",
-                )
-                failures = 0
-                while not shutdown_event.is_set() and not self.stop_event.is_set():
-                    ok, frame = cap.read()
-                    if ok and frame is not None:
-                        failures = 0
-                        camera_frame_store.publish(
-                            self.camera_id, stream_type, frame,
-                        )
-                        continue
-                    failures += 1
-                    if failures >= MAX_CONSECUTIVE_READ_FAILURES:
-                        _camera_log(
-                            self.camera_id,
-                            f"[RTSP][{stream_type.upper()}] disconnected",
-                        )
-                        break
-                    self.stop_event.wait(0.05)
-            except Exception as error:
-                _camera_log(
-                    self.camera_id,
-                    f"[RTSP][{stream_type.upper()}] error={error}",
-                )
-            finally:
-                if cap is not None:
-                    cap.release()
-            if not self.stop_event.is_set() and not shutdown_event.is_set():
-                self.stop_event.wait(2)
-
-    def read_latest_main(self, last_frame_id):
-        return camera_frame_store.wait_for_new(
-            self.camera_id,
-            "main",
-            after_frame_id=last_frame_id,
-            timeout=0.2,
-        )
-
-    def latest(self, stream_type):
-        return camera_frame_store.get(self.camera_id, stream_type)
-
-    def release(self):
-        self.stop_event.set()
-        for thread in self.threads:
-            thread.join(timeout=2)
-
-
-class _LatestMainCaptureProxy:
-    def __init__(self, dual_capture):
-        self.dual_capture = dual_capture
-        self.last_frame_id = 0
-        self.last_packet = None
-
-    def isOpened(self):
-        return not self.dual_capture.stop_event.is_set()
-
-    def read(self):
-        packet = self.dual_capture.read_latest_main(self.last_frame_id)
-        if packet is None:
-            return False, None
-        self.last_frame_id = packet["frame_id"]
-        self.last_packet = packet
-        return True, packet["frame"]
-
-    def release(self):
-        self.dual_capture.release()
 
 
 # ============================================================
@@ -755,21 +603,6 @@ def build_rtsp_url(camera_config):
         NVR_PASSWORD,
         safe=""
     )
-
-    main_stream = (camera_config.get("streams") or {}).get("main") or {}
-    configured_url = str(
-        main_stream.get("rtsp_url") or camera_config.get("rtsp_url") or ""
-    ).strip()
-    if configured_url:
-        parsed = urlsplit(configured_url)
-        scheme = parsed.scheme or "rtsp"
-        port = parsed.port or RTSP_PORT
-        host_path = (
-            f"{camera_config.get('nvr_ip', DEFAULT_NVR_IP)}:{port}{parsed.path}"
-        )
-        return (
-            f"{scheme}://{user}:{password}@{host_path}"
-        )
 
     channel = int(camera_config.get("channel", 1))
     subtype = int(camera_config.get("subtype", 1))
@@ -3264,8 +3097,6 @@ def camera_worker(camera_config, rtsp_url=None):
     last_frame_diagnostic_time = 0.0
     last_latency_diagnostic_time = 0.0
     last_rtsp_debug_time = 0.0
-    dual_capture = None
-
     emit_interval = (
         1.0 / max(SOCKET_LIVE_FPS, 1.0)
     )
@@ -3276,37 +3107,28 @@ def camera_worker(camera_config, rtsp_url=None):
         cap = None
         try:
 
-            if _dual_stream_for_camera(camera_config):
-                if dual_capture is None:
-                    dual_capture = _DualStreamCapture(camera_config)
-                    with camera_capture_lock:
-                        camera_stream_captures[camera_id] = dual_capture
-                    dual_capture.start()
-                cap = _LatestMainCaptureProxy(dual_capture)
-                _camera_log(camera_id, "[DUAL-STREAM] MAIN/SUB latest-frame capture active")
-            else:
+            _camera_log(
+                camera_id,
+                (
+                    f"Connecting to NVR={camera_config['nvr_ip']} "
+                    f"CHANNEL={camera_config['channel']} "
+                    f"SUBTYPE={camera_config['subtype']}"
+                ),
+            )
+            if RTSP_DEBUG:
                 _camera_log(
                     camera_id,
-                    (
-                        f"Connecting to NVR={camera_config['nvr_ip']} "
-                        f"CHANNEL={camera_config['channel']} "
-                        f"SUBTYPE={camera_config['subtype']}"
-                    ),
+                    f"[RTSP OPEN] camera={camera_id} channel={camera_config['channel']} "
+                    f"subtype={camera_config['subtype']} url={_redact_rtsp_url(rtsp_url)}",
                 )
-                if RTSP_DEBUG:
-                    _camera_log(
-                        camera_id,
-                        f"[RTSP OPEN] camera={camera_id} channel={camera_config['channel']} "
-                        f"subtype={camera_config['subtype']} url={_redact_rtsp_url(rtsp_url)}",
-                    )
-                cap = cv2.VideoCapture(
-                    rtsp_url,
-                    cv2.CAP_FFMPEG,
-                    [
-                        cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 10000,
-                        cv2.CAP_PROP_READ_TIMEOUT_MSEC, 10000,
-                    ]
-                )
+            cap = cv2.VideoCapture(
+                rtsp_url,
+                cv2.CAP_FFMPEG,
+                [
+                    cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 10000,
+                    cv2.CAP_PROP_READ_TIMEOUT_MSEC, 10000,
+                ]
+            )
             with camera_capture_lock:
                 camera_captures[camera_id] = cap
 
@@ -3422,22 +3244,7 @@ def camera_worker(camera_config, rtsp_url=None):
                     try:
 
                         person_frame = frame
-                        if dual_capture is not None:
-                            sub_packet = dual_capture.latest("sub")
-                            if sub_packet is not None:
-                                sub_age_ms = max(
-                                    0.0,
-                                    (time.time() - sub_packet["capture_timestamp"]) * 1000.0,
-                                )
-                                if sub_age_ms <= MAX_AI_FRAME_AGE_MS:
-                                    person_frame = sub_packet["frame"]
                         person_boxes = detect_person_boxes(person_frame)
-                        if person_frame is not frame:
-                            person_boxes = _scale_person_boxes(
-                                person_boxes,
-                                person_frame.shape,
-                                frame.shape,
-                            )
                         next_person_track_id = _update_person_tracks(
                             person_tracks,
                             person_boxes,
@@ -4762,9 +4569,6 @@ def camera_worker(camera_config, rtsp_url=None):
 
             if cap is not None:
                 _release_camera_capture(camera_id)
-            dual_capture = None
-
-
         except Exception as e:
 
             camera_status = (
@@ -4781,7 +4585,6 @@ def camera_worker(camera_config, rtsp_url=None):
 
             if cap is not None:
                 _release_camera_capture(camera_id)
-            dual_capture = None
             shutdown_event.wait(5)
 
 
