@@ -34,7 +34,8 @@ from typing import Any
 
 import psycopg
 from psycopg import sql
-
+from dotenv import load_dotenv
+load_dotenv()
 
 # -----------------------------
 # PostgreSQL schema
