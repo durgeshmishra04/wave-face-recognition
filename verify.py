@@ -2,7 +2,8 @@ import os
 import sqlite3
 import hashlib
 import psycopg
-
+from dotenv import load_dotenv
+load_dotenv()
 
 SQLITE_DB = "known_faces.db"
 
