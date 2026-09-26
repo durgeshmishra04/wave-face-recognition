@@ -4,6 +4,54 @@ import threading
 import time
 
 
+class LatestFrameStore:
+    """Bounded latest-frame storage shared by camera capture and AI workers."""
+
+    def __init__(self):
+        self._frames = {}
+        self._conditions = {}
+        self._lock = threading.Lock()
+
+    def publish(self, camera_id, stream_type, frame):
+        key = (str(camera_id), str(stream_type).lower())
+        with self._lock:
+            frame_id = self._frames.get(key, {}).get("frame_id", 0) + 1
+            packet = {
+                "frame": frame,
+                "frame_id": frame_id,
+                "capture_timestamp": time.time(),
+                "stream_type": key[1],
+                "camera_id": key[0],
+            }
+            self._frames[key] = packet
+            condition = self._conditions.setdefault(key, threading.Condition())
+        with condition:
+            condition.notify_all()
+        return packet
+
+    def get(self, camera_id, stream_type="main", after_frame_id=None):
+        key = (str(camera_id), str(stream_type).lower())
+        with self._lock:
+            packet = self._frames.get(key)
+            if packet is None:
+                return None
+            if after_frame_id is not None and packet["frame_id"] <= after_frame_id:
+                return None
+            return packet
+
+    def wait_for_new(self, camera_id, stream_type="main", after_frame_id=None,
+                     timeout=0.2):
+        packet = self.get(camera_id, stream_type, after_frame_id)
+        if packet is not None:
+            return packet
+        key = (str(camera_id), str(stream_type).lower())
+        with self._lock:
+            condition = self._conditions.setdefault(key, threading.Condition())
+        with condition:
+            condition.wait(timeout=max(0.0, float(timeout)))
+        return self.get(camera_id, stream_type, after_frame_id)
+
+
 class ManagedWorker:
     def __init__(self, camera_config, target, release_resources, rtsp_url=None):
         self.camera_config = camera_config
@@ -35,18 +83,22 @@ class CameraManager:
     """Create, start, stop, and inspect one worker per enabled camera."""
 
     def __init__(self, cameras, worker_target, shutdown_event=None,
-                 release_resources=None, rtsp_url_builder=None):
+                 release_resources=None, rtsp_url_builder=None,
+                 frame_store=None):
         self.cameras = list(cameras)
         self.worker_target = worker_target
         self.shutdown_event = shutdown_event or threading.Event()
         self.release_resources = release_resources or (lambda camera_id: None)
         self.rtsp_url_builder = rtsp_url_builder
+        self.frame_store = frame_store or LatestFrameStore()
         self.workers = {}
         self._stop_lock = threading.Lock()
         self._stopped = False
 
     def start(self):
         for camera_config in self.cameras:
+            if not camera_config.get("enabled", False):
+                continue
             camera_id = camera_config["camera_id"]
             if camera_id in self.workers:
                 continue
@@ -90,6 +142,9 @@ class CameraManager:
 
     def worker(self, camera_id):
         return self.workers.get(camera_id)
+
+    def get_latest_frame(self, camera_id, stream="main"):
+        return self.frame_store.get(camera_id, stream)
 
 
 __all__ = ["CameraManager"]

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import io
-import sqlite3
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,12 +11,14 @@ from types import SimpleNamespace
 
 import cv2
 import numpy as np
+import psycopg
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
-DB_PATH = PROJECT_DIR / "known_faces" / "known_faces.db"
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
+
+from database import get_postgres_config
 
 
 @dataclass
@@ -38,9 +39,8 @@ def _parse_args():
 
 
 def _read_only_connection():
-    if not DB_PATH.is_file():
-        raise FileNotFoundError(f"Database not found: {DB_PATH}")
-    return sqlite3.connect(f"file:{DB_PATH.as_posix()}?mode=ro", uri=True)
+    config = get_postgres_config()
+    return psycopg.connect(**config)
 
 
 def _import_production_face_helpers():
@@ -318,13 +318,13 @@ def main():
     else:
         print(
             "RESULT: BEST MATCH IS BELOW THRESHOLD.\n"
-            "SQLite is being searched, but the supplied image embedding is not "
+            "The database is being searched, but the supplied image embedding is not "
             "sufficiently similar to any registered template."
         )
     print(
         "If this is an exact copy of a registration image, its matching "
         "template should normally be extremely close to 1.0. A low camera "
-        "score alone does not prove SQLite is broken."
+        "score alone does not prove the database is broken."
     )
     print(f"Temporary diagnostic file: {Path(__file__).resolve()}")
     print("========================================")

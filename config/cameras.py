@@ -11,36 +11,57 @@ CAMERA_CONFIG_PATH = PROJECT_ROOT / "config" / "cameras.json"
 
 
 def load_cameras(config_path=CAMERA_CONFIG_PATH):
-    """Load cameras while preserving the existing environment overrides."""
+    """Load camera definitions while preserving environment overrides."""
     with Path(config_path).open("r", encoding="utf-8") as config_file:
         configured = json.load(config_file)
 
     cameras = []
+    seen_camera_ids = set()
+    seen_channels = set()
+
     for item in configured:
-        camera_id = str(item["camera_id"]).strip()
-        if not camera_id or any(
-            camera_id == existing["camera_id"] for existing in cameras
-        ):
-            raise ValueError(f"Duplicate or empty camera_id: {camera_id!r}")
-        cameras.append({
+        camera_id = str(item.get("camera_id", "")).strip()
+        if not camera_id:
+            raise ValueError("Camera entry is missing camera_id")
+        if camera_id in seen_camera_ids:
+            raise ValueError(f"Duplicate camera_id: {camera_id!r}")
+        seen_camera_ids.add(camera_id)
+
+        name = str(item.get("name", "")).strip()
+        if not name:
+            raise ValueError(f"Camera entry is missing name for {camera_id!r}")
+
+        nvr_ip = os.getenv(f"{camera_id}_NVR_IP", item.get("nvr_ip", DEFAULT_NVR_IP))
+        channel = int(os.getenv(f"{camera_id}_CHANNEL", str(item.get("channel", 1))))
+        if channel in seen_channels:
+            raise ValueError(f"Duplicate channel value: {channel} used by {camera_id!r}")
+        seen_channels.add(channel)
+
+        subtype = int(os.getenv(f"{camera_id}_SUBTYPE", str(item.get("subtype", 1))))
+        if subtype not in {1, 2}:
+            raise ValueError(f"Invalid subtype {subtype!r} for {camera_id!r}; expected 1 or 2")
+
+        enabled_value = os.getenv(
+            f"{camera_id}_ENABLED",
+            str(bool(item.get("enabled", False))),
+        )
+        enabled = enabled_value.strip().lower() not in {"false", "0", "no", "off", ""}
+        if not isinstance(item.get("enabled", enabled), bool):
+            # Keep the configuration contract strict while preserving env overrides.
+            if not isinstance(item.get("enabled", True), bool):
+                raise ValueError(f"Invalid enabled flag for {camera_id!r}")
+
+        camera = {
             "camera_id": camera_id,
-            "name": str(item["name"]).strip(),
-            "nvr_ip": os.getenv(
-                f"{camera_id}_NVR_IP",
-                item.get("nvr_ip", DEFAULT_NVR_IP),
-            ),
-            "channel": int(os.getenv(
-                f"{camera_id}_CHANNEL", str(item.get("channel", 1))
-            )),
-            "subtype": int(os.getenv(
-                f"{camera_id}_SUBTYPE", str(item.get("subtype", 1))
-            )),
+            "name": name,
+            "ip": item.get("ip"),
+            "nvr_ip": nvr_ip,
             "kpi": str(item.get("kpi", "person")).strip().lower(),
-            "enabled": os.getenv(
-                f"{camera_id}_ENABLED",
-                "true" if item.get("enabled", True) else "false",
-            ).strip().lower() not in {"false", "0", "no", "off"},
-        })
+            "enabled": enabled,
+            "channel": channel,
+            "subtype": subtype,
+        }
+        cameras.append(camera)
 
     enabled_override = os.getenv("ENABLED_CAMERAS", "").strip()
     if enabled_override:
@@ -67,15 +88,14 @@ CAMERAS = load_cameras()
 
 
 def enabled_cameras():
-    return [camera for camera in CAMERAS if camera.get("enabled", True)]
+    return [camera for camera in CAMERAS if camera.get("enabled", False)]
 
 
 def camera_by_id(camera_id):
     if camera_id:
         normalized = str(camera_id).strip().lower()
         return next(
-            (camera for camera in CAMERAS
-             if camera["camera_id"].lower() == normalized),
+            (camera for camera in CAMERAS if camera["camera_id"].lower() == normalized),
             None,
         )
     return None

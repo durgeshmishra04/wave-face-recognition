@@ -5,10 +5,9 @@ import threading
 import base64
 import hmac
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 from urllib.parse import urlencode
 from urllib.request import HTTPDigestAuthHandler, HTTPPasswordMgrWithDefaultRealm, build_opener
-import sqlite3
 import json
 import hashlib
 import io
@@ -41,10 +40,11 @@ from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 from flask_socketio import SocketIO, join_room, leave_room
 
+from database import validate_postgres_connection
 from insightface.app import FaceAnalysis
 from detection_database import DetectionDatabase
 from detection_events import DetectionEventManager
-from camera.manager import CameraManager
+from camera.manager import CameraManager, LatestFrameStore
 from config.cameras import CAMERAS, enabled_cameras
 from roi.camera_rois import get_camera_roi
 from fall_detection import FallDetector
@@ -165,7 +165,7 @@ PERSON_DEDUP_IOU = float(os.getenv("PERSON_DEDUP_IOU", "0.50"))
 USE_GPU = os.getenv("USE_GPU", "auto").strip().lower()
 CUDA_DEVICE_ID = int(os.getenv("CUDA_DEVICE_ID", "0"))
 VEHICLE_MODEL_PATH = "yolo26l.pt"
-VEHICLE_CONFIDENCE = 0.35
+VEHICLE_CONFIDENCE = 0.45
 VEHICLE_DEVICE = f"cuda:{CUDA_DEVICE_ID}"
 TWO_WHEELER_CLASSES = {
     "motorcycle"
@@ -227,6 +227,14 @@ PUBLIC_BASE_URL = os.getenv(
 STREAM_JPEG_QUALITY = 65
 STREAM_MAX_WIDTH = 800
 STREAM_TARGET_FPS = 10
+SOCKET_LIVE_FPS = float(os.getenv("SOCKET_LIVE_FPS", "8"))
+SOCKET_JPEG_QUALITY = int(os.getenv("SOCKET_JPEG_QUALITY", "70"))
+MAIN_FRAME_MAX_AGE_MS = int(os.getenv("MAIN_FRAME_MAX_AGE_MS", "2000"))
+MAX_AI_FRAME_AGE_MS = int(os.getenv("MAX_AI_FRAME_AGE_MS", "2000"))
+MAX_SOCKET_FRAME_AGE_MS = int(os.getenv("MAX_SOCKET_FRAME_AGE_MS", "2000"))
+VIDEO_LATENCY_DEBUG = os.getenv("VIDEO_LATENCY_DEBUG", "false").strip().lower() in {
+    "1", "true", "yes", "on"
+}
 MAX_CONSECUTIVE_READ_FAILURES = 5
 
 UNKNOWN_GONE_CLEARANCE = 5.0
@@ -267,6 +275,12 @@ os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
 
 app = Flask(__name__)
 
+try:
+    validate_postgres_connection()
+except RuntimeError as exc:
+    print(f"[ERROR] PostgreSQL database connection failed: {exc}")
+    raise
+
 CORS(app)
 
 socketio = SocketIO(
@@ -294,6 +308,9 @@ camera_state_lock = threading.Lock()
 camera_manager = None
 camera_captures = {}
 camera_capture_lock = threading.Lock()
+camera_frame_store = LatestFrameStore()
+latest_socket_frames = {}
+latest_socket_frame_lock = threading.Lock()
 gpu_inference_lock = threading.RLock()
 face_inference_lock = gpu_inference_lock
 shutdown_started = False
@@ -365,6 +382,26 @@ def _camera_room(camera_id):
 def _camera_log(camera_id, message):
 
     print(f"[{camera_id}] {message}")
+
+
+def _queue_latest_socket_frame(payload):
+    """Replace a live preview payload instead of queueing video frames."""
+    with latest_socket_frame_lock:
+        latest_socket_frames[payload["camera_id"]] = payload
+
+
+def _socket_frame_emitter():
+    interval = 1.0 / max(SOCKET_LIVE_FPS, 1.0)
+    while not shutdown_event.is_set():
+        with latest_socket_frame_lock:
+            pending = list(latest_socket_frames.values())
+            latest_socket_frames.clear()
+        for payload in pending:
+            try:
+                socketio.emit("face_frame", payload)
+            except Exception as error:
+                print(f"[SOCKET] live frame emit failed: {error}")
+        shutdown_event.wait(interval)
 
 
 def _should_run_kpi(camera_id, kpi_name):
@@ -463,6 +500,7 @@ def _release_camera_capture(camera_id):
     if cap is not None:
         cap.release()
         _camera_log(camera_id, "RTSP released")
+
 
 
 # ============================================================
@@ -794,12 +832,7 @@ def initialize_object_theft_detector():
 # KNOWN FACE DATABASE
 # ============================================================
 
-DB_FILENAME = (
-    KNOWN_FACES_DIR /
-    "known_faces.db"
-)
-
-detection_database = DetectionDatabase(DB_FILENAME)
+detection_database = DetectionDatabase()
 
 
 def normalize_embedding(embedding):
@@ -829,16 +862,9 @@ def _open_db():
         exist_ok=True
     )
 
-    conn = sqlite3.connect(
-        str(DB_FILENAME)
-    )
+    from database import get_db_connection
 
-    conn.execute("PRAGMA foreign_keys=ON;")
-    conn.execute(
-        "PRAGMA journal_mode=WAL;"
-    )
-
-    return conn
+    return get_db_connection()
 
 
 def _ensure_table(conn):
@@ -847,10 +873,10 @@ def _ensure_table(conn):
         """
         CREATE TABLE IF NOT EXISTS known_embeddings (
             person TEXT PRIMARY KEY,
-            embedding BLOB,
+            embedding BYTEA,
             image_paths TEXT,
             fingerprint TEXT,
-            updated_at REAL
+            updated_at DOUBLE PRECISION
         )
         """
     )
@@ -858,8 +884,8 @@ def _ensure_table(conn):
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS detection_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            detected_at REAL NOT NULL,
+            id SERIAL PRIMARY KEY,
+            detected_at DOUBLE PRECISION NOT NULL,
             known_count INTEGER NOT NULL DEFAULT 0,
             unknown_count INTEGER NOT NULL DEFAULT 0,
             two_wheeler_count INTEGER NOT NULL DEFAULT 0,
@@ -871,15 +897,15 @@ def _ensure_table(conn):
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS registered_persons (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             registration_id TEXT NOT NULL UNIQUE,
             storage_key TEXT NOT NULL UNIQUE,
             gate_no TEXT NOT NULL,
             employee_id TEXT UNIQUE,
             employee_name TEXT NOT NULL,
             designation TEXT NOT NULL,
-            created_at REAL NOT NULL,
-            updated_at REAL NOT NULL
+            created_at DOUBLE PRECISION NOT NULL,
+            updated_at DOUBLE PRECISION NOT NULL
         )
         """
     )
@@ -887,12 +913,12 @@ def _ensure_table(conn):
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS registered_face_embeddings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             registration_id TEXT NOT NULL,
             image_number INTEGER NOT NULL,
             image_path TEXT NOT NULL,
-            embedding BLOB NOT NULL,
-            created_at REAL NOT NULL,
+            embedding BYTEA NOT NULL,
+            created_at DOUBLE PRECISION NOT NULL,
             UNIQUE (registration_id, image_number)
         )
         """
@@ -901,12 +927,12 @@ def _ensure_table(conn):
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS auth_accounts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             role TEXT NOT NULL CHECK (role IN ('admin', 'user')),
             username TEXT NOT NULL UNIQUE,
             password_hash TEXT NOT NULL,
-            created_at REAL NOT NULL,
-            updated_at REAL NOT NULL
+            created_at DOUBLE PRECISION NOT NULL,
+            updated_at DOUBLE PRECISION NOT NULL
         )
         """
     )
@@ -914,15 +940,15 @@ def _ensure_table(conn):
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS fcm_device_tokens (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             account_id INTEGER NOT NULL,
             role TEXT NOT NULL CHECK (role IN ('admin', 'user')),
             fcm_token TEXT NOT NULL UNIQUE,
             is_active INTEGER NOT NULL DEFAULT 1,
-            created_at REAL NOT NULL,
-            updated_at REAL NOT NULL,
-            last_login_at REAL,
-            last_logout_at REAL,
+            created_at DOUBLE PRECISION NOT NULL,
+            updated_at DOUBLE PRECISION NOT NULL,
+            last_login_at DOUBLE PRECISION,
+            last_logout_at DOUBLE PRECISION,
             FOREIGN KEY (account_id) REFERENCES auth_accounts(id)
                 ON DELETE CASCADE
         )
@@ -1711,7 +1737,7 @@ def _save_embedding_db(
 
         conn.execute(
             """
-            REPLACE INTO known_embeddings
+            INSERT INTO known_embeddings
             (
                 person,
                 embedding,
@@ -1719,11 +1745,17 @@ def _save_embedding_db(
                 fingerprint,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (person)
+            DO UPDATE SET
+                embedding = EXCLUDED.embedding,
+                image_paths = EXCLUDED.image_paths,
+                fingerprint = EXCLUDED.fingerprint,
+                updated_at = EXCLUDED.updated_at
             """,
             (
                 person,
-                sqlite3.Binary(blob),
+                blob,
                 json.dumps(
                     [
                         str(p)
@@ -2698,6 +2730,19 @@ def detect_person_boxes(frame):
     )
     return deduplicated
 
+def _scale_person_boxes(person_boxes, source_shape, target_shape):
+    source_height, source_width = source_shape[:2]
+    target_height, target_width = target_shape[:2]
+    scale_x = target_width / max(float(source_width), 1.0)
+    scale_y = target_height / max(float(source_height), 1.0)
+    scaled = []
+    for box, score in person_boxes:
+        values = np.asarray(box, dtype=np.float32)
+        values[[0, 2]] *= scale_x
+        values[[1, 3]] *= scale_y
+        scaled.append((values.astype(np.int32), score))
+    return scaled
+
 
 def _is_plausible_vehicle_box(box, frame_shape):
     """Reject wall/structural false positives that share a vehicle label but not a vehicle shape."""
@@ -3050,11 +3095,10 @@ def camera_worker(camera_config, rtsp_url=None):
 
     last_emit_time = 0.0
     last_frame_diagnostic_time = 0.0
+    last_latency_diagnostic_time = 0.0
     last_rtsp_debug_time = 0.0
-
     emit_interval = (
-        1.0 /
-        STREAM_TARGET_FPS
+        1.0 / max(SOCKET_LIVE_FPS, 1.0)
     )
 
 
@@ -3077,15 +3121,12 @@ def camera_worker(camera_config, rtsp_url=None):
                     f"[RTSP OPEN] camera={camera_id} channel={camera_config['channel']} "
                     f"subtype={camera_config['subtype']} url={_redact_rtsp_url(rtsp_url)}",
                 )
-
             cap = cv2.VideoCapture(
                 rtsp_url,
                 cv2.CAP_FFMPEG,
                 [
-                    cv2.CAP_PROP_OPEN_TIMEOUT_MSEC,
-                    10000,
-                    cv2.CAP_PROP_READ_TIMEOUT_MSEC,
-                    10000,
+                    cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 10000,
+                    cv2.CAP_PROP_READ_TIMEOUT_MSEC, 10000,
                 ]
             )
             with camera_capture_lock:
@@ -3101,7 +3142,7 @@ def camera_worker(camera_config, rtsp_url=None):
                     connected=False,
                     latest_update_at=time.time(),
                 )
-                _camera_log(camera_id, "Could not open RTSP stream.")
+                _camera_log(camera_id, "Could not open MAIN RTSP stream.")
                 _release_camera_capture(camera_id)
 
                 shutdown_event.wait(5)
@@ -3155,6 +3196,23 @@ def camera_worker(camera_config, rtsp_url=None):
 
 
                 consecutive_read_failures = 0
+                frame_processing_started_at = time.time()
+
+                main_packet = getattr(cap, "last_packet", None)
+                frame_age_ms = (
+                    max(0.0, (time.time() - main_packet["capture_timestamp"]) * 1000.0)
+                    if main_packet is not None
+                    else 0.0
+                )
+                if (
+                    main_packet is not None
+                    and frame_age_ms > min(MAIN_FRAME_MAX_AGE_MS, MAX_AI_FRAME_AGE_MS)
+                ):
+                    _camera_log(
+                        camera_id,
+                        f"[VIDEO] stale MAIN frame dropped age_ms={frame_age_ms:.0f}",
+                    )
+                    continue
 
                 if RTSP_DEBUG and (time.time() - last_rtsp_debug_time >= 5.0):
                     small = cv2.resize(frame, (64, 36), interpolation=cv2.INTER_AREA)
@@ -3185,7 +3243,8 @@ def camera_worker(camera_config, rtsp_url=None):
 
                     try:
 
-                        person_boxes = detect_person_boxes(frame)
+                        person_frame = frame
+                        person_boxes = detect_person_boxes(person_frame)
                         next_person_track_id = _update_person_tracks(
                             person_tracks,
                             person_boxes,
@@ -3394,7 +3453,25 @@ def camera_worker(camera_config, rtsp_url=None):
                             )
                         ]
 
-                        detected_faces = safe_face_inference(frame)
+                        person_in_roi = any(
+                            face_in_roi(
+                                person_box,
+                                frame.shape[1],
+                                frame.shape[0],
+                                camera_id=camera_id,
+                            )
+                            for person_box, _score in person_boxes
+                        )
+                        detected_faces = (
+                            safe_face_inference(frame)
+                            if person_in_roi
+                            else []
+                        )
+                        if not person_in_roi:
+                            _camera_log(
+                                camera_id,
+                                "[FACE] skipped: no person in ROI",
+                            )
 
                         if detected_faces:
                             _camera_log(
@@ -4399,12 +4476,13 @@ def camera_worker(camera_config, rtsp_url=None):
                     # JPEG encode
                     # --------------------------------------------
 
+                    jpeg_started_at = time.time()
                     success, encoded = cv2.imencode(
                         ".jpg",
                         send_frame,
                         [
                             cv2.IMWRITE_JPEG_QUALITY,
-                            STREAM_JPEG_QUALITY
+                            SOCKET_JPEG_QUALITY
                         ]
                     )
 
@@ -4443,41 +4521,54 @@ def camera_worker(camera_config, rtsp_url=None):
                         # Socket.IO live frame
                         # ----------------------------------------
 
-                        socketio.emit(
-                            "face_frame",
-                            {
-                                "camera_id": camera_id,
-                                "camera_name": camera_name,
-                                "image":
-                                    base64.b64encode(
-                                        encoded_bytes
-                                    ).decode("utf-8"),
-
-                                "width":
-                                    send_frame.shape[1],
-
-                                "height":
-                                    send_frame.shape[0],
-
-                                "faces":
-                                    faces_payload,
-
-                                "vehicles":
-                                    vehicles_payload,
-
-                                "status":
-                                    camera_status,
-
-                                "timestamp":
-                                    now
-                            }
+                        socket_age_ms = (
+                            max(0.0, (time.time() - main_packet["capture_timestamp"]) * 1000.0)
+                            if main_packet is not None
+                            else 0.0
                         )
+                        socket_ms = 0.0
+                        if socket_age_ms <= MAX_SOCKET_FRAME_AGE_MS:
+                            socket_started_at = time.time()
+                            _queue_latest_socket_frame(
+                                {
+                                    "camera_id": camera_id,
+                                    "camera_name": camera_name,
+                                    "image": base64.b64encode(encoded_bytes).decode("utf-8"),
+                                    "width": send_frame.shape[1],
+                                    "height": send_frame.shape[0],
+                                    "faces": faces_payload,
+                                    "vehicles": vehicles_payload,
+                                    "status": camera_status,
+                                    "timestamp": now,
+                                    "frame_id": (
+                                        main_packet["frame_id"]
+                                        if main_packet is not None else frame_counter
+                                    ),
+                                    "stream": "main",
+                                }
+                            )
+                            socket_ms = (time.time() - socket_started_at) * 1000.0
+                        elif VIDEO_LATENCY_DEBUG:
+                            _camera_log(
+                                camera_id,
+                                f"[VIDEO-LATENCY] socket frame dropped age_ms={socket_age_ms:.0f}",
+                            )
+                            socket_ms = 0.0
+                        if VIDEO_LATENCY_DEBUG and now - last_latency_diagnostic_time >= 5.0:
+                            _camera_log(
+                                camera_id,
+                                "[VIDEO-LATENCY] "
+                                f"stream=MAIN frame_id={main_packet['frame_id'] if main_packet else frame_counter} "
+                                f"age_ms={socket_age_ms:.0f} "
+                                f"ai_ms={(jpeg_started_at - frame_processing_started_at) * 1000.0:.1f} "
+                                f"jpeg_ms={(time.time() - jpeg_started_at) * 1000.0:.1f} "
+                                f"socket_ms={socket_ms:.1f}",
+                            )
+                            last_latency_diagnostic_time = now
 
 
             if cap is not None:
                 _release_camera_capture(camera_id)
-
-
         except Exception as e:
 
             camera_status = (
@@ -4872,11 +4963,11 @@ def _save_registered_person(gate_no, employee_name, designation, employee_id,
                 INSERT INTO registered_face_embeddings (
                     registration_id, image_number, image_path, embedding,
                     created_at
-                ) VALUES (?, ?, ?, ?, ?)
+                ) VALUES (%s, %s, %s, %s, %s)
                 """,
                 (
                     registration_id, number, str(path),
-                    sqlite3.Binary(_embedding_blob(embedding)), now,
+                    _embedding_blob(embedding), now,
                 ),
             )
         # This is the legacy compatibility record used by the app and DB
@@ -4884,12 +4975,18 @@ def _save_registered_person(gate_no, employee_name, designation, employee_id,
         # every stored template in registered_face_embeddings.
         conn.execute(
             """
-            REPLACE INTO known_embeddings (
+            INSERT INTO known_embeddings (
                 person, embedding, image_paths, fingerprint, updated_at
-            ) VALUES (?, ?, ?, ?, ?)
+            ) VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (person)
+            DO UPDATE SET
+                embedding = EXCLUDED.embedding,
+                image_paths = EXCLUDED.image_paths,
+                fingerprint = EXCLUDED.fingerprint,
+                updated_at = EXCLUDED.updated_at
             """,
             (
-                storage_key, sqlite3.Binary(_embedding_blob(embeddings[0])),
+                storage_key, _embedding_blob(embeddings[0]),
                 json.dumps([str(path) for path in final_paths]), fingerprint, now,
             ),
         )
@@ -5892,6 +5989,13 @@ def main():
 
     initialize_firebase()
     initialize_camera_states()
+    latest_socket_frames.clear()
+    socket_frame_thread = threading.Thread(
+        target=_socket_frame_emitter,
+        name="socket-live-frame-emitter",
+        daemon=True,
+    )
+    socket_frame_thread.start()
 
 
     # ----------------------------------------
@@ -5926,6 +6030,7 @@ def main():
         shutdown_event=shutdown_event,
         release_resources=_release_camera_capture,
         rtsp_url_builder=build_rtsp_url,
+        frame_store=camera_frame_store,
     )
     camera_manager.start()
 
@@ -6000,6 +6105,7 @@ def main():
         shutdown_event.set()
         print("[INFO] Stopping camera workers...")
         camera_manager.stop_all(timeout=5)
+    socket_frame_thread.join(timeout=2)
     print("[INFO] Flask/Socket.IO shutdown complete")
 
 

@@ -1,20 +1,16 @@
-import sqlite3
 import time
-from pathlib import Path
+
+from database import get_db_connection
 
 
 class DetectionDatabase:
 
-    def __init__(self, database_path):
-        self.database_path = Path(database_path)
-        self.database_path.parent.mkdir(parents=True, exist_ok=True)
+    def __init__(self, database_path=None):
+        self.database_path = database_path
         self.ensure_schema()
 
     def connect(self):
-        connection = sqlite3.connect(str(self.database_path))
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode=WAL;")
-        return connection
+        return get_db_connection()
 
     def ensure_schema(self):
         connection = self.connect()
@@ -22,28 +18,32 @@ class DetectionDatabase:
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS detection_records (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    detected_at REAL NOT NULL,
+                    id SERIAL PRIMARY KEY,
+                    detected_at DOUBLE PRECISION NOT NULL,
                     detection_type TEXT NOT NULL,
                     person_id TEXT,
                     person_name TEXT,
                     vehicle_type TEXT,
                     vehicle_class TEXT,
-                    confidence REAL,
+                    confidence DOUBLE PRECISION,
                     unknown_count INTEGER,
                     camera_id TEXT,
                     camera_name TEXT,
                     gate_name TEXT NOT NULL,
                     image_url TEXT,
-                    created_at REAL NOT NULL
+                    created_at DOUBLE PRECISION NOT NULL
                 )
                 """
             )
             columns = {
-                row["name"]
+                row[0]
                 for row in connection.execute(
-                    "PRAGMA table_info(detection_records)"
-                )
+                    """
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_name = 'detection_records'
+                    """
+                ).fetchall()
             }
             if "unknown_count" not in columns:
                 connection.execute(
@@ -92,7 +92,8 @@ class DetectionDatabase:
                     gate_name,
                     image_url,
                     created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
                 """,
                 (
                     event.get("detected_at", time.time()),
@@ -111,7 +112,8 @@ class DetectionDatabase:
                 ),
             )
             connection.commit()
-            return cursor.lastrowid
+            row = cursor.fetchone()
+            return row[0] if row else None
         finally:
             connection.close()
 
@@ -129,19 +131,36 @@ class DetectionDatabase:
             """
             params = []
             if camera_id:
-                query += " WHERE camera_id = ? OR camera_id IS NULL"
+                query += " WHERE camera_id = %s OR camera_id IS NULL"
                 params.append(camera_id)
             query += " ORDER BY detected_at DESC, id DESC"
-            rows = connection.execute(
-                f"{query} LIMIT ?" if limit else query,
-                tuple(params + [limit]) if limit else tuple(params),
-            ).fetchall()
+            if limit:
+                query += " LIMIT %s"
+                params.append(limit)
+            cursor = connection.execute(query, tuple(params))
+            rows = cursor.fetchall()
         finally:
             connection.close()
 
         detections = []
+        names = [
+            "id",
+            "detected_at",
+            "detection_type",
+            "person_id",
+            "person_name",
+            "vehicle_type",
+            "vehicle_class",
+            "confidence",
+            "unknown_count",
+            "camera_id",
+            "camera_name",
+            "gate_name",
+            "image_url",
+            "created_at",
+        ]
         for row in rows:
-            item = dict(row)
+            item = dict(zip(names, row))
             item["type"] = item.pop("detection_type")
             item["time"] = time.strftime(
                 "%Y-%m-%d %H:%M:%S",
