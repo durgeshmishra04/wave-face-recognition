@@ -291,8 +291,11 @@ class DetectionEventManager:
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
         else:
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-        # A solid color label with thick white text remains readable in the
-        # image downloaded by Android and in the Firebase notification.
+        text_color = (
+            (0, 0, 0)
+            if event["detection_type"] == "known_person"
+            else (255, 255, 255)
+        )
         (text_width, text_height), baseline = cv2.getTextSize(
             label,
             cv2.FONT_HERSHEY_SIMPLEX,
@@ -314,7 +317,7 @@ class DetectionEventManager:
             (x1 + 6, label_bottom - baseline - 5),
             cv2.FONT_HERSHEY_SIMPLEX,
             .65,
-            (255, 255, 255),
+            text_color,
             3,
             cv2.LINE_AA,
         )
