@@ -99,15 +99,20 @@ class DetectionEventManager:
     def _update_track(self, tracks, category, event, frame, now):
         is_person = category == "person"
         incoming_state = None
+        identity_name = event.get("person_name", "Unknown")
+        has_face = bool(event.get("annotation_box"))
         if is_person:
             incoming_state = event.get("recognition_state")
             if incoming_state not in {"PENDING", "UNKNOWN", "KNOWN"}:
                 if event.get("detection_type") == "known_person":
                     incoming_state = "KNOWN"
+                elif identity_name == "Pending":
+                    incoming_state = "PENDING"
                 elif event.get("detection_type") == "unknown_person":
                     incoming_state = "UNKNOWN"
                 else:
                     incoming_state = "PENDING"
+            incoming_state = "KNOWN" if incoming_state == "KNOWN" else "PENDING"
             event["recognition_state"] = incoming_state
             event["detection_type"] = (
                 "known_person" if incoming_state == "KNOWN" else "unknown_person"
@@ -133,6 +138,7 @@ class DetectionEventManager:
                 "center": self._center(event["box"]),
                 "matched_this_frame": True,
                 "known_detected_once": is_person and incoming_state == "KNOWN",
+                "no_face_logged": False,
                 "vehicle_context_detected": bool(event.get("vehicle_context_detected")),
                 "suppress_notify": bool(event.get("suppress_notify")),
                 "event": event.copy(),
@@ -152,16 +158,21 @@ class DetectionEventManager:
                 f"track={track['track_id'] or track['event_id']} ENTER_ROI "
                 f"state={incoming_state}"
             )
+            if is_person and incoming_state == "KNOWN":
+                print(
+                    f"{self._camera_prefix()} [FACE EVENT] "
+                    f"track={track['track_id'] or track['event_id']} "
+                    f"recognition=KNOWN name={track['known_person_name']}"
+                )
         else:
             previous_state = track.get("recognition_state", "PENDING")
             recognition_state = previous_state
             if is_person:
-                if previous_state == "KNOWN" or incoming_state == "KNOWN":
-                    recognition_state = "KNOWN"
-                elif previous_state == "UNKNOWN" or incoming_state == "UNKNOWN":
-                    recognition_state = "UNKNOWN"
-                else:
-                    recognition_state = "PENDING"
+                recognition_state = (
+                    "KNOWN"
+                    if previous_state == "KNOWN" or incoming_state == "KNOWN"
+                    else "PENDING"
+                )
             track.update({
                 "state": "TRACKING",
                 "last_seen": now,
@@ -178,8 +189,14 @@ class DetectionEventManager:
                     print(
                         f"{self._camera_prefix()} [FACE EVENT] "
                         f"track={track['track_id'] or track['event_id']} "
-                        f"state={recognition_state}"
+                        f"recognition={recognition_state}"
                     )
+                    if recognition_state == "KNOWN":
+                        print(
+                            f"{self._camera_prefix()} [FACE EVENT] "
+                            f"track={track['track_id'] or track['event_id']} "
+                            f"recognition=KNOWN name={event.get('person_name')}"
+                        )
         if is_person:
             if incoming_state == "KNOWN":
                 if event.get("person_id") is not None:
@@ -202,8 +219,17 @@ class DetectionEventManager:
                     "title": "Known Person Detected",
                     "message": f"{track['known_person_name']} detected at {event['gate_name']}",
                 })
-            elif track["recognition_state"] == "UNKNOWN":
-                event.update({"person_id": None, "person_name": "Unknown"})
+            else:
+                event.update({"person_id": None, "person_name": "Pending"})
+            if has_face:
+                track["no_face_logged"] = False
+            elif not track.get("no_face_logged"):
+                print(
+                    f"{self._camera_prefix()} [FACE EVENT] "
+                    f"track={track['track_id'] or track['event_id']} "
+                    "recognition=PENDING_NO_FACE"
+                )
+                track["no_face_logged"] = True
         event["event_id"] = track["event_id"]
         event["session_id"] = track["session_id"]
         event["track_id"] = track.get("track_id")
@@ -434,7 +460,7 @@ class DetectionEventManager:
         if body_box is None:
             body_box = getattr(face, "bbox", None)
         annotation_box = getattr(face, "annotation_box", None)
-        if annotation_box is None:
+        if annotation_box is None and getattr(face, "associated_person_box", None) is None:
             annotation_box = getattr(face, "bbox", None)
         known = recognition_state == "KNOWN"
         return {"detected_at": now, "recognition_state": recognition_state, "detection_type": "known_person" if known else "unknown_person", "person_id": (getattr(face, "person_id", None) or self.person_ids.get(name)) if known else None, "person_name": name, "confidence": confidence, "gate_name": gate_name, "camera_id": self.camera_id, "camera_name": self.camera_name, "box": tuple(int(v) for v in body_box) if body_box is not None else None, "annotation_box": tuple(int(v) for v in annotation_box) if annotation_box is not None else None, "body_box": tuple(int(v) for v in body_box) if body_box is not None else None, "title": "Known Person Detected" if known else "Unknown Person Detected", "message": f"{name} detected at {gate_name}"}
@@ -442,6 +468,16 @@ class DetectionEventManager:
     def _publish_unknowns(self, unknowns, gate_name, now):
         track, chosen = unknowns[0]
         if track["alert_generated"]:
+            print(
+                f"{self._camera_prefix()} [FACE EVENT] "
+                f"track={track['track_id'] or track['event_id']} "
+                "DUPLICATE_ALERT_SUPPRESSED"
+            )
+            return None
+        if (
+            track.get("recognition_state") == "KNOWN"
+            or track.get("inside_roi", False)
+        ):
             return None
         event = track["event"].copy()
         count = len(unknowns)
@@ -467,10 +503,21 @@ class DetectionEventManager:
             f"{self._camera_prefix()} [UNKNOWN] ALERT_CONFIRMED "
             f"| people={count}"
         )
+        track["alert_generated"] = True
+        track["event"]["alert_generated"] = True
         published = self._publish(event, image, notify=True)
-        if published is not None:
-            track["alert_generated"] = True
-            track["event"]["alert_generated"] = True
+        if published is None:
+            print(
+                f"{self._camera_prefix()} [FACE EVENT] "
+                f"track={track['track_id'] or track['event_id']} "
+                "DUPLICATE_ALERT_SUPPRESSED"
+            )
+        else:
+            print(
+                f"{self._camera_prefix()} [FACE EVENT] "
+                f"track={track['track_id'] or track['event_id']} "
+                "UNKNOWN_ALERT_SENT"
+            )
         return published
 
     def process_frame(self, frame, faces, vehicles, gate_name, detected_at, alert_frame=None):
@@ -516,11 +563,20 @@ class DetectionEventManager:
         records = []
         for track, chosen in people:
             state = track.get("recognition_state")
-            if state == "PENDING":
+            track_label = track["track_id"] or track["event_id"]
+            track["inside_roi"] = False
+            print(
+                f"{self._camera_prefix()} [FACE EVENT] "
+                f"track={track_label} EXIT_ROI"
+            )
+            if state != "KNOWN":
                 state = "UNKNOWN"
                 track["recognition_state"] = state
                 track["event"]["recognition_state"] = state
-            track["inside_roi"] = False
+                print(
+                    f"{self._camera_prefix()} [FACE EVENT] "
+                    f"track={track_label} FINAL=UNKNOWN"
+                )
             track["event_finalized"] = True
             track["event"].update({
                 "recognition_state": state,
