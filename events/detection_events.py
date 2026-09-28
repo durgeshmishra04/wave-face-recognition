@@ -274,16 +274,16 @@ class DetectionEventManager:
             x1, y1, x2, y2 = event["box"]
             label, color = f"{event['vehicle_type'].replace('_', ' ').title()} | {event['vehicle_class']} | {event['confidence']:.2f}", (0, 140, 255)
         elif event["detection_type"] == "known_person":
-            # The person-model box is tracking-only. Only a face box may be
-            # rendered on the image exposed to API/Firebase/Android.
-            if not event.get("annotation_box"):
+            box = event.get("annotation_box") or event.get("box")
+            if not box:
                 return
-            x1, y1, x2, y2 = event["annotation_box"]
+            x1, y1, x2, y2 = box
             label, color = f"KNOWN | {event['person_name']} | ID: {event.get('person_id') or 'N/A'} | {event['confidence']:.2f}", (0, 255, 0)
         else:
-            if not event.get("annotation_box"):
+            box = event.get("annotation_box") or event.get("box")
+            if not box:
                 return
-            x1, y1, x2, y2 = event["annotation_box"]
+            x1, y1, x2, y2 = box
             count = event.get("unknown_count", 1)
             label, color = ("UNKNOWN" if count == 1 else f"UNKNOWN PERSONS: {count}"), (0, 0, 255)
         if event["detection_type"] == "object_theft":
