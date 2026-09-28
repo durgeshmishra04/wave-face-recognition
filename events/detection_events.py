@@ -30,9 +30,6 @@ class DetectionEventManager:
         self.active_person_events = []
         self.active_vehicle_events = []
         self._recent_event_cache = {}
-        # Unknown people in one concurrent ROI visit are deliberately held
-        # until the final member exits, then emitted as a single group event.
-        self.pending_unknown_exits = []
         try:
             self.person_ids = json.loads(os.getenv("PERSON_IDS_JSON", "{}"))
         except json.JSONDecodeError:
@@ -100,20 +97,122 @@ class DetectionEventManager:
         return best
 
     def _update_track(self, tracks, category, event, frame, now):
+        is_person = category == "person"
+        incoming_state = None
+        if is_person:
+            incoming_state = event.get("recognition_state")
+            if incoming_state not in {"PENDING", "UNKNOWN", "KNOWN"}:
+                if event.get("detection_type") == "known_person":
+                    incoming_state = "KNOWN"
+                elif event.get("detection_type") == "unknown_person":
+                    incoming_state = "UNKNOWN"
+                else:
+                    incoming_state = "PENDING"
+            event["recognition_state"] = incoming_state
+            event["detection_type"] = (
+                "known_person" if incoming_state == "KNOWN" else "unknown_person"
+            )
         track = self._match_track(tracks, category, event["box"])
         if track is None:
-            track = {"event_id": str(uuid.uuid4()), "category": category, "state": "ENTERED_ROI", "first_seen": now, "last_seen": now, "last_box": event["box"], "center": self._center(event["box"]), "matched_this_frame": True, "known_detected_once": event["detection_type"] == "known_person", "vehicle_context_detected": bool(event.get("vehicle_context_detected")), "suppress_notify": bool(event.get("suppress_notify")), "event": event.copy(), "frames": deque(maxlen=self.exit_frame_offset + 2)}
+            track = {
+                "event_id": str(uuid.uuid4()),
+                "session_id": str(uuid.uuid4()),
+                "track_id": event.get("track_id"),
+                "category": category,
+                "state": "ENTERED_ROI",
+                "recognition_state": incoming_state if is_person else None,
+                "known_person_id": event.get("person_id") if incoming_state == "KNOWN" else None,
+                "known_person_name": event.get("person_name") if incoming_state == "KNOWN" else None,
+                "known_confidence": event.get("confidence") if incoming_state == "KNOWN" else None,
+                "alert_generated": False,
+                "event_finalized": False,
+                "inside_roi": True,
+                "first_seen": now,
+                "last_seen": now,
+                "last_box": event["box"],
+                "center": self._center(event["box"]),
+                "matched_this_frame": True,
+                "known_detected_once": is_person and incoming_state == "KNOWN",
+                "vehicle_context_detected": bool(event.get("vehicle_context_detected")),
+                "suppress_notify": bool(event.get("suppress_notify")),
+                "event": event.copy(),
+                "frames": deque(maxlen=self.exit_frame_offset + 2),
+            }
+            track["event"].update({
+                "event_id": track["event_id"],
+                "session_id": track["session_id"],
+                "track_id": track["track_id"],
+                "alert_generated": False,
+                "event_finalized": False,
+                "inside_roi": True,
+            })
             tracks.append(track)
+            print(
+                f"{self._camera_prefix()} [FACE EVENT] "
+                f"track={track['track_id'] or track['event_id']} ENTER_ROI "
+                f"state={incoming_state}"
+            )
         else:
-            track.update({"state": "TRACKING", "last_seen": now, "last_box": event["box"], "center": self._center(event["box"]), "matched_this_frame": True})
-        # A recognition is sticky for the entire physical ROI crossing.
-        if event["detection_type"] == "known_person":
-            track["known_detected_once"] = True
-            track["event"] = event.copy()
-        elif not track["known_detected_once"]:
-            track["vehicle_context_detected"] = track.get("vehicle_context_detected", False) or bool(event.get("vehicle_context_detected"))
-            track["suppress_notify"] = track.get("suppress_notify", False) or bool(event.get("suppress_notify"))
-            track["event"] = event.copy()
+            previous_state = track.get("recognition_state", "PENDING")
+            recognition_state = previous_state
+            if is_person:
+                if previous_state == "KNOWN" or incoming_state == "KNOWN":
+                    recognition_state = "KNOWN"
+                elif previous_state == "UNKNOWN" or incoming_state == "UNKNOWN":
+                    recognition_state = "UNKNOWN"
+                else:
+                    recognition_state = "PENDING"
+            track.update({
+                "state": "TRACKING",
+                "last_seen": now,
+                "last_box": event["box"],
+                "center": self._center(event["box"]),
+                "matched_this_frame": True,
+                "track_id": event.get("track_id") or track.get("track_id"),
+                "inside_roi": True,
+            })
+            if is_person:
+                track["recognition_state"] = recognition_state
+                track["known_detected_once"] = recognition_state == "KNOWN"
+                if recognition_state != previous_state:
+                    print(
+                        f"{self._camera_prefix()} [FACE EVENT] "
+                        f"track={track['track_id'] or track['event_id']} "
+                        f"state={recognition_state}"
+                    )
+        if is_person:
+            if incoming_state == "KNOWN":
+                if event.get("person_id") is not None:
+                    track["known_person_id"] = event["person_id"]
+                if event.get("person_name") not in {None, "", "Unknown", "Pending"}:
+                    track["known_person_name"] = event["person_name"]
+                if event.get("confidence") is not None:
+                    track["known_confidence"] = event["confidence"]
+            event["recognition_state"] = track["recognition_state"]
+            event["detection_type"] = (
+                "known_person"
+                if track["recognition_state"] == "KNOWN"
+                else "unknown_person"
+            )
+            if track["recognition_state"] == "KNOWN":
+                event.update({
+                    "person_id": track["known_person_id"],
+                    "person_name": track["known_person_name"],
+                    "confidence": track["known_confidence"],
+                    "title": "Known Person Detected",
+                    "message": f"{track['known_person_name']} detected at {event['gate_name']}",
+                })
+            elif track["recognition_state"] == "UNKNOWN":
+                event.update({"person_id": None, "person_name": "Unknown"})
+        event["event_id"] = track["event_id"]
+        event["session_id"] = track["session_id"]
+        event["track_id"] = track.get("track_id")
+        event["alert_generated"] = track["alert_generated"]
+        event["event_finalized"] = track["event_finalized"]
+        event["inside_roi"] = True
+        track["event"] = event.copy()
+        track["vehicle_context_detected"] = track.get("vehicle_context_detected", False) or bool(event.get("vehicle_context_detected"))
+        track["suppress_notify"] = track.get("suppress_notify", False) or bool(event.get("suppress_notify"))
         track["event"]["box"] = event["box"]
         if track.get("vehicle_context_detected"):
             track["event"]["vehicle_context_detected"] = True
@@ -202,9 +301,7 @@ class DetectionEventManager:
             return (
                 "known_person",
                 camera_id,
-                gate_name,
-                event.get("person_id"),
-                event.get("person_name"),
+                event.get("event_id") or event.get("session_id") or event.get("track_id"),
             )
         if detection_type == "vehicle":
             return (
@@ -225,10 +322,14 @@ class DetectionEventManager:
                 event.get("track_id"),
                 event.get("session_id"),
             )
-        # Unknown entries must collapse to one alert per camera/gate while the
-        # same person is still being tracked in the ROI. Counting multiple
-        # unknown frames as distinct dedupe keys caused duplicate notifications
-        # for the same person in one camera.
+        if detection_type == "unknown_person" and (
+            event.get("event_id") or event.get("session_id") or event.get("track_id")
+        ):
+            return (
+                "unknown_person",
+                camera_id,
+                event.get("event_id") or event.get("session_id") or event.get("track_id"),
+            )
         return (
             detection_type,
             camera_id,
@@ -294,7 +395,7 @@ class DetectionEventManager:
                 f"{self._camera_prefix()} [UNKNOWN] ALERT_SENT "
                 "| channel=socketio"
             )
-        if notify:
+        if notify and event["detection_type"] != "known_person":
             try:
                 self._notify(event)
             except Exception as error:
@@ -320,25 +421,35 @@ class DetectionEventManager:
         return expired
 
     def _person_event(self, face, gate_name, now):
-        name, confidence = getattr(face, "recognized_name", "Unknown"), float(getattr(face, "recognition_score", 0.0))
-        known = name != "Unknown"
+        name = getattr(face, "recognized_name", "Unknown")
+        recognition_state = getattr(face, "recognition_state", None)
+        if recognition_state not in {"PENDING", "UNKNOWN", "KNOWN"}:
+            recognition_state = "KNOWN" if name != "Unknown" else "UNKNOWN"
+        if recognition_state == "PENDING":
+            name = "Pending"
+        elif recognition_state == "UNKNOWN":
+            name = "Unknown"
+        confidence = float(getattr(face, "recognition_score", 0.0))
         body_box = getattr(face, "associated_person_box", None)
         if body_box is None:
             body_box = getattr(face, "bbox", None)
         annotation_box = getattr(face, "annotation_box", None)
         if annotation_box is None:
             annotation_box = getattr(face, "bbox", None)
-        return {"detected_at": now, "detection_type": "known_person" if known else "unknown_person", "person_id": getattr(face, "person_id", None) or self.person_ids.get(name), "person_name": name, "confidence": confidence, "gate_name": gate_name, "camera_id": self.camera_id, "camera_name": self.camera_name, "box": tuple(int(v) for v in body_box) if body_box is not None else None, "annotation_box": tuple(int(v) for v in annotation_box) if annotation_box is not None else None, "body_box": tuple(int(v) for v in body_box) if body_box is not None else None, "title": "Known Person Detected" if known else "Unknown Person Detected", "message": f"{name} detected at {gate_name}"}
+        known = recognition_state == "KNOWN"
+        return {"detected_at": now, "recognition_state": recognition_state, "detection_type": "known_person" if known else "unknown_person", "person_id": (getattr(face, "person_id", None) or self.person_ids.get(name)) if known else None, "person_name": name, "confidence": confidence, "gate_name": gate_name, "camera_id": self.camera_id, "camera_name": self.camera_name, "box": tuple(int(v) for v in body_box) if body_box is not None else None, "annotation_box": tuple(int(v) for v in annotation_box) if annotation_box is not None else None, "body_box": tuple(int(v) for v in body_box) if body_box is not None else None, "title": "Known Person Detected" if known else "Unknown Person Detected", "message": f"{name} detected at {gate_name}"}
 
     def _publish_unknowns(self, unknowns, gate_name, now):
         track, chosen = unknowns[0]
+        if track["alert_generated"]:
+            return None
         event = track["event"].copy()
         count = len(unknowns)
         vehicle_context = any(
             item[0].get("vehicle_context_detected")
             for item in unknowns
         )
-        event.update({"detected_at": now, "detection_type": "unknown_person", "person_name": "Unknown", "person_id": None, "camera_id": self.camera_id, "camera_name": self.camera_name, "unknown_count": count, "title": "Unknown Person Detected" if count == 1 else "Unknown Persons Detected", "message": f"Unknown person detected at {gate_name}" if count == 1 else f"{count} unknown persons detected at {gate_name}"})
+        event.update({"detected_at": now, "detection_type": "unknown_person", "recognition_state": "UNKNOWN", "person_name": "Unknown", "person_id": None, "camera_id": self.camera_id, "camera_name": self.camera_name, "unknown_count": count, "title": "Unknown Person Detected" if count == 1 else "Unknown Persons Detected", "message": f"Unknown person detected at {gate_name}" if count == 1 else f"{count} unknown persons detected at {gate_name}", "alert_generated": True, "event_finalized": True, "inside_roi": False})
         if vehicle_context:
             event["title"] = "Unknown Person Detected at Vehicle" if count == 1 else "Unknown Persons Detected at Vehicle"
             event["message"] = f"Unknown person detected at vehicle at {gate_name}" if count == 1 else f"{count} unknown persons detected at vehicle at {gate_name}"
@@ -356,7 +467,11 @@ class DetectionEventManager:
             f"{self._camera_prefix()} [UNKNOWN] ALERT_CONFIRMED "
             f"| people={count}"
         )
-        return self._publish(event, image, notify=True)
+        published = self._publish(event, image, notify=True)
+        if published is not None:
+            track["alert_generated"] = True
+            track["event"]["alert_generated"] = True
+        return published
 
     def process_frame(self, frame, faces, vehicles, gate_name, detected_at, alert_frame=None):
         """Ingest one annotated ROI frame; return records finalized on this call."""
@@ -398,29 +513,29 @@ class DetectionEventManager:
                 })
         people = self._finalize_expired(self.active_person_events, detected_at)
         vehicles = self._finalize_expired(self.active_vehicle_events, detected_at)
-        expired_unknowns = [
-            (track, chosen)
-            for track, chosen in people
-            if not track["known_detected_once"]
-        ]
-        self.pending_unknown_exits.extend(expired_unknowns)
-        unknowns_still_inside = any(
-            not track["known_detected_once"]
-            for track in self.active_person_events
-        )
-        # Do not publish when the first person leaves. Wait until every
-        # unknown track from the same ROI group has confirmed its exit.
         records = []
-        if self.pending_unknown_exits and not unknowns_still_inside:
-            records.append(self._publish_unknowns(
-                self.pending_unknown_exits,
-                gate_name,
-                detected_at,
-            ))
-            self.pending_unknown_exits.clear()
         for track, chosen in people:
-            if track["known_detected_once"]:
-                event = track["event"].copy(); event["detected_at"] = detected_at
+            state = track.get("recognition_state")
+            if state == "PENDING":
+                state = "UNKNOWN"
+                track["recognition_state"] = state
+                track["event"]["recognition_state"] = state
+            track["inside_roi"] = False
+            track["event_finalized"] = True
+            track["event"].update({
+                "recognition_state": state,
+                "inside_roi": False,
+                "event_finalized": True,
+            })
+            event = track["event"].copy()
+            event["detected_at"] = detected_at
+            if state == "KNOWN":
+                event.update({
+                    "detection_type": "known_person",
+                    "person_id": track["known_person_id"],
+                    "person_name": track["known_person_name"],
+                    "confidence": track["known_confidence"],
+                })
                 try:
                     image = self._decode_buffered_frame(chosen["frame"])
                 except Exception as error:
@@ -428,6 +543,13 @@ class DetectionEventManager:
                     continue
                 self._draw_event(image, event)
                 records.append(self._publish(event, image, notify=False))
+            elif not track["alert_generated"]:
+                track["event"]["detection_type"] = "unknown_person"
+                records.append(self._publish_unknowns(
+                    [(track, chosen)],
+                    gate_name,
+                    detected_at,
+                ))
         for track, chosen in vehicles:
             event = track["event"].copy(); event["detected_at"] = detected_at
             try:

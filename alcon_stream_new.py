@@ -3101,7 +3101,6 @@ def camera_worker(camera_config, rtsp_url=None):
         1.0 / max(SOCKET_LIVE_FPS, 1.0)
     )
 
-
     while not shutdown_event.is_set():
 
         cap = None
@@ -3113,79 +3112,12 @@ def camera_worker(camera_config, rtsp_url=None):
                     f"Connecting to NVR={camera_config['nvr_ip']} "
                     f"CHANNEL={camera_config['channel']} "
                     f"SUBTYPE={camera_config['subtype']}"
-                ),
             )
             if RTSP_DEBUG:
                 _camera_log(
                     camera_id,
                     f"[RTSP OPEN] camera={camera_id} channel={camera_config['channel']} "
                     f"subtype={camera_config['subtype']} url={_redact_rtsp_url(rtsp_url)}",
-                )
-            cap = cv2.VideoCapture(
-                rtsp_url,
-                cv2.CAP_FFMPEG,
-                [
-                    cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 10000,
-                    cv2.CAP_PROP_READ_TIMEOUT_MSEC, 10000,
-                ]
-            )
-            with camera_capture_lock:
-                camera_captures[camera_id] = cap
-
-
-            if not cap.isOpened():
-
-                camera_status = "RTSP connection failed"
-                _set_camera_state(
-                    camera_id,
-                    status=camera_status,
-                    connected=False,
-                    latest_update_at=time.time(),
-                )
-                _camera_log(camera_id, "Could not open MAIN RTSP stream.")
-                _release_camera_capture(camera_id)
-
-                shutdown_event.wait(5)
-
-                continue
-
-
-            camera_status = "LIVE"
-            _set_camera_state(
-                camera_id,
-                status=camera_status,
-                connected=True,
-                latest_update_at=time.time(),
-            )
-            _camera_log(camera_id, "RTSP stream connected.")
-
-            consecutive_read_failures = 0
-
-
-            while not shutdown_event.is_set():
-
-                ok, frame = cap.read()
-
-                if (
-                    not ok
-                    or frame is None
-                ):
-
-                    consecutive_read_failures += 1
-
-                    if (
-                        consecutive_read_failures
-                        <
-                        MAX_CONSECUTIVE_READ_FAILURES
-                    ):
-
-                        time.sleep(0.05)
-
-                        continue
-
-                    camera_status = "Stream lost - reconnecting..."
-                    _set_camera_state(
-                        camera_id,
                         status=camera_status,
                         connected=False,
                         latest_update_at=time.time(),
@@ -3228,10 +3160,71 @@ def camera_worker(camera_config, rtsp_url=None):
 
                 faces_payload = []
                 vehicles_payload = []
+                    if (
+                        consecutive_read_failures
+                        <
+                        MAX_CONSECUTIVE_READ_FAILURES
+                    ):
 
+                        time.sleep(0.05)
+                        event_person_indexes = {}
+                        continue
 
+                    camera_status = "Stream lost - reconnecting..."
+                    _set_camera_state(
+                        camera_id,
+                            if person_track is None:
+                                continue
+
+                            identity_status = person_track.get("identity_status")
+                            if identity_status == "KNOWN":
+                                recognition_state = "KNOWN"
+                                identity_name = person_track.get("employee_name") or "Unknown"
+                            elif (
+                                identity_status == "UNKNOWN"
+                                and person_track.get("unknown_evidence")
+                            ):
+                                recognition_state = "UNKNOWN"
+                                identity_name = "Unknown"
+                            else:
+                                recognition_state = "PENDING"
+                                identity_name = "Pending"
+
+                            annotation_box = person_track.get("annotation_box")
+                            last_event_people.append(
+                                SimpleNamespace(
+                                    bbox=np.asarray(person_box, dtype=np.int32),
+                                    associated_person_box=np.asarray(
+                                        person_box, dtype=np.int32
+                                    ),
+                                    annotation_box=(
+                                        tuple(int(value) for value in annotation_box)
+                                        if annotation_box is not None
+                                        else None
+                                    ),
+                                    recognized_name=identity_name,
+                                    recognition_state=recognition_state,
+                                    recognition_score=float(
+                                        person_track.get("recognition_score", 0.0)
+                                    ),
+                                    person_id=person_track.get("employee_id"),
+                                    track_id=person_track["track_id"],
+                                )
+                            )
+                            event_person_indexes[person_track["track_id"]] = (
+                                len(last_event_people) - 1
+                            )
+
+                        # Preserve a classified face when its current body
+                        # association is unavailable, using the same manager.
+
+                            recognition_state = getattr(
+                                face,
+                                "recognition_state",
+                                "UNKNOWN" if getattr(face, "recognized_name", "Unknown") == "Unknown" else "KNOWN",
+                            )
                 # ------------------------------------------------
-                # FACE DETECTION
+                                recognition_state not in {"KNOWN", "UNKNOWN"}
                 # ------------------------------------------------
 
                 if (
@@ -3438,41 +3431,61 @@ def camera_worker(camera_config, rtsp_url=None):
                                     camera_id=camera_id,
                                 )
                             ]
-                        elif camera_config.get("kpi") != "vehicle":
-                            last_vehicles = []
-
                         vehicle_person_boxes = [
                             person_box
                             for person_box in person_boxes
-                            if any(
-                                boxes_overlap(
-                                    person_box,
-                                    vehicle["box"],
-                                )
-                                for vehicle in last_vehicles
-                            )
-                        ]
-
-                        person_in_roi = any(
-                            face_in_roi(
-                                person_box,
-                                frame.shape[1],
-                                frame.shape[0],
-                                camera_id=camera_id,
-                            )
-                            for person_box, _score in person_boxes
-                        )
+                                    identity_name = (
+                                        getattr(face, "recognized_name", "Unknown")
+                                        if recognition_state == "KNOWN"
+                                        else "Unknown"
                         detected_faces = (
-                            safe_face_inference(frame)
-                            if person_in_roi
+                                    event_person = SimpleNamespace(
+                                        bbox=np.asarray(tracking_box, dtype=np.int32),
+                                        associated_person_box=(
+                                            np.asarray(body_box, dtype=np.int32)
+                                            if body_box is not None
+                                            else None
+                                        ),
+                                        annotation_box=tuple(
+                                            int(value) for value in face_box
+                                        ),
+                                        recognized_name=identity_name,
+                                        recognition_state=recognition_state,
+                                        recognition_score=float(
+                                            getattr(face, "recognition_score", 0.0)
+                                        ),
+                                        person_id=getattr(face, "person_id", None),
+                                        track_id=track_id,
+                                    )
+                                    if track_id in event_person_indexes:
+                                        event_person = last_event_people[
+                                            event_person_indexes[track_id]
+                                        ]
+                                        event_person.annotation_box = tuple(
+                                            int(value) for value in face_box
+                                        )
+                                        event_person.recognized_name = identity_name
+                                        event_person.recognition_state = recognition_state
+                                        event_person.recognition_score = float(
+                                            getattr(face, "recognition_score", 0.0)
+                                        )
+                                        event_person.person_id = getattr(
+                                            face, "person_id", None
+                                        )
+                                    else:
+                                        last_event_people.append(event_person)
+                                        if track_id is not None:
+                                            event_person_indexes[track_id] = (
+                                                len(last_event_people) - 1
+                                            )
                             else []
                         )
-                        if not person_in_roi:
+                                        "[FACE EVENT] PERSON_TRACK_ASSOCIATED | "
                             _camera_log(
                                 camera_id,
                                 "[FACE] skipped: no person in ROI",
                             )
-
+                                        "[FACE EVENT] EVENT_PERSON_QUEUED | source=face_fallback",
                         if detected_faces:
                             _camera_log(
                                 camera_id,
@@ -3844,6 +3857,9 @@ def camera_worker(camera_config, rtsp_url=None):
                                 })
 
                             face.recognized_name = name
+                            face.recognition_state = (
+                                "KNOWN" if name != "Unknown" else "UNKNOWN"
+                            )
 
                             face.recognition_score = score
                             face.in_roi = face_is_in_roi
@@ -3883,58 +3899,62 @@ def camera_worker(camera_config, rtsp_url=None):
                             )
                         ]
                         last_event_people = []
-                        unknown_event_track_ids = set()
+                        event_person_track_ids = set()
                         for person_box in roi_person_boxes:
                             person_track = _match_person_track(
                                 person_tracks,
                                 person_box,
                             )
-                            if person_track is not None and person_track.get(
-                                "annotation_box"
-                            ) is not None:
-                                identity_name = (
-                                    person_track.get("employee_name")
-                                    if person_track.get("identity_status") == "KNOWN"
-                                    else "Unknown"
-                                )
-                                last_event_people.append(
-                                    SimpleNamespace(
-                                        # Keep the body box only for stable
-                                        # tracking; API/Firebase annotations
-                                        # use annotation_box (the face) only.
-                                        bbox=np.array(person_box),
-                                        annotation_box=tuple(
-                                            int(value)
-                                            for value in person_track["annotation_box"]
-                                        ),
-                                        recognized_name=identity_name,
-                                        recognition_score=float(
-                                            person_track.get("recognition_score", 0.0)
-                                        ),
-                                        person_id=person_track.get("employee_id"),
-                                        track_id=person_track["track_id"],
-                                    )
-                                )
-                                if identity_name == "Unknown":
-                                    unknown_event_track_ids.add(
-                                        person_track["track_id"]
-                                    )
-                                    _camera_log(
-                                        camera_id,
-                                        "[UNKNOWN] PERSON_TRACK_ASSOCIATED | "
-                                        f"track={person_track['track_id']} result=matched",
-                                    )
-                                    _camera_log(
-                                        camera_id,
-                                        "[UNKNOWN] EVENT_PERSON_QUEUED | source=person_track",
-                                    )
+                            if person_track is None:
+                                continue
 
-                        # A valid Unknown face may pass face-track continuity
-                        # without a current person-track match. Preserve it in
-                        # the existing event-manager handoff.
+                            identity_status = person_track.get("identity_status")
+                            if identity_status == "KNOWN":
+                                recognition_state = "KNOWN"
+                                identity_name = person_track.get("employee_name") or "Unknown"
+                            elif (
+                                identity_status == "UNKNOWN"
+                                and person_track.get("unknown_evidence")
+                            ):
+                                recognition_state = "UNKNOWN"
+                                identity_name = "Unknown"
+                            else:
+                                recognition_state = "PENDING"
+                                identity_name = "Pending"
+
+                            annotation_box = person_track.get("annotation_box")
+                            last_event_people.append(
+                                SimpleNamespace(
+                                    bbox=np.asarray(person_box, dtype=np.int32),
+                                    associated_person_box=np.asarray(
+                                        person_box, dtype=np.int32
+                                    ),
+                                    annotation_box=(
+                                        tuple(int(value) for value in annotation_box)
+                                        if annotation_box is not None
+                                        else None
+                                    ),
+                                    recognized_name=identity_name,
+                                    recognition_state=recognition_state,
+                                    recognition_score=float(
+                                        person_track.get("recognition_score", 0.0)
+                                    ),
+                                    person_id=person_track.get("employee_id"),
+                                    track_id=person_track["track_id"],
+                                )
+                            )
+                            event_person_track_ids.add(person_track["track_id"])
+
+                        # A valid classified face may outlive or miss its body
+                        # track. Preserve that recognition in the same manager.
                         for face in last_faces:
+                            recognition_state = getattr(
+                                face,
+                                "recognition_state",
+                                "UNKNOWN" if getattr(face, "recognized_name", "Unknown") == "Unknown" else "KNOWN",
+                            )
                             if (
-                                getattr(face, "recognized_name", "Unknown") != "Unknown"
+                                recognition_state not in {"KNOWN", "UNKNOWN"}
                                 or not (
                                     getattr(face, "in_roi", False)
                                     or getattr(face, "vehicle_context", False)
@@ -3973,7 +3993,7 @@ def camera_worker(camera_config, rtsp_url=None):
                                 if person_track is not None
                                 else None
                             )
-                            if track_id in unknown_event_track_ids:
+                            if track_id in event_person_track_ids:
                                 continue
 
                             tracking_box = (
@@ -3991,23 +4011,24 @@ def camera_worker(camera_config, rtsp_url=None):
                                         int(value) for value in face_box
                                     ),
                                     recognized_name="Unknown",
+                                    recognition_state=recognition_state,
                                     recognition_score=float(
                                         getattr(face, "recognition_score", 0.0)
                                     ),
-                                    person_id=None,
+                                    person_id=getattr(face, "person_id", None),
                                     track_id=track_id,
                                 )
                             )
                             if track_id is not None:
-                                unknown_event_track_ids.add(track_id)
+                                event_person_track_ids.add(track_id)
                             _camera_log(
                                 camera_id,
-                                "[UNKNOWN] PERSON_TRACK_ASSOCIATED | "
+                                "[FACE EVENT] PERSON_TRACK_ASSOCIATED | "
                                 f"result={'matched' if person_track is not None else 'face_fallback'}",
                             )
                             _camera_log(
                                 camera_id,
-                                "[UNKNOWN] EVENT_PERSON_QUEUED | source=face_fallback",
+                                "[FACE EVENT] EVENT_PERSON_QUEUED | source=face_fallback",
                             )
 
                         unique_unknown_people = [
