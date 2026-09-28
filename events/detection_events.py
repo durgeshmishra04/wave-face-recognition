@@ -261,13 +261,19 @@ class DetectionEventManager:
         image_url = event["image_url"]
         data = {key: str(value) for key, value in {"type": event["detection_type"], "detection_id": event["id"], "camera_id": event.get("camera_id", self.camera_id or ""), "camera_name": event.get("camera_name", self.camera_name or ""), "gate": event["gate_name"], "image_url": image_url, "confidence": event.get("confidence", ""), "unknown_count": event.get("unknown_count", ""), "detected_at": event["detected_at"]}.items()}
         if self.fcm_sender is not None:
-            self.fcm_sender(
+            response = self.fcm_sender(
                 title=event["title"],
                 body=event["message"],
                 data=data,
                 image_url=image_url,
             )
-            return
+            if event["detection_type"] == "unknown_person":
+                sent = response.get("sent", "unknown") if isinstance(response, dict) else "unknown"
+                print(
+                    f"{self._camera_prefix()} [UNKNOWN] ALERT_SENT "
+                    f"| channel=fcm sent={sent}"
+                )
+            return response
         print("[WARNING] No FCM sender configured; notification skipped.")
 
     def _publish(self, event, image, notify):
@@ -280,9 +286,14 @@ class DetectionEventManager:
         event["id"] = self.database.save(event)
         event["type"], event["gate"] = event["detection_type"], event["gate_name"]
         event["time"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(event["detected_at"]))
-        self.socketio.emit("detection_event", event)
+        if event["detection_type"] != "known_person":
+            self.socketio.emit("detection_event", event)
         if event["detection_type"] == "unknown_person":
             self.socketio.emit("face_alert", event)
+            print(
+                f"{self._camera_prefix()} [UNKNOWN] ALERT_SENT "
+                "| channel=socketio"
+            )
         if notify:
             try:
                 self._notify(event)
@@ -341,6 +352,10 @@ class DetectionEventManager:
             marked = item["event"].copy()
             marked["unknown_count"] = count
             self._draw_event(image, marked)
+        print(
+            f"{self._camera_prefix()} [UNKNOWN] ALERT_CONFIRMED "
+            f"| people={count}"
+        )
         return self._publish(event, image, notify=True)
 
     def process_frame(self, frame, faces, vehicles, gate_name, detected_at, alert_frame=None):

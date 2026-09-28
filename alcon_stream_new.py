@@ -3883,6 +3883,7 @@ def camera_worker(camera_config, rtsp_url=None):
                             )
                         ]
                         last_event_people = []
+                        unknown_event_track_ids = set()
                         for person_box in roi_person_boxes:
                             person_track = _match_person_track(
                                 person_tracks,
@@ -3914,6 +3915,100 @@ def camera_worker(camera_config, rtsp_url=None):
                                         track_id=person_track["track_id"],
                                     )
                                 )
+                                if identity_name == "Unknown":
+                                    unknown_event_track_ids.add(
+                                        person_track["track_id"]
+                                    )
+                                    _camera_log(
+                                        camera_id,
+                                        "[UNKNOWN] PERSON_TRACK_ASSOCIATED | "
+                                        f"track={person_track['track_id']} result=matched",
+                                    )
+                                    _camera_log(
+                                        camera_id,
+                                        "[UNKNOWN] EVENT_PERSON_QUEUED | source=person_track",
+                                    )
+
+                        # A valid Unknown face may pass face-track continuity
+                        # without a current person-track match. Preserve it in
+                        # the existing event-manager handoff.
+                        for face in last_faces:
+                            if (
+                                getattr(face, "recognized_name", "Unknown") != "Unknown"
+                                or not (
+                                    getattr(face, "in_roi", False)
+                                    or getattr(face, "vehicle_context", False)
+                                )
+                            ):
+                                continue
+
+                            face_annotation = getattr(face, "annotation_box", None)
+                            face_box = np.asarray(
+                                face_annotation if face_annotation is not None else face.bbox,
+                                dtype=np.int32,
+                            )
+                            _camera_log(
+                                camera_id,
+                                "[UNKNOWN] FACE_DETECTED | "
+                                f"face_box={tuple(int(value) for value in face_box)}",
+                            )
+
+                            body_box = getattr(face, "associated_person_box", None)
+                            if body_box is None:
+                                body_box = next(
+                                    (
+                                        np.asarray(person_box, dtype=np.int32)
+                                        for person_box in person_boxes
+                                        if face_inside_person(face_box, person_box)
+                                    ),
+                                    None,
+                                )
+                            person_track = (
+                                _match_person_track(person_tracks, body_box)
+                                if body_box is not None
+                                else None
+                            )
+                            track_id = (
+                                person_track["track_id"]
+                                if person_track is not None
+                                else None
+                            )
+                            if track_id in unknown_event_track_ids:
+                                continue
+
+                            tracking_box = (
+                                body_box if body_box is not None else face_box
+                            )
+                            last_event_people.append(
+                                SimpleNamespace(
+                                    bbox=np.asarray(tracking_box, dtype=np.int32),
+                                    associated_person_box=(
+                                        np.asarray(body_box, dtype=np.int32)
+                                        if body_box is not None
+                                        else None
+                                    ),
+                                    annotation_box=tuple(
+                                        int(value) for value in face_box
+                                    ),
+                                    recognized_name="Unknown",
+                                    recognition_score=float(
+                                        getattr(face, "recognition_score", 0.0)
+                                    ),
+                                    person_id=None,
+                                    track_id=track_id,
+                                )
+                            )
+                            if track_id is not None:
+                                unknown_event_track_ids.add(track_id)
+                            _camera_log(
+                                camera_id,
+                                "[UNKNOWN] PERSON_TRACK_ASSOCIATED | "
+                                f"result={'matched' if person_track is not None else 'face_fallback'}",
+                            )
+                            _camera_log(
+                                camera_id,
+                                "[UNKNOWN] EVENT_PERSON_QUEUED | source=face_fallback",
+                            )
 
                         unique_unknown_people = [
                             person
