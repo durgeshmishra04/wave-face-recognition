@@ -76,6 +76,7 @@ from object_theft.config import (
     OBJECT_THEFT_MODEL_PATH,
     OBJECT_THEFT_ROI_ENABLED,
 )
+from face_association import face_associated_with_person as _face_associated_with_person
 
 
 # ============================================================
@@ -118,6 +119,19 @@ FACE_RECOGNITION_MIN_DET_SCORE = float(
 )
 FACE_MIN_WIDTH_RATIO = float(os.getenv("FACE_MIN_WIDTH_RATIO", "0.008"))
 FACE_MIN_HEIGHT_RATIO = float(os.getenv("FACE_MIN_HEIGHT_RATIO", "0.012"))
+FACE_PERSON_ASSOCIATION_ENABLED = (
+    os.getenv("FACE_PERSON_ASSOCIATION_ENABLED", "true")
+    .strip()
+    .lower()
+    in {"1", "true", "yes", "on"}
+)
+FACE_PERSON_MIN_CENTER_INSIDE = (
+    os.getenv("FACE_PERSON_MIN_CENTER_INSIDE", "true")
+    .strip()
+    .lower()
+    in {"1", "true", "yes", "on"}
+)
+FACE_PERSON_MIN_OVERLAP = float(os.getenv("FACE_PERSON_MIN_OVERLAP", "0.10"))
 REGISTRATION_MIN_FACE_WIDTH_RATIO = float(
     os.getenv("REGISTRATION_MIN_FACE_WIDTH_RATIO", "0.12")
 )
@@ -2629,29 +2643,8 @@ def is_plausible_face_detection(face):
 
 
 def face_associated_with_person(face_box, person_boxes, frame_shape):
-    """Return the person box containing a face center, with a small margin."""
-    frame_height, frame_width = frame_shape[:2]
-    face_box = np.asarray(face_box, dtype=np.float32)
-    face_width = max(face_box[2] - face_box[0], 0.0)
-    face_height = max(face_box[3] - face_box[1], 0.0)
-    if (
-        face_width < frame_width * FACE_MIN_WIDTH_RATIO
-        or face_height < frame_height * FACE_MIN_HEIGHT_RATIO
-    ):
-        return None
-    margin_ratio = 0.08
-    center_x = (face_box[0] + face_box[2]) / 2.0
-    center_y = (face_box[1] + face_box[3]) / 2.0
-    for person_box in person_boxes:
-        person_box = np.asarray(person_box, dtype=np.float32)
-        person_width = max(person_box[2] - person_box[0], 1.0)
-        person_height = max(person_box[3] - person_box[1], 1.0)
-        if (
-            person_box[0] - person_width * margin_ratio <= center_x <= person_box[2] + person_width * margin_ratio
-            and person_box[1] - person_height * margin_ratio <= center_y <= person_box[3] + person_height * margin_ratio
-        ):
-            return person_box.astype(np.int32)
-    return None
+    """Dispatch to the strict face-person association gate used before recognition."""
+    return _face_associated_with_person(face_box, person_boxes, frame_shape)
 
 
 def vehicle_in_roi(vehicle_box, frame_width, frame_height, camera_id=None):
@@ -3440,11 +3433,19 @@ def camera_worker(camera_config, rtsp_url=None):
                         for face in detected_faces:
                             det_score = float(getattr(face, "det_score", 0.0))
                             face_box = face.bbox.astype(int)
-                            associated_person_box = face_associated_with_person(
+                            associated_person_box = _face_associated_with_person(
                                 face_box,
                                 person_boxes,
                                 frame.shape,
                             )
+                            if FACE_PERSON_ASSOCIATION_ENABLED and associated_person_box is None:
+                                _camera_log(
+                                    camera_id,
+                                    f"[FACE] REJECTED | camera={camera_id} | "
+                                    f"reason=no_person_association | det_score={det_score:.3f} | "
+                                    f"face_box={tuple(int(value) for value in face_box)}",
+                                )
+                                continue
                             if associated_person_box is None:
                                 _camera_log(
                                     camera_id,
@@ -3511,13 +3512,6 @@ def camera_worker(camera_config, rtsp_url=None):
                                 f"[FACE ROI] camera={camera_id} result=PASS"
                                 + (" reason=vehicle_context" if associated_with_vehicle and not face_roi_pass else ""),
                             )
-                            if associated_person_box is None and not active_track_match:
-                                _camera_log(
-                                    camera_id,
-                                    f"[FACE] REJECTED | camera={camera_id} | "
-                                    f"reason=no_person_association | det_score={det_score:.3f}",
-                                )
-                                continue
                             face.associated_person_box = associated_person_box
                             face.person_associated = associated_person_box is not None
                             face.vehicle_context = associated_with_vehicle
