@@ -131,7 +131,13 @@ FACE_PERSON_MIN_CENTER_INSIDE = (
     .lower()
     in {"1", "true", "yes", "on"}
 )
-FACE_PERSON_MIN_OVERLAP = float(os.getenv("FACE_PERSON_MIN_OVERLAP", "0.10"))
+FACE_PERSON_MIN_OVERLAP = float(os.getenv("FACE_PERSON_MIN_OVERLAP", "0.20"))
+FACE_ASSOCIATION_DEBUG = (
+    os.getenv("FACE_ASSOCIATION_DEBUG", "false")
+    .strip()
+    .lower()
+    in {"1", "true", "yes", "on"}
+)
 REGISTRATION_MIN_FACE_WIDTH_RATIO = float(
     os.getenv("REGISTRATION_MIN_FACE_WIDTH_RATIO", "0.12")
 )
@@ -334,6 +340,7 @@ known_embeddings = {}
 known_person_metadata = {}
 # Full per-person embedding templates used by live recognition.
 known_face_templates = {}
+face_confirmation_state = {}
 face_app = None
 person_detector = None
 vehicle_detector = None
@@ -3484,6 +3491,50 @@ def camera_worker(camera_config, rtsp_url=None):
                                     f"reason=invalid_face_geometry | det_score={det_score:.3f}",
                                 )
                                 continue
+
+                            person_track = _match_person_track(
+                                person_tracks,
+                                associated_person_box,
+                            ) if associated_person_box is not None else None
+                            if person_track is None:
+                                _camera_log(
+                                    camera_id,
+                                    f"[FACE] REJECTED | camera={camera_id} | "
+                                    f"reason=no_person_association | det_score={det_score:.3f}",
+                                )
+                                continue
+
+                            if FACE_ASSOCIATION_DEBUG:
+                                center_x = (face_box[0] + face_box[2]) / 2.0
+                                center_y = (face_box[1] + face_box[3]) / 2.0
+                                face_area = max(
+                                    (face_box[2] - face_box[0]) * (face_box[3] - face_box[1]),
+                                    1e-6,
+                                )
+                                overlap = (
+                                    max(0.0, min(face_box[2], associated_person_box[2]) - max(face_box[0], associated_person_box[0]))
+                                    * max(0.0, min(face_box[3], associated_person_box[3]) - max(face_box[1], associated_person_box[1]))
+                                    / face_area
+                                )
+                                _camera_log(
+                                    camera_id,
+                                    f"[FACE-ASSOCIATION] camera={camera_id} person_track={person_track['track_id']} "
+                                    f"person_box={tuple(int(value) for value in associated_person_box)} "
+                                    f"face_box={tuple(int(value) for value in face_box)} "
+                                    f"face_center=({center_x:.1f},{center_y:.1f}) overlap={overlap:.3f} associated=true",
+                                )
+
+                            track_key = (camera_id, int(person_track["track_id"]))
+                            current_hits = face_confirmation_state.get(track_key, 0)
+                            face_confirmation_state[track_key] = current_hits + 1
+                            if face_confirmation_state[track_key] < 2:
+                                _camera_log(
+                                    camera_id,
+                                    f"[FACE] REJECTED | camera={camera_id} | reason=temporal_confirmation_pending | "
+                                    f"track={person_track['track_id']} | hits={face_confirmation_state[track_key]}",
+                                )
+                                continue
+
                             associated_with_vehicle = (
                                 associated_person_box is not None
                                 and any(

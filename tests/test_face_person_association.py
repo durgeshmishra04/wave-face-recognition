@@ -32,3 +32,10 @@ def test_multiple_people_associate_to_the_correct_person_track():
 
     assert np.allclose(face_associated_with_person(face_for_a, [person_a, person_b], (480, 640)), person_a)
     assert np.allclose(face_associated_with_person(face_for_b, [person_a, person_b], (480, 640)), person_b)
+
+
+def test_face_touching_image_edge_is_rejected():
+    person_box = [50, 50, 220, 380]
+    face_box = [2, 90, 58, 150]
+
+    assert face_associated_with_person(face_box, [person_box], (480, 640)) is None

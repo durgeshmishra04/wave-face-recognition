@@ -18,7 +18,8 @@ FACE_PERSON_MIN_CENTER_INSIDE = (
     .lower()
     in {"1", "true", "yes", "on"}
 )
-FACE_PERSON_MIN_OVERLAP = float(os.getenv("FACE_PERSON_MIN_OVERLAP", "0.10"))
+FACE_PERSON_MIN_OVERLAP = float(os.getenv("FACE_PERSON_MIN_OVERLAP", "0.20"))
+FACE_ASSOCIATION_EDGE_MARGIN = float(os.getenv("FACE_ASSOCIATION_EDGE_MARGIN", "0.03"))
 
 
 def _intersection_area(first_box, second_box):
@@ -40,14 +41,20 @@ def _face_overlap_fraction(face_box, person_box):
     return _intersection_area(face_box, person_box) / face_area
 
 
-def face_associated_with_person(face_box, person_boxes, frame_shape):
-    """Require a valid spatial match to a tracked YOLO person before UX events.
+def face_association_metrics(face_box, person_box):
+    face_box = np.asarray(face_box, dtype=np.float32).reshape(4)
+    person_box = np.asarray(person_box, dtype=np.float32).reshape(4)
+    face_center_x = (float(face_box[0]) + float(face_box[2])) / 2.0
+    face_center_y = (float(face_box[1]) + float(face_box[3])) / 2.0
+    overlap = _face_overlap_fraction(face_box, person_box)
+    return {
+        "center": (face_center_x, face_center_y),
+        "overlap": float(overlap),
+    }
 
-    A face is accepted only when its center sits inside the person box (or it has a
-    meaningful overlap), and it remains in the upper/body region rather than the lower
-    torso/legs. This rejects poles, cables, lights, reflections, and other false
-    night-time objects while keeping genuine face detections for tracked people.
-    """
+
+def face_associated_with_person(face_box, person_boxes, frame_shape):
+    """Require a valid spatial match to a tracked YOLO person before UX events."""
     if not FACE_PERSON_ASSOCIATION_ENABLED:
         return None
 
@@ -62,6 +69,15 @@ def face_associated_with_person(face_box, person_boxes, frame_shape):
 
     frame_height, frame_width = frame_shape[:2]
     if frame_width <= 0 or frame_height <= 0:
+        return None
+
+    edge_margin = max(FACE_ASSOCIATION_EDGE_MARGIN, 0.0)
+    if (
+        face_box[0] < edge_margin * frame_width
+        or face_box[2] > frame_width * (1.0 - edge_margin)
+        or face_box[1] < edge_margin * frame_height
+        or face_box[3] > frame_height * (1.0 - edge_margin)
+    ):
         return None
 
     min_face_width = max(frame_width * 0.008, 12.0)
@@ -82,20 +98,15 @@ def face_associated_with_person(face_box, person_boxes, frame_shape):
         person_x1, person_y1, person_x2, person_y2 = [float(v) for v in person_box]
 
         center_inside = (
-            person_x1 - person_width * 0.08 <= face_center_x <= person_x2 + person_width * 0.08
-            and person_y1 - person_height * 0.08 <= face_center_y <= person_y2 + person_height * 0.08
+            person_x1 <= face_center_x <= person_x2
+            and person_y1 <= face_center_y <= person_y2
         )
         overlap = _face_overlap_fraction(face_box, person_box)
         upper_body_limit = person_y1 + person_height * 0.70
         face_in_upper_body = face_center_y <= upper_body_limit
         meaningful_overlap = overlap >= FACE_PERSON_MIN_OVERLAP
 
-        if FACE_PERSON_MIN_CENTER_INSIDE:
-            if center_inside and face_in_upper_body:
-                return person_box.astype(np.int32)
-            if meaningful_overlap and face_in_upper_body:
-                return person_box.astype(np.int32)
-        elif meaningful_overlap and face_in_upper_body:
+        if center_inside and meaningful_overlap and face_in_upper_body:
             return person_box.astype(np.int32)
 
     return None
