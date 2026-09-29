@@ -132,6 +132,7 @@ FACE_PERSON_MIN_CENTER_INSIDE = (
     in {"1", "true", "yes", "on"}
 )
 FACE_PERSON_MIN_OVERLAP = float(os.getenv("FACE_PERSON_MIN_OVERLAP", "0.20"))
+PERSON_FACE_CROP_PADDING = float(os.getenv("PERSON_FACE_CROP_PADDING", "0.05"))
 FACE_ASSOCIATION_DEBUG = (
     os.getenv("FACE_ASSOCIATION_DEBUG", "false")
     .strip()
@@ -2058,6 +2059,159 @@ def safe_face_inference(frame):
         return face_app.get(frame)
 
 
+def _map_crop_face_to_full_frame(face, crop_origin, frame_shape):
+    """Translate InsightFace crop-local coordinates back to full-frame coordinates."""
+    if face is None:
+        return face
+
+    crop_x, crop_y = crop_origin
+    frame_height, frame_width = frame_shape[:2]
+    if not hasattr(face, "bbox"):
+        return face
+
+    try:
+        bbox = np.asarray(face.bbox, dtype=np.float32).reshape(4).copy()
+        bbox[0] = np.clip(float(bbox[0]) + crop_x, 0.0, float(frame_width))
+        bbox[1] = np.clip(float(bbox[1]) + crop_y, 0.0, float(frame_height))
+        bbox[2] = np.clip(float(bbox[2]) + crop_x, 0.0, float(frame_width))
+        bbox[3] = np.clip(float(bbox[3]) + crop_y, 0.0, float(frame_height))
+        face.bbox = bbox.astype(np.int32)
+    except Exception:
+        pass
+
+    for attr_name in ("kps", "landmark_2d_106"):
+        points = getattr(face, attr_name, None)
+        if points is None:
+            continue
+        try:
+            points_array = np.asarray(points, dtype=np.float32)
+            if points_array.size == 0:
+                continue
+            if points_array.ndim == 2:
+                shifted = points_array.copy()
+                shifted[:, 0] = np.clip(shifted[:, 0] + crop_x, 0.0, float(frame_width))
+                shifted[:, 1] = np.clip(shifted[:, 1] + crop_y, 0.0, float(frame_height))
+                setattr(face, attr_name, shifted)
+        except Exception:
+            continue
+
+    return face
+
+
+def _detect_faces_in_person_crops(frame, person_boxes, person_tracks=None, camera_id=None):
+    """Run InsightFace only on YOLO-detected person crops and remap coordinates to full frame."""
+    if frame is None or frame.size == 0:
+        return []
+    if not person_boxes:
+        if camera_id is not None:
+            _camera_log(camera_id, "[FACE-CROP] InsightFace skipped | reason=no_person")
+        return []
+
+    frame_height, frame_width = frame.shape[:2]
+    detected_faces = []
+    person_count = 0
+    for person_box in person_boxes:
+        if person_box is None:
+            continue
+        try:
+            box = np.asarray(person_box, dtype=np.float32).reshape(4)
+        except Exception:
+            continue
+        if box.size != 4:
+            continue
+
+        x1, y1, x2, y2 = [float(v) for v in box]
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        width = max(float(x2 - x1), 1.0)
+        height = max(float(y2 - y1), 1.0)
+        pad_x = max(2, int(round(width * float(PERSON_FACE_CROP_PADDING))))
+        pad_y = max(2, int(round(height * float(PERSON_FACE_CROP_PADDING))))
+
+        crop_x1 = max(0, int(np.floor(x1 - pad_x)))
+        crop_y1 = max(0, int(np.floor(y1 - pad_y)))
+        crop_x2 = min(frame_width, int(np.ceil(x2 + pad_x)))
+        crop_y2 = min(frame_height, int(np.ceil(y2 + pad_y)))
+        if crop_x2 <= crop_x1 or crop_y2 <= crop_y1:
+            continue
+
+        track = (
+            _match_person_track(
+                [
+                    item for item in person_tracks
+                    if item.get("matched_this_frame")
+                ],
+                person_box,
+            )
+            if person_tracks is not None
+            else None
+        )
+        inside_roi = _person_track_in_roi(
+            track,
+            frame_width,
+            frame_height,
+            camera_id=camera_id,
+        )
+        if FACE_ASSOCIATION_DEBUG:
+            _camera_log(
+                camera_id,
+                f"[FACE-ROI] camera={camera_id} "
+                f"track={track['track_id'] if track is not None else 'none'} "
+                f"inside_roi={str(inside_roi).lower()} "
+                f"person_box={tuple(int(v) for v in box)}",
+            )
+        if track is None or not inside_roi:
+            if FACE_ASSOCIATION_DEBUG:
+                _camera_log(
+                    camera_id,
+                    f"[FACE-ROI] BLOCKED | camera={camera_id} | "
+                    f"track={track['track_id'] if track is not None else 'none'} | "
+                    "reason=outside_roi",
+                )
+            continue
+
+        person_count += 1
+        if FACE_ASSOCIATION_DEBUG:
+            _camera_log(
+                camera_id,
+                f"[FACE-ROI] ALLOWED | camera={camera_id} | "
+                f"track={track['track_id']}",
+            )
+
+        person_crop = frame[crop_y1:crop_y2, crop_x1:crop_x2]
+        if person_crop.size == 0:
+            continue
+
+        if FACE_ASSOCIATION_DEBUG:
+            _camera_log(
+                camera_id,
+                f"[FACE-CROP] camera={camera_id} person_track={track['track_id'] if track is not None else 'none'} "
+                f"person_box={tuple(int(v) for v in box)} crop_shape={person_crop.shape[:2]}"
+            )
+
+        crop_faces = safe_face_inference(person_crop)
+        if not crop_faces:
+            continue
+
+        for face in crop_faces:
+            mapped_face = _map_crop_face_to_full_frame(face, (crop_x1, crop_y1), frame.shape)
+            if mapped_face is not None:
+                mapped_face.person_box = np.asarray(person_box, dtype=np.int32)
+                mapped_face.crop_origin = (crop_x1, crop_y1)
+                mapped_face.person_track_id = track["track_id"]
+                detected_faces.append(mapped_face)
+
+    if not person_count and camera_id is not None:
+        _camera_log(camera_id, "[FACE-CROP] InsightFace skipped | reason=no_person")
+    if camera_id is not None and detected_faces:
+        _camera_log(
+            camera_id,
+            f"[FACE-CROP] camera={camera_id} face_count={len(detected_faces)} person_crops={person_count}",
+        )
+    return detected_faces
+
+
 def safe_registration_face_inference(frame):
     """Detect registration faces with safe retries for close-up portraits."""
     if face_app is None:
@@ -2607,6 +2761,29 @@ def face_in_roi(face_box, frame_width, frame_height, camera_id=None):
     )
 
     return in_center or in_bottom
+
+
+def _person_track_in_roi(person_track, frame_width, frame_height, camera_id=None):
+    """Use the existing person ROI and the tracked body center as the gate."""
+    if person_track is None:
+        return False
+
+    box = np.asarray(person_track.get("box", []), dtype=np.float32).reshape(-1)
+    if box.size != 4:
+        return False
+
+    roi_points = (
+        get_camera_roi(camera_id)["points"]
+        * np.array([frame_width, frame_height], dtype=np.float32)
+    )
+    if roi_points.shape[0] < 3:
+        return False
+
+    center = (
+        (float(box[0]) + float(box[2])) / 2.0,
+        (float(box[1]) + float(box[3])) / 2.0,
+    )
+    return cv2.pointPolygonTest(roi_points, center, False) >= 0
 
 
 def is_plausible_face_detection(face):
@@ -3423,7 +3600,12 @@ def camera_worker(camera_config, rtsp_url=None):
                             )
                         ]
 
-                        detected_faces = safe_face_inference(frame)
+                        detected_faces = _detect_faces_in_person_crops(
+                            frame,
+                            person_boxes,
+                            person_tracks=person_tracks,
+                            camera_id=camera_id,
+                        )
 
                         if detected_faces:
                             _camera_log(
@@ -3440,11 +3622,13 @@ def camera_worker(camera_config, rtsp_url=None):
                         for face in detected_faces:
                             det_score = float(getattr(face, "det_score", 0.0))
                             face_box = face.bbox.astype(int)
-                            associated_person_box = _face_associated_with_person(
-                                face_box,
-                                person_boxes,
-                                frame.shape,
-                            )
+                            associated_person_box = getattr(face, "person_box", None)
+                            if associated_person_box is None:
+                                associated_person_box = _face_associated_with_person(
+                                    face_box,
+                                    person_boxes,
+                                    frame.shape,
+                                )
                             if FACE_PERSON_ASSOCIATION_ENABLED and associated_person_box is None:
                                 _camera_log(
                                     camera_id,
@@ -3492,10 +3676,24 @@ def camera_worker(camera_config, rtsp_url=None):
                                 )
                                 continue
 
-                            person_track = _match_person_track(
-                                person_tracks,
-                                associated_person_box,
-                            ) if associated_person_box is not None else None
+                            person_track_id = getattr(face, "person_track_id", None)
+                            person_track = next(
+                                (
+                                    track for track in person_tracks
+                                    if track.get("matched_this_frame")
+                                    and person_track_id is not None
+                                    and track["track_id"] == person_track_id
+                                ),
+                                None,
+                            )
+                            if person_track is None and person_track_id is None:
+                                person_track = _match_person_track(
+                                    [
+                                        track for track in person_tracks
+                                        if track.get("matched_this_frame")
+                                    ],
+                                    associated_person_box,
+                                ) if associated_person_box is not None else None
                             if person_track is None:
                                 _camera_log(
                                     camera_id,
