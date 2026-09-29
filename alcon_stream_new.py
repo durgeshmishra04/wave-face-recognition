@@ -3835,6 +3835,27 @@ def camera_worker(camera_config, rtsp_url=None):
 
                         for face in last_faces:
 
+                            person_track_id = getattr(face, "person_track_id", None)
+                            person_track = next(
+                                (
+                                    track for track in person_tracks
+                                    if track.get("matched_this_frame")
+                                    and person_track_id is not None
+                                    and track["track_id"] == person_track_id
+                                ),
+                                None,
+                            )
+                            if (
+                                person_track is None
+                                or not _person_track_in_roi(
+                                    person_track,
+                                    frame.shape[1],
+                                    frame.shape[0],
+                                    camera_id=camera_id,
+                                )
+                            ):
+                                continue
+
                             (
                                 name,
                                 score
@@ -3853,18 +3874,7 @@ def camera_worker(camera_config, rtsp_url=None):
                                 None,
                             )
                             if current_body_box is None:
-                                current_body_box = next(
-                                    (
-                                        np.asarray(person_box, dtype=np.int32)
-                                        for person_box in person_boxes
-                                        if face_inside_person(current_box, person_box)
-                                    ),
-                                    None,
-                                )
-                            person_track = _match_person_track(
-                                person_tracks,
-                                current_body_box,
-                            ) if current_body_box is not None else None
+                                continue
                             face_is_in_roi = face_in_roi(
                                 current_box,
                                 frame.shape[1],
@@ -4064,20 +4074,23 @@ def camera_worker(camera_config, rtsp_url=None):
                                 seen_unknown_in_frame = True
 
 
+                        current_face_track_ids = {
+                            int(face.person_track_id)
+                            for face in last_faces
+                            if getattr(face, "person_track_id", None) is not None
+                        }
                         roi_person_boxes = [
                             person_box
                             for person_box in person_boxes
                             if (
-                                face_in_roi(
+                                (person_track := _match_person_track(
+                                    [
+                                        track for track in person_tracks
+                                        if track.get("matched_this_frame")
+                                    ],
                                     person_box,
-                                    frame.shape[1],
-                                    frame.shape[0],
-                                    camera_id=camera_id,
-                                )
-                                or any(
-                                    np.array_equal(person_box, vehicle_person_box)
-                                    for vehicle_person_box in vehicle_person_boxes
-                                )
+                                )) is not None
+                                and int(person_track["track_id"]) in current_face_track_ids
                             )
                         ]
                         last_event_people = []
@@ -4165,15 +4178,21 @@ def camera_worker(camera_config, rtsp_url=None):
                                     ),
                                     None,
                                 )
-                            person_track = (
-                                _match_person_track(person_tracks, body_box)
-                                if body_box is not None
-                                else None
+                            person_track_id = getattr(face, "person_track_id", None)
+                            person_track = next(
+                                (
+                                    track for track in person_tracks
+                                    if track.get("matched_this_frame")
+                                    and person_track_id is not None
+                                    and track["track_id"] == person_track_id
+                                ),
+                                None,
                             )
+                            if person_track is None:
+                                continue
                             track_id = (
                                 person_track["track_id"]
-                                if person_track is not None
-                                else None
+                                if person_track is not None else None
                             )
                             if track_id in event_person_track_ids:
                                 continue
