@@ -21,6 +21,56 @@ FACE_PERSON_MIN_CENTER_INSIDE = (
 FACE_PERSON_MIN_OVERLAP = float(os.getenv("FACE_PERSON_MIN_OVERLAP", "0.20"))
 FACE_ASSOCIATION_EDGE_MARGIN = float(os.getenv("FACE_ASSOCIATION_EDGE_MARGIN", "0.03"))
 
+FACE_VALIDATION_FIELDS = (
+    "valid_person",
+    "person_inside_roi",
+    "person_crop_valid",
+    "valid_face",
+    "face_inside_person",
+    "human_face_valid",
+    "face_belongs_to_person",
+)
+
+
+def face_box_inside_person(face_box, person_box):
+    """Require the complete face box to belong to the authoritative person box."""
+    try:
+        face = np.asarray(face_box, dtype=np.float32).reshape(4)
+        person = np.asarray(person_box, dtype=np.float32).reshape(4)
+    except (TypeError, ValueError):
+        return False
+
+    if not np.all(np.isfinite(face)) or not np.all(np.isfinite(person)):
+        return False
+    if face[2] <= face[0] or face[3] <= face[1]:
+        return False
+    return bool(
+        person[0] <= face[0]
+        and person[1] <= face[1]
+        and face[2] <= person[2]
+        and face[3] <= person[3]
+    )
+
+
+def is_validated_human_face(validation):
+    """Fail closed unless every live person/ROI/face gate passed."""
+    return bool(
+        isinstance(validation, dict)
+        and all(validation.get(field) is True for field in FACE_VALIDATION_FIELDS)
+        and type(validation.get("person_class")) is int
+        and validation.get("person_class") == 0
+        and validation.get("source") == "YOLO_PERSON_CROP"
+    )
+
+
+def is_validated_unknown_face(validation, recognition_decision):
+    """Require the full face gate and the existing UNKNOWN evidence score gate."""
+    return bool(
+        recognition_decision == "UNKNOWN"
+        and is_validated_human_face(validation)
+        and validation.get("unknown_face_score_valid") is True
+    )
+
 
 def _intersection_area(first_box, second_box):
     first_x1, first_y1, first_x2, first_y2 = map(float, first_box)

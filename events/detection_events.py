@@ -9,6 +9,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 from firebase_admin import messaging
+from face_association import is_validated_unknown_face
 
 
 class DetectionEventManager:
@@ -108,16 +109,42 @@ class DetectionEventManager:
                     incoming_state = "KNOWN"
                 elif identity_name == "Pending":
                     incoming_state = "PENDING"
-                elif event.get("detection_type") == "unknown_person":
+                elif (
+                    event.get("detection_type") == "unknown_person"
+                    and is_validated_unknown_face(
+                        event.get("face_validation"),
+                        event.get("recognition_decision"),
+                    )
+                ):
                     incoming_state = "UNKNOWN"
                 else:
                     incoming_state = "PENDING"
-            incoming_state = "KNOWN" if incoming_state == "KNOWN" else "PENDING"
+            unknown_validated = (
+                incoming_state == "UNKNOWN"
+                and is_validated_unknown_face(
+                    event.get("face_validation"),
+                    event.get("recognition_decision"),
+                )
+            )
+            if incoming_state == "UNKNOWN" and not unknown_validated:
+                incoming_state = "PENDING"
             event["recognition_state"] = incoming_state
             event["detection_type"] = (
                 "known_person" if incoming_state == "KNOWN" else "unknown_person"
             )
-        track = self._match_track(tracks, category, event["box"])
+        track_id = event.get("track_id")
+        track = next(
+            (
+                item for item in tracks
+                if track_id is not None
+                and item["category"] == category
+                and item.get("track_id") == track_id
+                and not item["matched_this_frame"]
+            ),
+            None,
+        )
+        if track is None and track_id is None:
+            track = self._match_track(tracks, category, event["box"])
         if track is None:
             track = {
                 "event_id": str(uuid.uuid4()),
@@ -126,6 +153,7 @@ class DetectionEventManager:
                 "category": category,
                 "state": "ENTERED_ROI",
                 "recognition_state": incoming_state if is_person else None,
+                "unknown_validated": bool(is_person and unknown_validated),
                 "known_person_id": event.get("person_id") if incoming_state == "KNOWN" else None,
                 "known_person_name": event.get("person_name") if incoming_state == "KNOWN" else None,
                 "known_confidence": event.get("confidence") if incoming_state == "KNOWN" else None,
@@ -168,11 +196,15 @@ class DetectionEventManager:
             previous_state = track.get("recognition_state", "PENDING")
             recognition_state = previous_state
             if is_person:
-                recognition_state = (
-                    "KNOWN"
-                    if previous_state == "KNOWN" or incoming_state == "KNOWN"
-                    else "PENDING"
-                )
+                if previous_state == "KNOWN" or incoming_state == "KNOWN":
+                    recognition_state = "KNOWN"
+                elif (
+                    previous_state == "UNKNOWN"
+                    and track.get("unknown_validated")
+                ) or unknown_validated:
+                    recognition_state = "UNKNOWN"
+                else:
+                    recognition_state = "PENDING"
             track.update({
                 "state": "TRACKING",
                 "last_seen": now,
@@ -184,6 +216,9 @@ class DetectionEventManager:
             })
             if is_person:
                 track["recognition_state"] = recognition_state
+                track["unknown_validated"] = bool(
+                    track.get("unknown_validated") or unknown_validated
+                )
                 track["known_detected_once"] = recognition_state == "KNOWN"
                 if recognition_state != previous_state:
                     print(
@@ -236,6 +271,7 @@ class DetectionEventManager:
         event["alert_generated"] = track["alert_generated"]
         event["event_finalized"] = track["event_finalized"]
         event["inside_roi"] = True
+        event["unknown_validated"] = track.get("unknown_validated", False)
         track["event"] = event.copy()
         track["vehicle_context_detected"] = track.get("vehicle_context_detected", False) or bool(event.get("vehicle_context_detected"))
         track["suppress_notify"] = track.get("suppress_notify", False) or bool(event.get("suppress_notify"))
@@ -407,6 +443,18 @@ class DetectionEventManager:
         print("[WARNING] No FCM sender configured; notification skipped.")
 
     def _publish(self, event, image, notify):
+        if event.get("detection_type") == "unknown_person" and not (
+            event.get("recognition_state") == "UNKNOWN"
+            and is_validated_unknown_face(
+                event.get("face_validation"),
+                event.get("recognition_decision"),
+            )
+        ):
+            print(
+                f"{self._camera_prefix()} [FACE EVENT] "
+                "UNKNOWN_REJECTED reason=missing_face_validation"
+            )
+            return None
         if self._is_duplicate_event(event):
             return None
 
@@ -452,8 +500,20 @@ class DetectionEventManager:
     def _person_event(self, face, gate_name, now):
         name = getattr(face, "recognized_name", "Unknown")
         recognition_state = getattr(face, "recognition_state", None)
+        validation = getattr(face, "face_validation", None)
+        recognition_decision = getattr(face, "recognition_decision", None)
         if recognition_state not in {"PENDING", "UNKNOWN", "KNOWN"}:
-            recognition_state = "KNOWN" if name != "Unknown" else "UNKNOWN"
+            recognition_state = (
+                "KNOWN"
+                if name not in {"Unknown", "Pending"}
+                else "UNKNOWN"
+                if is_validated_unknown_face(validation, recognition_decision)
+                else "PENDING"
+            )
+        if recognition_state == "UNKNOWN" and not (
+            is_validated_unknown_face(validation, recognition_decision)
+        ):
+            recognition_state = "PENDING"
         if recognition_state == "PENDING":
             name = "Pending"
         elif recognition_state == "UNKNOWN":
@@ -466,10 +526,24 @@ class DetectionEventManager:
         if annotation_box is None and getattr(face, "associated_person_box", None) is None:
             annotation_box = getattr(face, "bbox", None)
         known = recognition_state == "KNOWN"
-        return {"detected_at": now, "recognition_state": recognition_state, "detection_type": "known_person" if known else "unknown_person", "person_id": (getattr(face, "person_id", None) or self.person_ids.get(name)) if known else None, "person_name": name, "confidence": confidence, "gate_name": gate_name, "camera_id": self.camera_id, "camera_name": self.camera_name, "box": tuple(int(v) for v in body_box) if body_box is not None else None, "annotation_box": tuple(int(v) for v in annotation_box) if annotation_box is not None else None, "body_box": tuple(int(v) for v in body_box) if body_box is not None else None, "title": "Known Person Detected" if known else "Unknown Person Detected", "message": f"{name} detected at {gate_name}"}
+        return {"detected_at": now, "recognition_state": recognition_state, "recognition_decision": recognition_decision, "face_validation": validation, "detection_type": "known_person" if known else "unknown_person", "person_id": (getattr(face, "person_id", None) or self.person_ids.get(name)) if known else None, "person_name": name, "confidence": confidence, "gate_name": gate_name, "camera_id": self.camera_id, "camera_name": self.camera_name, "track_id": getattr(face, "track_id", None), "box": tuple(int(v) for v in body_box) if body_box is not None else None, "annotation_box": tuple(int(v) for v in annotation_box) if annotation_box is not None else None, "body_box": tuple(int(v) for v in body_box) if body_box is not None else None, "title": "Known Person Detected" if known else "Unknown Person Detected", "message": f"{name} detected at {gate_name}"}
 
     def _publish_unknowns(self, unknowns, gate_name, now):
         track, chosen = unknowns[0]
+        if not (
+            track.get("recognition_state") == "UNKNOWN"
+            and track.get("unknown_validated")
+            and is_validated_unknown_face(
+                track.get("event", {}).get("face_validation"),
+                track.get("event", {}).get("recognition_decision"),
+            )
+        ):
+            print(
+                f"{self._camera_prefix()} [FACE EVENT] "
+                f"track={track.get('track_id') or track.get('event_id')} "
+                "UNKNOWN_REJECTED reason=missing_face_validation"
+            )
+            return None
         if track["alert_generated"]:
             print(
                 f"{self._camera_prefix()} [FACE EVENT] "
@@ -572,14 +646,6 @@ class DetectionEventManager:
                 f"{self._camera_prefix()} [FACE EVENT] "
                 f"track={track_label} EXIT_ROI"
             )
-            if state != "KNOWN":
-                state = "UNKNOWN"
-                track["recognition_state"] = state
-                track["event"]["recognition_state"] = state
-                print(
-                    f"{self._camera_prefix()} [FACE EVENT] "
-                    f"track={track_label} FINAL=UNKNOWN"
-                )
             track["event_finalized"] = True
             track["event"].update({
                 "recognition_state": state,
@@ -602,7 +668,7 @@ class DetectionEventManager:
                     continue
                 self._draw_event(image, event)
                 records.append(self._publish(event, image, notify=False))
-            elif not track["alert_generated"]:
+            elif state == "UNKNOWN" and track.get("unknown_validated") and not track["alert_generated"]:
                 track["event"]["detection_type"] = "unknown_person"
                 records.append(self._publish_unknowns(
                     [(track, chosen)],

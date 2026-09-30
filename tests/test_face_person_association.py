@@ -1,6 +1,10 @@
 import numpy as np
 
-from face_association import face_associated_with_person
+from face_association import (
+    face_associated_with_person,
+    face_box_inside_person,
+    is_validated_human_face,
+)
 
 
 def test_valid_face_associated_to_person():
@@ -39,3 +43,29 @@ def test_face_touching_image_edge_is_rejected():
     face_box = [2, 90, 58, 150]
 
     assert face_associated_with_person(face_box, [person_box], (480, 640)) is None
+
+
+def test_face_box_must_be_fully_inside_authoritative_person_box():
+    person_box = [40, 40, 220, 380]
+
+    assert face_box_inside_person([90, 80, 160, 145], person_box)
+    assert not face_box_inside_person([210, 80, 240, 145], person_box)
+
+
+def test_unknown_face_validation_fails_closed():
+    valid = {
+        "valid_person": True,
+        "person_class": 0,
+        "person_inside_roi": True,
+        "person_crop_valid": True,
+        "valid_face": True,
+        "face_inside_person": True,
+        "human_face_valid": True,
+        "face_belongs_to_person": True,
+        "source": "YOLO_PERSON_CROP",
+    }
+
+    assert is_validated_human_face(valid)
+    assert not is_validated_human_face({**valid, "person_inside_roi": False})
+    assert not is_validated_human_face({**valid, "person_class": 16})
+    assert not is_validated_human_face({**valid, "source": "FULL_FRAME"})

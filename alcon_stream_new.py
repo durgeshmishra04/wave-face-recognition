@@ -76,7 +76,12 @@ from object_theft.config import (
     OBJECT_THEFT_MODEL_PATH,
     OBJECT_THEFT_ROI_ENABLED,
 )
-from face_association import face_associated_with_person as _face_associated_with_person
+from face_association import (
+    face_associated_with_person as _face_associated_with_person,
+    face_box_inside_person,
+    is_validated_human_face,
+    is_validated_unknown_face,
+)
 
 
 # ============================================================
@@ -2104,7 +2109,11 @@ def _detect_faces_in_person_crops(frame, person_boxes, person_tracks=None, camer
         return []
     if not person_boxes:
         if camera_id is not None:
-            _camera_log(camera_id, "[FACE-CROP] InsightFace skipped | reason=no_person")
+            _camera_log(
+                camera_id,
+                "[FACE GATE] No human person detected -> InsightFace SKIPPED",
+            )
+            _camera_log(camera_id, "[FACE REJECT] reason=NO_HUMAN_PERSON")
         return []
 
     frame_height, frame_width = frame.shape[:2]
@@ -2124,25 +2133,24 @@ def _detect_faces_in_person_crops(frame, person_boxes, person_tracks=None, camer
         if x2 <= x1 or y2 <= y1:
             continue
 
-        width = max(float(x2 - x1), 1.0)
-        height = max(float(y2 - y1), 1.0)
-        pad_x = max(2, int(round(width * float(PERSON_FACE_CROP_PADDING))))
-        pad_y = max(2, int(round(height * float(PERSON_FACE_CROP_PADDING))))
-
-        crop_x1 = max(0, int(np.floor(x1 - pad_x)))
-        crop_y1 = max(0, int(np.floor(y1 - pad_y)))
-        crop_x2 = min(frame_width, int(np.ceil(x2 + pad_x)))
-        crop_y2 = min(frame_height, int(np.ceil(y2 + pad_y)))
+        crop_x1 = max(0, int(np.floor(x1)))
+        crop_y1 = max(0, int(np.floor(y1)))
+        crop_x2 = min(frame_width, int(np.ceil(x2)))
+        crop_y2 = min(frame_height, int(np.ceil(y2)))
         if crop_x2 <= crop_x1 or crop_y2 <= crop_y1:
             continue
 
         track = (
-            _match_person_track(
-                [
+            next(
+                (
                     item for item in person_tracks
                     if item.get("matched_this_frame")
-                ],
-                person_box,
+                    and np.array_equal(
+                        np.asarray(item.get("box", []), dtype=np.int32),
+                        box.astype(np.int32),
+                    )
+                ),
+                None,
             )
             if person_tracks is not None
             else None
@@ -2153,42 +2161,56 @@ def _detect_faces_in_person_crops(frame, person_boxes, person_tracks=None, camer
             frame_height,
             camera_id=camera_id,
         )
-        if FACE_ASSOCIATION_DEBUG:
-            _camera_log(
-                camera_id,
-                f"[FACE-ROI] camera={camera_id} "
-                f"track={track['track_id'] if track is not None else 'none'} "
-                f"inside_roi={str(inside_roi).lower()} "
-                f"person_box={tuple(int(v) for v in box)}",
-            )
+        track_id = track["track_id"] if track is not None else "none"
+        _camera_log(
+            camera_id,
+            f"[ROI GATE] camera={camera_id} track_id={track_id} "
+            f"person_bbox={tuple(int(v) for v in box)} "
+            f"inside_roi={inside_roi}",
+        )
         if track is None or not inside_roi:
-            if FACE_ASSOCIATION_DEBUG:
+            if track is not None:
                 _camera_log(
                     camera_id,
-                    f"[FACE-ROI] BLOCKED | camera={camera_id} | "
-                    f"track={track['track_id'] if track is not None else 'none'} | "
-                    "reason=outside_roi",
+                    f"[ROI GATE] camera={camera_id} track_id={track_id} "
+                    "OUTSIDE ROI -> FACE SKIPPED",
                 )
+                _camera_log(
+                    camera_id,
+                    f"[FACE REJECT] camera={camera_id} track_id={track_id} "
+                    "reason=OUTSIDE_ROI",
+                )
+            _camera_log(
+                camera_id,
+                f"[FACE GATE] camera={camera_id} track_id={track_id} "
+                "action=SKIP reason=OUTSIDE_ROI",
+            )
             continue
 
         person_count += 1
-        if FACE_ASSOCIATION_DEBUG:
-            _camera_log(
-                camera_id,
-                f"[FACE-ROI] ALLOWED | camera={camera_id} | "
-                f"track={track['track_id']}",
-            )
+        _camera_log(
+            camera_id,
+            f"[ROI GATE] camera={camera_id} track_id={track_id} INSIDE ROI -> FACE ENABLED",
+        )
 
         person_crop = frame[crop_y1:crop_y2, crop_x1:crop_x2]
         if person_crop.size == 0:
-            continue
-
-        if FACE_ASSOCIATION_DEBUG:
             _camera_log(
                 camera_id,
-                f"[FACE-CROP] camera={camera_id} person_track={track['track_id'] if track is not None else 'none'} "
-                f"person_box={tuple(int(v) for v in box)} crop_shape={person_crop.shape[:2]}"
+                f"[FACE REJECT] camera={camera_id} track_id={track_id} "
+                "reason=INVALID_PERSON_CROP",
             )
+            continue
+
+        _camera_log(
+            camera_id,
+            f"[FACE GATE] camera={camera_id} track_id={track_id} action=PROCESS",
+        )
+        _camera_log(
+            camera_id,
+            f"[FACE SOURCE] camera={camera_id} track_id={track_id} "
+            "source=YOLO_PERSON_CROP",
+        )
 
         crop_faces = safe_face_inference(person_crop)
         if not crop_faces:
@@ -2196,14 +2218,44 @@ def _detect_faces_in_person_crops(frame, person_boxes, person_tracks=None, camer
 
         for face in crop_faces:
             mapped_face = _map_crop_face_to_full_frame(face, (crop_x1, crop_y1), frame.shape)
-            if mapped_face is not None:
-                mapped_face.person_box = np.asarray(person_box, dtype=np.int32)
-                mapped_face.crop_origin = (crop_x1, crop_y1)
-                mapped_face.person_track_id = track["track_id"]
-                detected_faces.append(mapped_face)
+            if mapped_face is None or not face_box_inside_person(
+                mapped_face.bbox, person_box,
+            ):
+                _camera_log(
+                    camera_id,
+                    f"[FACE REJECT] camera={camera_id} track_id={track_id} "
+                    "reason=FACE_OUTSIDE_PERSON",
+                )
+                continue
+            if not is_plausible_face_detection(mapped_face):
+                _camera_log(
+                    camera_id,
+                    f"[FACE REJECT] camera={camera_id} track_id={track_id} "
+                    "reason=NON_HUMAN_FACE",
+                )
+                continue
+            mapped_face.person_box = np.asarray(person_box, dtype=np.int32)
+            mapped_face.crop_origin = (crop_x1, crop_y1)
+            mapped_face.person_track_id = track["track_id"]
+            mapped_face.face_validation = {
+                "valid_person": True,
+                "person_class": 0,
+                "person_inside_roi": True,
+                "person_crop_valid": True,
+                "valid_face": True,
+                "face_inside_person": True,
+                "human_face_valid": True,
+                "face_belongs_to_person": True,
+                "unknown_face_score_valid": False,
+                "source": "YOLO_PERSON_CROP",
+            }
+            detected_faces.append(mapped_face)
 
     if not person_count and camera_id is not None:
-        _camera_log(camera_id, "[FACE-CROP] InsightFace skipped | reason=no_person")
+        _camera_log(
+            camera_id,
+            "[FACE GATE] No eligible human person inside ROI -> InsightFace SKIPPED",
+        )
     if camera_id is not None and detected_faces:
         _camera_log(
             camera_id,
@@ -2895,11 +2947,12 @@ def detect_person_boxes(frame):
         return []
 
     raw_boxes = results[0].boxes.xyxy.cpu().numpy()
+    raw_classes = results[0].boxes.cls.cpu().numpy()
     raw_scores = results[0].boxes.conf.cpu().numpy()
     person_boxes = [
         (box.astype(int), float(score))
-        for box, score in zip(raw_boxes, raw_scores)
-        if _is_plausible_human_box(box, frame.shape)
+        for box, class_id, score in zip(raw_boxes, raw_classes, raw_scores)
+        if int(class_id) == 0 and _is_plausible_human_box(box, frame.shape)
     ]
     deduplicated = deduplicate_person_boxes(
         [box for box, _ in person_boxes],
@@ -3395,6 +3448,11 @@ def camera_worker(camera_config, rtsp_url=None):
 
                         person_frame = frame
                         person_boxes = detect_person_boxes(person_frame)
+                        _camera_log(
+                            camera_id,
+                            f"[PERSON GATE] camera={camera_id} frame={frame_counter} "
+                            f"person_count={len(person_boxes)}",
+                        )
                         next_person_track_id = _update_person_tracks(
                             person_tracks,
                             person_boxes,
@@ -3623,35 +3681,27 @@ def camera_worker(camera_config, rtsp_url=None):
                             det_score = float(getattr(face, "det_score", 0.0))
                             face_box = face.bbox.astype(int)
                             associated_person_box = getattr(face, "person_box", None)
-                            if associated_person_box is None:
-                                associated_person_box = _face_associated_with_person(
+                            if (
+                                associated_person_box is None
+                                or not face_box_inside_person(
                                     face_box,
-                                    person_boxes,
-                                    frame.shape,
+                                    associated_person_box,
                                 )
-                            if FACE_PERSON_ASSOCIATION_ENABLED and associated_person_box is None:
+                            ):
                                 _camera_log(
                                     camera_id,
                                     f"[FACE] REJECTED | camera={camera_id} | "
-                                    f"reason=no_person_association | det_score={det_score:.3f} | "
+                                    f"reason=face_outside_person | det_score={det_score:.3f} | "
                                     f"face_box={tuple(int(value) for value in face_box)}",
                                 )
                                 continue
-                            if associated_person_box is None:
-                                _camera_log(
-                                    camera_id,
-                                    f"[FACE ASSOCIATION] camera={camera_id} "
-                                    f"face_box={tuple(int(value) for value in face_box)} "
-                                    "result=REJECT reason=no_person_association",
-                                )
-                            else:
-                                _camera_log(
-                                    camera_id,
-                                    f"[FACE ASSOCIATION] camera={camera_id} "
-                                    f"face_box={tuple(int(value) for value in face_box)} "
-                                    f"person_box={tuple(int(value) for value in associated_person_box)} "
-                                    "result=PASS",
-                                )
+                            _camera_log(
+                                camera_id,
+                                f"[FACE ASSOCIATION] camera={camera_id} "
+                                f"face_box={tuple(int(value) for value in face_box)} "
+                                f"person_box={tuple(int(value) for value in associated_person_box)} "
+                                "result=PASS",
+                            )
                             active_track_match = any(
                                 now - remembered_face["last_seen"]
                                 < KNOWN_IDENTITY_MEMORY_TIMEOUT
@@ -3686,19 +3736,30 @@ def camera_worker(camera_config, rtsp_url=None):
                                 ),
                                 None,
                             )
-                            if person_track is None and person_track_id is None:
-                                person_track = _match_person_track(
-                                    [
-                                        track for track in person_tracks
-                                        if track.get("matched_this_frame")
-                                    ],
-                                    associated_person_box,
-                                ) if associated_person_box is not None else None
                             if person_track is None:
                                 _camera_log(
                                     camera_id,
                                     f"[FACE] REJECTED | camera={camera_id} | "
                                     f"reason=no_person_association | det_score={det_score:.3f}",
+                                )
+                                continue
+                            if (
+                                not np.array_equal(
+                                    np.asarray(person_track.get("box"), dtype=np.int32),
+                                    np.asarray(associated_person_box, dtype=np.int32),
+                                )
+                                or not _person_track_in_roi(
+                                    person_track,
+                                    frame.shape[1],
+                                    frame.shape[0],
+                                    camera_id=camera_id,
+                                )
+                            ):
+                                _camera_log(
+                                    camera_id,
+                                    f"[FACE REJECT] camera={camera_id} "
+                                    f"track_id={person_track['track_id']} "
+                                    "reason=FACE_OUTSIDE_PERSON_OR_ROI",
                                 )
                                 continue
 
@@ -3756,6 +3817,33 @@ def camera_worker(camera_config, rtsp_url=None):
                                     "reason=outside_roi",
                                 )
                                 continue
+                            face_validation = dict(
+                                getattr(face, "face_validation", {})
+                            )
+                            face_validation.update({
+                                "valid_person": True,
+                                "person_class": 0,
+                                "person_inside_roi": True,
+                                "person_crop_valid": True,
+                                "valid_face": det_score >= FACE_RECOGNITION_MIN_DET_SCORE,
+                                "face_inside_person": True,
+                                "human_face_valid": is_plausible_face_detection(face),
+                                "face_belongs_to_person": True,
+                                "unknown_face_score_valid": (
+                                    det_score >= UNKNOWN_FACE_MIN_SCORE
+                                ),
+                                "source": "YOLO_PERSON_CROP",
+                            })
+                            if not is_validated_human_face(face_validation):
+                                _camera_log(
+                                    camera_id,
+                                    f"[FACE REJECT] camera={camera_id} "
+                                    f"track_id={person_track['track_id']} "
+                                    "reason=INVALID_FACE",
+                                )
+                                continue
+                            face.face_validation = face_validation
+                            person_track["face_validation"] = face_validation.copy()
                             _camera_log(
                                 camera_id,
                                 f"[FACE ROI] camera={camera_id} result=PASS"
@@ -3855,6 +3943,10 @@ def camera_worker(camera_config, rtsp_url=None):
                                 )
                             ):
                                 continue
+                            if not is_validated_human_face(
+                                getattr(face, "face_validation", None)
+                            ):
+                                continue
 
                             (
                                 name,
@@ -3862,6 +3954,11 @@ def camera_worker(camera_config, rtsp_url=None):
                             ) = recognize_face(
                                 face,
                                 camera_id=camera_id,
+                            )
+                            person_track["recognition_decision"] = getattr(
+                                face,
+                                "recognition_decision",
+                                "UNKNOWN",
                             )
 
                             current_box = (
@@ -4027,11 +4124,18 @@ def camera_worker(camera_config, rtsp_url=None):
                                     f"last_verified={retained_memory['last_verified_score']:.4f} | "
                                     "source=active_track",
                                 )
+                            elif getattr(face, "recognition_decision", None) == "PENDING":
+                                name = "Pending"
+                                face.person_id = None
                             else:
                                 name = "Unknown"
                                 face.person_id = None
 
-                            if person_track is not None and name == "Unknown":
+                            unknown_face_valid = is_validated_unknown_face(
+                                face.face_validation,
+                                getattr(face, "recognition_decision", None),
+                            )
+                            if person_track is not None and name == "Unknown" and unknown_face_valid:
                                 person_track.update({
                                     "identity_status": "UNKNOWN",
                                     "body_box": (
@@ -4050,14 +4154,22 @@ def camera_worker(camera_config, rtsp_url=None):
 
                             face.recognized_name = name
                             face.recognition_state = (
-                                "KNOWN" if name != "Unknown" else "UNKNOWN"
+                                "KNOWN"
+                                if name not in {"Unknown", "Pending"}
+                                else "UNKNOWN"
+                                if (
+                                    name == "Unknown"
+                                    and unknown_face_valid
+                                )
+                                else "PENDING"
                             )
 
                             face.recognition_score = score
                             face.in_roi = face_is_in_roi
-                            # A geometrically valid face may still be unknown;
-                            # database similarity must not suppress its alert.
-                            face.unknown_evidence = True
+                            face.unknown_evidence = (
+                                face.recognition_state == "UNKNOWN"
+                                and unknown_face_valid
+                            )
 
                             face_detection_score = float(
                                 getattr(face, "det_score", 0.0)
@@ -4066,6 +4178,7 @@ def camera_worker(camera_config, rtsp_url=None):
 
                             if (
                                 name == "Unknown"
+                                and face.recognition_state == "UNKNOWN"
                                 and face_is_in_roi
                                 and face.unknown_evidence
                                 and face_detection_score
@@ -4079,29 +4192,25 @@ def camera_worker(camera_config, rtsp_url=None):
                             for face in last_faces
                             if getattr(face, "person_track_id", None) is not None
                         }
-                        roi_person_boxes = [
-                            person_box
+                        roi_person_tracks = [
+                            person_track
                             for person_box in person_boxes
+                            for person_track in person_tracks
                             if (
-                                (person_track := _match_person_track(
-                                    [
-                                        track for track in person_tracks
-                                        if track.get("matched_this_frame")
-                                    ],
-                                    person_box,
-                                )) is not None
+                                person_track.get("matched_this_frame")
                                 and int(person_track["track_id"]) in current_face_track_ids
+                                and np.array_equal(
+                                    np.asarray(person_track.get("box"), dtype=np.int32),
+                                    np.asarray(person_box, dtype=np.int32),
+                                )
                             )
                         ]
                         last_event_people = []
                         event_person_track_ids = set()
-                        for person_box in roi_person_boxes:
-                            person_track = _match_person_track(
-                                person_tracks,
-                                person_box,
+                        for person_track in roi_person_tracks:
+                            person_box = np.asarray(
+                                person_track["box"], dtype=np.int32,
                             )
-                            if person_track is None:
-                                continue
 
                             identity_status = person_track.get("identity_status")
                             if identity_status == "KNOWN":
@@ -4131,6 +4240,12 @@ def camera_worker(camera_config, rtsp_url=None):
                                     ),
                                     recognized_name=identity_name,
                                     recognition_state=recognition_state,
+                                    recognition_decision=person_track.get(
+                                        "recognition_decision"
+                                    ),
+                                    face_validation=person_track.get(
+                                        "face_validation"
+                                    ),
                                     recognition_score=float(
                                         person_track.get("recognition_score", 0.0)
                                     ),
@@ -4139,98 +4254,6 @@ def camera_worker(camera_config, rtsp_url=None):
                                 )
                             )
                             event_person_track_ids.add(person_track["track_id"])
-
-                        # A valid classified face may outlive or miss its body
-                        # track. Preserve that recognition in the same manager.
-                        for face in last_faces:
-                            recognition_state = getattr(
-                                face,
-                                "recognition_state",
-                                "UNKNOWN" if getattr(face, "recognized_name", "Unknown") == "Unknown" else "KNOWN",
-                            )
-                            if (
-                                recognition_state not in {"KNOWN", "UNKNOWN"}
-                                or not (
-                                    getattr(face, "in_roi", False)
-                                    or getattr(face, "vehicle_context", False)
-                                )
-                            ):
-                                continue
-
-                            face_annotation = getattr(face, "annotation_box", None)
-                            face_box = np.asarray(
-                                face_annotation if face_annotation is not None else face.bbox,
-                                dtype=np.int32,
-                            )
-                            _camera_log(
-                                camera_id,
-                                "[UNKNOWN] FACE_DETECTED | "
-                                f"face_box={tuple(int(value) for value in face_box)}",
-                            )
-
-                            body_box = getattr(face, "associated_person_box", None)
-                            if body_box is None:
-                                body_box = next(
-                                    (
-                                        np.asarray(person_box, dtype=np.int32)
-                                        for person_box in person_boxes
-                                        if face_inside_person(face_box, person_box)
-                                    ),
-                                    None,
-                                )
-                            person_track_id = getattr(face, "person_track_id", None)
-                            person_track = next(
-                                (
-                                    track for track in person_tracks
-                                    if track.get("matched_this_frame")
-                                    and person_track_id is not None
-                                    and track["track_id"] == person_track_id
-                                ),
-                                None,
-                            )
-                            if person_track is None:
-                                continue
-                            track_id = (
-                                person_track["track_id"]
-                                if person_track is not None else None
-                            )
-                            if track_id in event_person_track_ids:
-                                continue
-
-                            tracking_box = (
-                                body_box if body_box is not None else face_box
-                            )
-                            last_event_people.append(
-                                SimpleNamespace(
-                                    bbox=np.asarray(tracking_box, dtype=np.int32),
-                                    associated_person_box=(
-                                        np.asarray(body_box, dtype=np.int32)
-                                        if body_box is not None
-                                        else None
-                                    ),
-                                    annotation_box=tuple(
-                                        int(value) for value in face_box
-                                    ),
-                                    recognized_name="Unknown",
-                                    recognition_state=recognition_state,
-                                    recognition_score=float(
-                                        getattr(face, "recognition_score", 0.0)
-                                    ),
-                                    person_id=getattr(face, "person_id", None),
-                                    track_id=track_id,
-                                )
-                            )
-                            if track_id is not None:
-                                event_person_track_ids.add(track_id)
-                            _camera_log(
-                                camera_id,
-                                "[FACE EVENT] PERSON_TRACK_ASSOCIATED | "
-                                f"result={'matched' if person_track is not None else 'face_fallback'}",
-                            )
-                            _camera_log(
-                                camera_id,
-                                "[FACE EVENT] EVENT_PERSON_QUEUED | source=face_fallback",
-                            )
 
                         unique_unknown_people = [
                             person
