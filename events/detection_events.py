@@ -529,38 +529,28 @@ class DetectionEventManager:
         return {"detected_at": now, "recognition_state": recognition_state, "recognition_decision": recognition_decision, "face_validation": validation, "detection_type": "known_person" if known else "unknown_person", "person_id": (getattr(face, "person_id", None) or self.person_ids.get(name)) if known else None, "person_name": name, "confidence": confidence, "gate_name": gate_name, "camera_id": self.camera_id, "camera_name": self.camera_name, "track_id": getattr(face, "track_id", None), "box": tuple(int(v) for v in body_box) if body_box is not None else None, "annotation_box": tuple(int(v) for v in annotation_box) if annotation_box is not None else None, "body_box": tuple(int(v) for v in body_box) if body_box is not None else None, "title": "Known Person Detected" if known else "Unknown Person Detected", "message": f"{name} detected at {gate_name}"}
 
     def _publish_unknowns(self, unknowns, gate_name, now):
-        track, chosen = unknowns[0]
-        if not (
-            track.get("recognition_state") == "UNKNOWN"
-            and track.get("unknown_validated")
-            and is_validated_unknown_face(
-                track.get("event", {}).get("face_validation"),
-                track.get("event", {}).get("recognition_decision"),
+        eligible_unknowns = [
+            (track, chosen)
+            for track, chosen in unknowns
+            if (
+                track.get("recognition_state") == "UNKNOWN"
+                and track.get("unknown_validated")
+                and not track.get("alert_generated")
+                and not track.get("inside_roi", False)
+                and is_validated_unknown_face(
+                    track.get("event", {}).get("face_validation"),
+                    track.get("event", {}).get("recognition_decision"),
+                )
             )
-        ):
-            print(
-                f"{self._camera_prefix()} [FACE EVENT] "
-                f"track={track.get('track_id') or track.get('event_id')} "
-                "UNKNOWN_REJECTED reason=missing_face_validation"
-            )
+        ]
+        if not eligible_unknowns:
             return None
-        if track["alert_generated"]:
-            print(
-                f"{self._camera_prefix()} [FACE EVENT] "
-                f"track={track['track_id'] or track['event_id']} "
-                "DUPLICATE_ALERT_SUPPRESSED"
-            )
-            return None
-        if (
-            track.get("recognition_state") == "KNOWN"
-            or track.get("inside_roi", False)
-        ):
-            return None
+        track, chosen = eligible_unknowns[0]
         event = track["event"].copy()
-        count = len(unknowns)
+        count = len(eligible_unknowns)
         vehicle_context = any(
             item[0].get("vehicle_context_detected")
-            for item in unknowns
+            for item in eligible_unknowns
         )
         event.update({"detected_at": now, "detection_type": "unknown_person", "recognition_state": "UNKNOWN", "person_name": "Unknown", "person_id": None, "camera_id": self.camera_id, "camera_name": self.camera_name, "unknown_count": count, "title": "Unknown Person Detected" if count == 1 else "Unknown Persons Detected", "message": f"Unknown person detected at {gate_name}" if count == 1 else f"{count} unknown persons detected at {gate_name}", "alert_generated": True, "event_finalized": True, "inside_roi": False})
         if vehicle_context:
@@ -572,7 +562,7 @@ class DetectionEventManager:
         except Exception as error:
             print(f"{self._camera_prefix()} [ERROR] Could not decode tracking frame: {error}")
             return None
-        for item, _ in unknowns:
+        for item, _ in eligible_unknowns:
             marked = item["event"].copy()
             marked["unknown_count"] = count
             self._draw_event(image, marked)
@@ -580,8 +570,9 @@ class DetectionEventManager:
             f"{self._camera_prefix()} [UNKNOWN] ALERT_CONFIRMED "
             f"| people={count}"
         )
-        track["alert_generated"] = True
-        track["event"]["alert_generated"] = True
+        for item, _ in eligible_unknowns:
+            item["alert_generated"] = True
+            item["event"]["alert_generated"] = True
         published = self._publish(event, image, notify=True)
         if published is None:
             print(
@@ -638,6 +629,7 @@ class DetectionEventManager:
         people = self._finalize_expired(self.active_person_events, detected_at)
         vehicles = self._finalize_expired(self.active_vehicle_events, detected_at)
         records = []
+        unknowns = []
         for track, chosen in people:
             state = track.get("recognition_state")
             track_label = track["track_id"] or track["event_id"]
@@ -670,11 +662,9 @@ class DetectionEventManager:
                 records.append(self._publish(event, image, notify=False))
             elif state == "UNKNOWN" and track.get("unknown_validated") and not track["alert_generated"]:
                 track["event"]["detection_type"] = "unknown_person"
-                records.append(self._publish_unknowns(
-                    [(track, chosen)],
-                    gate_name,
-                    detected_at,
-                ))
+                unknowns.append((track, chosen))
+        if unknowns:
+            records.append(self._publish_unknowns(unknowns, gate_name, detected_at))
         for track, chosen in vehicles:
             event = track["event"].copy(); event["detected_at"] = detected_at
             try:
