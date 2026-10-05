@@ -99,7 +99,12 @@ class ObjectTheftTracker:
         }
 
     def _confirm_removal(self, track, camera_id, confirmed):
-        if not track.get("presence_confirmed") or track.get("alert_generated"):
+        if (
+            not track.get("presence_confirmed")
+            or not track.get("last_seen_inside_roi")
+            or track.get("alert_generated")
+            or track.get("event_finalized")
+        ):
             return
         track["state"] = "REMOVAL_CONFIRMED"
         track["alert_generated"] = True
@@ -107,9 +112,12 @@ class ObjectTheftTracker:
         confirmed.append(self._event(track, camera_id))
         track["state"] = "FINALIZED"
         print(
-            "[OBJECT-THEFT] REMOVAL CONFIRMED "
+            "[OBJECT-THEFT][CONFIRMED] "
             f"camera={camera_id} track={track['track_id']} "
-            f"session={track['session_id']}"
+            f"presence_confirmed={bool(track.get('presence_confirmed'))} "
+            f"last_seen_inside_roi={bool(track.get('last_seen_inside_roi'))} "
+            f"visible=False missed={track.get('missed_frames', 0)}/{self.max_missed} "
+            f"action=REMOVAL_CONFIRMED"
         )
 
     def update(self, camera_id, detections, roi_polygon=None, now=None):
@@ -148,7 +156,7 @@ class ObjectTheftTracker:
                     "presence_confirmed": False,
                     "removal_confirmations": 0,
                     "missed_frames": 0,
-                    "state": "PRESENCE_CANDIDATE",
+                    "state": "PRESENCE_CANDIDATE" if inside else "OUTSIDE_ROI",
                     "alert_generated": False,
                     "event_finalized": False,
                     "session_id": uuid.uuid4().hex[:12],
@@ -158,12 +166,10 @@ class ObjectTheftTracker:
                 }
                 self.tracks.append(matched)
                 self._next_track_id += 1
-                if inside:
-                    print(
-                        "[OBJECT-THEFT] "
-                        f"track={matched['track_id']} state=PRESENCE_CANDIDATE "
-                        f"inside_roi=True presence=1/{self.confirm_frames}"
-                    )
+                print(
+                    f"[OBJECT-THEFT][ROI] camera={camera_id} track={matched['track_id']} "
+                    f"visible=True inside_roi={inside} state={matched['state']} action=MONITOR"
+                )
             else:
                 matched["matched_this_frame"] = True
                 matched["bbox"] = tuple(int(value) for value in detection["bbox"])
@@ -177,7 +183,7 @@ class ObjectTheftTracker:
                 matched["inside_roi"] = self._inside_roi(
                     matched["bbox"], roi_polygon
                 )
-                matched["last_seen_inside_roi"] = matched["inside_roi"]
+                matched["last_seen_inside_roi"] = bool(matched["inside_roi"])
 
             matched["canonical_class"] = detection.get(
                 "canonical_class", matched.get("canonical_class", "DRUM_CONTAINER")
@@ -199,6 +205,7 @@ class ObjectTheftTracker:
                             * (matched["bbox"][3] - matched["bbox"][1]),
                             1.0,
                         )
+                        matched["last_seen_inside_roi"] = True
                         print(
                             "[OBJECT-THEFT] "
                             f"track={matched['track_id']} state=PRESENT "
@@ -206,55 +213,63 @@ class ObjectTheftTracker:
                         )
                 else:
                     matched["presence_confirmations"] = 0
-                    matched["state"] = "PRESENCE_CANDIDATE"
+                    matched["state"] = "OUTSIDE_ROI"
+                    matched["last_seen_inside_roi"] = False
+                    print(
+                        f"[OBJECT-THEFT][ROI] camera={camera_id} track={matched['track_id']} "
+                        f"visible=True inside_roi=False state=OUTSIDE_ROI action=IGNORE_FOR_THEFT"
+                    )
                 continue
 
             if inside:
-                if matched.get("state") == "REMOVAL_CANDIDATE":
-                    print(
-                        "[OBJECT-THEFT][ROI] "
-                        f"track={matched['track_id']} "
-                        f"center={matched['center']} inside_roi=True "
-                        "action=CANCEL_REMOVAL state=PRESENT"
-                    )
                 matched["state"] = "PRESENT"
+                matched["last_seen_inside_roi"] = True
                 matched["removal_confirmations"] = 0
                 matched["missed_frames"] = 0
                 print(
-                    "[OBJECT-THEFT][ROI] "
-                    f"track={matched['track_id']} center={matched['center']} "
-                    "inside_roi=True state=PRESENT"
+                    f"[OBJECT-THEFT][ROI] camera={camera_id} track={matched['track_id']} "
+                    f"visible=True inside_roi=True state=PRESENT action=MONITOR"
                 )
             else:
-                matched["state"] = "REMOVAL_CANDIDATE"
-                matched["removal_confirmations"] += 1
+                matched["state"] = "OUTSIDE_ROI"
+                matched["last_seen_inside_roi"] = False
+                matched["removal_confirmations"] = 0
+                matched["missed_frames"] = 0
                 print(
-                    "[OBJECT-THEFT][ROI] "
-                    f"track={matched['track_id']} center={matched['center']} "
-                    "inside_roi=False state=REMOVAL_CANDIDATE "
-                    f"outside_count={matched['removal_confirmations']}/{self.max_missed}"
+                    f"[OBJECT-THEFT][ROI] camera={camera_id} track={matched['track_id']} "
+                    f"visible=True inside_roi=False state=OUTSIDE_ROI action=IGNORE_FOR_THEFT"
                 )
-                if matched["removal_confirmations"] >= self.max_missed:
-                    self._confirm_removal(matched, camera_id, confirmed)
 
         for track in self.tracks:
             if track["track_id"] in seen or track.get("event_finalized"):
                 continue
-            track["missed_frames"] += 1
+
             if not track.get("presence_confirmed"):
-                track["presence_confirmations"] = 0
                 track["state"] = "PRESENCE_CANDIDATE"
+                track["missed_frames"] = 0
+                track["removal_confirmations"] = 0
                 continue
-            track["state"] = "REMOVAL_CANDIDATE"
-            track["removal_confirmations"] += 1
+
+            if not track.get("last_seen_inside_roi"):
+                track["state"] = "OUTSIDE_ROI"
+                track["missed_frames"] = 0
+                track["removal_confirmations"] = 0
+                print(
+                    f"[OBJECT-THEFT][ROI] camera={camera_id} track={track['track_id']} "
+                    f"visible=False inside_roi=False state=OUTSIDE_ROI action=NO_THEFT"
+                )
+                continue
+
+            track["missed_frames"] += 1
+            track["state"] = "MISSING_CANDIDATE"
             print(
-                "[OBJECT-THEFT][ROI] "
-                f"track={track['track_id']} center={track['center']} "
-                "inside_roi=False state=REMOVAL_CANDIDATE "
-                f"outside_count={track['removal_confirmations']}/{self.max_missed}"
+                f"[OBJECT-THEFT][MISSING] camera={camera_id} track={track['track_id']} "
+                f"visible=False last_seen_inside_roi=True missed={track['missed_frames']}/{self.max_missed}"
             )
-            if track["removal_confirmations"] >= self.max_missed:
-                self._confirm_removal(track, camera_id, confirmed)
+
+            if track["missed_frames"] >= self.max_missed:
+                if not track.get("alert_generated"):
+                    self._confirm_removal(track, camera_id, confirmed)
 
         self.tracks = [
             track for track in self.tracks if track.get("active", True)
