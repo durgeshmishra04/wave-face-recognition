@@ -172,3 +172,34 @@ class DetectionDatabase:
             item.pop("created_at", None)
             detections.append(item)
         return detections
+
+    def delete_event(self, event_id):
+        """Delete one persisted event and report whether its image is shared."""
+        connection = self.connect()
+        try:
+            row = connection.execute(
+                "SELECT image_url FROM detection_records WHERE id = %s",
+                (event_id,),
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                return None
+
+            image_url = row[0]
+            connection.execute(
+                "DELETE FROM detection_records WHERE id = %s",
+                (event_id,),
+            )
+            image_is_shared = False
+            if image_url:
+                image_is_shared = connection.execute(
+                    "SELECT 1 FROM detection_records WHERE image_url = %s LIMIT 1",
+                    (image_url,),
+                ).fetchone() is not None
+            connection.commit()
+            return {"image_url": image_url, "image_is_shared": image_is_shared}
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()

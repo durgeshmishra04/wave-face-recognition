@@ -6155,6 +6155,44 @@ def api_detections():
     )
 
 
+@app.route("/api/events/<int:event_id>", methods=["DELETE"])
+def api_delete_event(event_id):
+    try:
+        deleted = detection_database.delete_event(event_id)
+    except Exception as error:
+        print(f"[ERROR] Event deletion failed for id={event_id}: {error}")
+        return jsonify({
+            "success": False,
+            "message": "Event deletion failed",
+            "event_id": event_id,
+        }), 500
+
+    if deleted is None:
+        return jsonify({
+            "success": False,
+            "message": "Event not found",
+            "event_id": event_id,
+        }), 404
+
+    image_url = deleted["image_url"]
+    if image_url and not deleted["image_is_shared"]:
+        image_path = urlsplit(image_url).path
+        image_filename = image_path.rsplit("/", 1)[-1]
+        if image_path.startswith("/alerts/") and image_filename:
+            candidate = (ALERT_IMAGE_DIR / image_filename).resolve()
+            if candidate.parent == ALERT_IMAGE_DIR.resolve():
+                try:
+                    candidate.unlink(missing_ok=True)
+                except OSError as error:
+                    print(f"[WARNING] Could not remove event image for id={event_id}: {error}")
+
+    return jsonify({
+        "success": True,
+        "message": "Event deleted successfully",
+        "event_id": event_id,
+    })
+
+
 @app.route(
     "/api/snapshot",
     methods=["GET"]
