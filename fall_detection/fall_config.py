@@ -15,7 +15,7 @@ FALL_CONFIRMATION_FRAMES = max(2, int(os.getenv("FALL_CONFIRMATION_FRAMES", "2")
 FALL_RECOVERY_FRAMES = max(2, int(os.getenv("FALL_RECOVERY_FRAMES", "5")))
 FALL_MIN_NORMAL_FRAMES = max(1, int(os.getenv("FALL_MIN_NORMAL_FRAMES", "2")))
 # A camera can first observe a person after they have already fallen. Keep
-# temporal confirmation, but do not require an unseen upright transition.
+
 # Set this true only to restore the legacy transition-only behaviour.
 FALL_REQUIRE_UPRIGHT_TRANSITION = os.getenv(
     "FALL_REQUIRE_UPRIGHT_TRANSITION", "false"
