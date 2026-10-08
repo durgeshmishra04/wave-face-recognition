@@ -6,7 +6,7 @@ import os
 # existing SMOKE_FIRE_ENABLED name as a backwards-compatible alias.
 FIRE_DETECTION_ENABLED = os.getenv(
     "FIRE_DETECTION_ENABLED",
-    os.getenv("SMOKE_FIRE_ENABLED", "true"),
+    os.getenv("SMOKE_FIRE_ENABLED", "false"),
 ).strip().lower() in {"1", "true", "yes", "on"}
 SMOKE_FIRE_ENABLED = FIRE_DETECTION_ENABLED
 SMOKE_FIRE_TEST_MODE = os.getenv("SMOKE_FIRE_TEST_MODE", "false").strip().lower() in {"1", "true", "yes", "on"}
