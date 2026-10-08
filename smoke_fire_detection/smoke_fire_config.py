@@ -6,12 +6,12 @@ import os
 # existing SMOKE_FIRE_ENABLED name as a backwards-compatible alias.
 FIRE_DETECTION_ENABLED = os.getenv(
     "FIRE_DETECTION_ENABLED",
-    os.getenv("SMOKE_FIRE_ENABLED", "false"),
+    os.getenv("SMOKE_FIRE_ENABLED", "true"),
 ).strip().lower() in {"1", "true", "yes", "on"}
 SMOKE_FIRE_ENABLED = FIRE_DETECTION_ENABLED
 SMOKE_FIRE_TEST_MODE = os.getenv("SMOKE_FIRE_TEST_MODE", "false").strip().lower() in {"1", "true", "yes", "on"}
 SMOKE_FIRE_MODEL_PATH = os.getenv("SMOKE_FIRE_MODEL_PATH", "salahyolo26.pt")
-SMOKE_CONFIDENCE_THRESHOLD = float(os.getenv("SMOKE_CONFIDENCE_THRESHOLD", "0.50"))
+SMOKE_CONFIDENCE_THRESHOLD = float(os.getenv("SMOKE_CONFIDENCE_THRESHOLD", "0.30"))
 FIRE_CONFIDENCE_THRESHOLD = float(os.getenv("FIRE_CONFIDENCE_THRESHOLD", "0.50"))
 SMOKE_FIRE_IOU = float(os.getenv("SMOKE_FIRE_IOU", "0.45"))
 SMOKE_FIRE_CONFIRM_FRAMES = max(2, int(os.getenv("SMOKE_FIRE_CONFIRM_FRAMES", "3")))
