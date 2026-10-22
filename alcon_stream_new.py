@@ -17,6 +17,12 @@ import signal
 from collections import deque
 from types import SimpleNamespace
 
+from dotenv import load_dotenv
+
+from runtime_paths import resolve_model_path, resolve_runtime_path, runtime_root
+
+load_dotenv(runtime_root() / ".env")
+
 import firebase_admin
 from firebase_admin import credentials, messaging
 
@@ -29,12 +35,6 @@ try:
     from ultralytics import YOLO
 except ImportError:
     YOLO = None
-
-from dotenv import load_dotenv
-
-# Load deployment switches before importing camera and KPI configuration
-# modules, which read their values at module initialization time.
-load_dotenv()
 
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
@@ -88,8 +88,8 @@ from face_association import (
 # CONFIGURATION
 # ============================================================
 
-DEFAULT_NVR_IP = os.getenv("NVR_IP", "115.247.225.82")
-NVR_USERNAME = "alcon"
+DEFAULT_NVR_IP = os.getenv("NVR_IP", "")
+NVR_USERNAME = os.getenv("NVR_USERNAME", "alcon")
 NVR_PASSWORD = os.getenv("ALCON_PASSWORD", "")
 
 RTSP_PORT = 554
@@ -183,14 +183,16 @@ KNOWN_IDENTITY_MEMORY_TIMEOUT = float(
 PERSON_TRACK_TIMEOUT = float(
     os.getenv("PERSON_TRACK_TIMEOUT", str(KNOWN_IDENTITY_MEMORY_TIMEOUT))
 )
-PERSON_MODEL = os.getenv("PERSON_MODEL", "yolo11n.pt")
+PERSON_MODEL = str(resolve_model_path(os.getenv("PERSON_MODEL", "yolo11n.pt")))
 PERSON_CONFIDENCE = float(os.getenv("PERSON_CONFIDENCE", "0.45"))
 PERSON_IOU = float(os.getenv("PERSON_IOU", "0.45"))
 PERSON_DEDUP_IOU = float(os.getenv("PERSON_DEDUP_IOU", "0.50"))
 
 USE_GPU = os.getenv("USE_GPU", "auto").strip().lower()
 CUDA_DEVICE_ID = int(os.getenv("CUDA_DEVICE_ID", "0"))
-VEHICLE_MODEL_PATH = "yolo26l.pt"
+VEHICLE_MODEL_PATH = str(
+    resolve_model_path(os.getenv("VEHICLE_MODEL_PATH", "yolo26l.pt"))
+)
 VEHICLE_CONFIDENCE = 0.45
 VEHICLE_DEVICE = f"cuda:{CUDA_DEVICE_ID}"
 TWO_WHEELER_CLASSES = {
@@ -207,19 +209,18 @@ VEHICLE_DEDUP_IOU = float(os.getenv("VEHICLE_DEDUP_IOU", "0.50"))
 AUTH_PASSWORD_HASH_ITERATIONS = int(
     os.getenv("AUTH_PASSWORD_HASH_ITERATIONS", "210000")
 )
-DEFAULT_ADMIN_USERNAME = os.getenv("ADMIN_LOGIN_USERNAME", "admin")
-DEFAULT_ADMIN_PASSWORD = os.getenv("ADMIN_LOGIN_PASSWORD", "admin123")
-DEFAULT_USER_USERNAME = os.getenv("USER_LOGIN_USERNAME", "user")
-DEFAULT_USER_PASSWORD = os.getenv("USER_LOGIN_PASSWORD", "user123")
+DEFAULT_ADMIN_USERNAME = os.getenv("ADMIN_LOGIN_USERNAME", "")
+DEFAULT_ADMIN_PASSWORD = os.getenv("ADMIN_LOGIN_PASSWORD", "")
+DEFAULT_USER_USERNAME = os.getenv("USER_LOGIN_USERNAME", "")
+DEFAULT_USER_PASSWORD = os.getenv("USER_LOGIN_PASSWORD", "")
 
-# Resolve this from the source file, not the process working directory. This
-# keeps known faces and finalized detection history on the same server DB even
-# when the service is started by Android deployment tooling or a scheduler.
-PROJECT_DIR = Path(__file__).resolve().parent
+# Keep configuration and persistent data rooted outside the frozen executable
+# when WAVE_RUNTIME_DIR is configured by the service.
+PROJECT_DIR = runtime_root()
 KNOWN_FACES_DIR = PROJECT_DIR / "known_faces"
 
-HOST = "0.0.0.0"
-PORT = 5000
+HOST = os.getenv("HOST", "0.0.0.0")
+PORT = int(os.getenv("PORT", "5000"))
 
 CAMERA_CONFIG_PATH = PROJECT_DIR / "config" / "cameras.json"
 
@@ -234,15 +235,9 @@ CAMERA_CONFIG_PATH = PROJECT_DIR / "config" / "cameras.json"
 ALERT_IMAGE_DIR = PROJECT_DIR / "alert_images"
 ALERT_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
 
-# IMPORTANT:
-# Change this to your actual public HTTPS domain.
-#
-# Example:
-# PUBLIC_BASE_URL = "https://bhcs.biconnect.in"
-#
 PUBLIC_BASE_URL = os.getenv(
     "PUBLIC_BASE_URL",
-    "http://103.234.71.168:5000/"
+    ""
 ).rstrip("/")
 
 
@@ -543,17 +538,17 @@ def initialize_firebase():
             print("[INFO] Firebase already initialized.")
             return
 
-        firebase_json = os.getenv(
+        firebase_json = resolve_runtime_path(os.getenv(
             "FIREBASE_SERVICE_ACCOUNT",
-            "./pythonai.json"
-        )
+            "pythonai.json"
+        ))
 
-        if not os.path.exists(firebase_json):
+        if not firebase_json.exists():
             raise FileNotFoundError(
                 f"Firebase service account not found: {firebase_json}"
             )
 
-        cred = credentials.Certificate(firebase_json)
+        cred = credentials.Certificate(str(firebase_json))
 
         firebase_admin.initialize_app(cred)
 
@@ -741,6 +736,9 @@ def initialize_face_model():
 
     face_app = FaceAnalysis(
         name="buffalo_l",
+        root=str(
+            resolve_runtime_path(os.getenv("INSIGHTFACE_HOME", ".insightface"))
+        ),
         providers=providers
     )
 

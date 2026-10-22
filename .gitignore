@@ -10,6 +10,10 @@ __pycache__/
 .venv/
 venv/
 env/
+.build-venv/
+/build/
+/dist/
+/release/
 
 # Local runtime/cache data
 known_faces/known_faces.db

@@ -2,6 +2,8 @@
 
 import os
 
+from runtime_paths import resolve_model_path
+
 # HELMET_DETECTION_ENABLED controls the complete PPE/helmet KPI globally.
 # The earlier PPE switches remain supported for existing deployments.
 HELMET_DETECTION_ENABLED = os.getenv(
@@ -9,7 +11,9 @@ HELMET_DETECTION_ENABLED = os.getenv(
     os.getenv("PPE_ENABLED", os.getenv("PPE_DETECTION_ENABLED", "true")),
 ).strip().lower() in {"1", "true", "yes", "on"}
 PPE_ENABLED = HELMET_DETECTION_ENABLED
-PPE_MODEL_PATH = os.getenv("PPE_MODEL_PATH", "yolo26n_ppe.pt")
+PPE_MODEL_PATH = str(
+    resolve_model_path(os.getenv("PPE_MODEL_PATH", "yolo26n_ppe.pt"))
+)
 PPE_CONFIDENCE = float(os.getenv("PPE_CONFIDENCE", "0.55"))
 PPE_IOU = float(os.getenv("PPE_IOU", "0.45"))
 HELMET_ENABLED = os.getenv("HELMET_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}

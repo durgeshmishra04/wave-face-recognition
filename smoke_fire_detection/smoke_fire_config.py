@@ -2,6 +2,8 @@
 
 import os
 
+from runtime_paths import resolve_model_path
+
 # FIRE_DETECTION_ENABLED is the deployment-facing global switch. Keep the
 # existing SMOKE_FIRE_ENABLED name as a backwards-compatible alias.
 FIRE_DETECTION_ENABLED = os.getenv(
@@ -10,7 +12,9 @@ FIRE_DETECTION_ENABLED = os.getenv(
 ).strip().lower() in {"1", "true", "yes", "on"}
 SMOKE_FIRE_ENABLED = FIRE_DETECTION_ENABLED
 SMOKE_FIRE_TEST_MODE = os.getenv("SMOKE_FIRE_TEST_MODE", "false").strip().lower() in {"1", "true", "yes", "on"}
-SMOKE_FIRE_MODEL_PATH = os.getenv("SMOKE_FIRE_MODEL_PATH", "salahyolo26.pt")
+SMOKE_FIRE_MODEL_PATH = str(
+    resolve_model_path(os.getenv("SMOKE_FIRE_MODEL_PATH", "salahyolo26.pt"))
+)
 SMOKE_CONFIDENCE_THRESHOLD = float(os.getenv("SMOKE_CONFIDENCE_THRESHOLD", "0.30"))
 FIRE_CONFIDENCE_THRESHOLD = float(os.getenv("FIRE_CONFIDENCE_THRESHOLD", "0.50"))
 SMOKE_FIRE_IOU = float(os.getenv("SMOKE_FIRE_IOU", "0.45"))

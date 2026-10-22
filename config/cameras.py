@@ -6,7 +6,7 @@ from pathlib import Path
 
 from config.settings import PROJECT_ROOT
 
-DEFAULT_NVR_IP = os.getenv("NVR_IP", "115.247.225.82")
+DEFAULT_NVR_IP = os.getenv("NVR_IP", "")
 CAMERA_CONFIG_PATH = PROJECT_ROOT / "config" / "cameras.json"
 
 
@@ -31,7 +31,11 @@ def load_cameras(config_path=CAMERA_CONFIG_PATH):
         if not name:
             raise ValueError(f"Camera entry is missing name for {camera_id!r}")
 
-        nvr_ip = os.getenv(f"{camera_id}_NVR_IP", item.get("nvr_ip", DEFAULT_NVR_IP))
+        nvr_ip = (
+            os.getenv(f"{camera_id}_NVR_IP")
+            or item.get("nvr_ip")
+            or DEFAULT_NVR_IP
+        )
         channel = int(os.getenv(f"{camera_id}_CHANNEL", str(item.get("channel", 1))))
         if channel in seen_channels:
             raise ValueError(f"Duplicate channel value: {channel} used by {camera_id!r}")

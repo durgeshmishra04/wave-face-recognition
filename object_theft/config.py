@@ -3,6 +3,8 @@
 import json
 import os
 
+from runtime_paths import resolve_model_path
+
 
 def _env_bool(name, default):
     value = os.getenv(name, str(default)).strip().lower()
@@ -19,7 +21,12 @@ def _parse_cameras(raw_value):
 
 OBJECT_THEFT_ENABLED = _env_bool("OBJECT_THEFT_ENABLED", "true")
 OBJECT_THEFT_CAMERAS = _parse_cameras(os.getenv("OBJECT_THEFT_CAMERAS", "CAM008"))
-OBJECT_THEFT_MODEL_PATH = os.getenv("OBJECT_THEFT_MODEL_PATH", "barrel.pt").strip()
+_object_theft_model_path = os.getenv("OBJECT_THEFT_MODEL_PATH", "barrel.pt").strip()
+OBJECT_THEFT_MODEL_PATH = (
+    str(resolve_model_path(_object_theft_model_path))
+    if _object_theft_model_path
+    else ""
+)
 OBJECT_THEFT_CONFIDENCE_THRESHOLD = float(
     os.getenv("OBJECT_THEFT_CONFIDENCE_THRESHOLD", "0.70")
 )
