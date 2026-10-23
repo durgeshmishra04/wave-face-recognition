@@ -49,16 +49,20 @@ from config.cameras import CAMERAS, enabled_cameras
 from roi.camera_rois import get_camera_roi
 from fall_detection import FallDetector
 from fall_detection.fall_config import (
+    FALL_CAMERAS,
     FALL_DETECTION_ENABLED,
     FALL_ENABLED,
     FALL_MODEL_PATH,
+    is_fall_camera_enabled,
 )
 from ppe_detection import PPEDetector
 from ppe_detection.ppe_config import (
     HELMET_DETECTION_ENABLED,
     PPE_ANNOTATION_ENABLED,
+    PPE_CAMERAS,
     PPE_ENABLED,
     PPE_MODEL_PATH,
+    is_ppe_camera_enabled,
 )
 from smoke_fire_detection import SmokeFireDetector
 from smoke_fire_detection.smoke_fire_config import (
@@ -427,13 +431,11 @@ def _socket_frame_emitter():
 
 
 def _should_run_kpi(camera_id, kpi_name):
-    """Central KPI scope: fire/smoke/known/unknown run on all enabled cameras,
-    while helmet/fall are restricted to CAM008 only.
-    """
-    camera_ref = str(camera_id or "").upper()
-    restricted_kpis = {"helmet", "fall"}
-    if kpi_name in restricted_kpis:
-        return camera_ref == "CAM008"
+    """Return whether a camera is configured to run the requested KPI."""
+    if kpi_name == "helmet":
+        return is_ppe_camera_enabled(camera_id)
+    if kpi_name == "fall":
+        return is_fall_camera_enabled(camera_id)
     return True
 
 
@@ -774,7 +776,8 @@ def initialize_fall_detector():
     print(f"[INFO] Loading fall pose detector: {FALL_MODEL_PATH}...")
     fall_detector = FallDetector(FALL_MODEL_PATH, YOLO)
     print("[OK] Fall pose detector loaded.")
-    print("[FALL] ENABLED | scope=CAM008_ONLY")
+    fall_scope = ",".join(sorted(FALL_CAMERAS)) or "NONE"
+    print(f"[FALL] ENABLED | scope={fall_scope}")
 
 
 def initialize_ppe_detector():
@@ -796,7 +799,8 @@ def initialize_ppe_detector():
         print(f"[PPE MODEL] classes={actual_classes}")
         print(f"[PPE MODEL] supported={supported} missing={missing}")
         print("[OK] PPE detector loaded (only confirmed Helmet sessions alert).")
-        print("[HELMET] ENABLED | scope=CAM008_ONLY")
+        ppe_scope = ",".join(sorted(PPE_CAMERAS)) or "NONE"
+        print(f"[HELMET] ENABLED | scope={ppe_scope}")
     except Exception as error:
         ppe_detector = None
         print(f"[WARNING] PPE detection disabled; model load failed: {error}")
@@ -3284,16 +3288,15 @@ def camera_worker(camera_config, rtsp_url=None):
     detection_manager = camera_event_managers.get(camera_id)
     state = camera_states.get(camera_id)
 
-    # CameraManager creates workers exclusively from _enabled_cameras(). The
-    # three global switches therefore apply to every enabled worker and never
-    # to a disabled camera, without maintaining per-KPI camera lists.
+    # CameraManager creates workers exclusively from _enabled_cameras(), so a
+    # KPI's configured camera scope is intersected with enabled cameras.
     if fall_detector is not None and FALL_DETECTION_ENABLED:
-        scope = "CAM008_ONLY" if _should_run_kpi(camera_id, "fall") else "DISABLED"
+        scope = "ENABLED" if _should_run_kpi(camera_id, "fall") else "DISABLED"
         _camera_log(camera_id, f"[FALL] ENABLED | scope={scope}")
     if smoke_fire_detector is not None and FIRE_DETECTION_ENABLED:
         _camera_log(camera_id, "[FIRE] ENABLED | scope=ALL_ENABLED_CAMERAS")
     if ppe_detector is not None and HELMET_DETECTION_ENABLED:
-        scope = "CAM008_ONLY" if _should_run_kpi(camera_id, "helmet") else "DISABLED"
+        scope = "ENABLED" if _should_run_kpi(camera_id, "helmet") else "DISABLED"
         _camera_log(camera_id, f"[HELMET] ENABLED | scope={scope}")
 
     if rtsp_url is None:

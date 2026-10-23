@@ -113,6 +113,18 @@ CAM001_ENABLED=true
 `ENABLED_CAMERAS=ALL` enables every configured camera. Invalid camera IDs are
 rejected. `config/cameras.py` is now the owner of this loading behavior.
 
+Fall and PPE/helmet detection use independent camera scopes configured with
+`FALL_CAMERAS` and `PPE_CAMERAS` in `.env`. Each accepts a comma-separated
+list of camera IDs and defaults to `CAM008`:
+
+```env
+FALL_CAMERAS=CAM003,CAM013
+PPE_CAMERAS=CAM013
+```
+
+A camera must also be enabled in `config/cameras.json` or with its
+`CAMxxx_ENABLED=true` override for either KPI to run.
+
 The active ROI values are in `roi/camera_rois.py`. `CAMERA_ROIS` contains one
 independent entry for every configured camera. Edit only the camera you want:
 

@@ -10,6 +10,17 @@ FALL_DETECTION_ENABLED = os.getenv(
     "FALL_DETECTION_ENABLED", "true"
 ).strip().lower() in {"1", "true", "yes", "on"}
 FALL_ENABLED = FALL_DETECTION_ENABLED
+FALL_CAMERAS = frozenset(
+    camera.strip().upper()
+    for camera in os.getenv("FALL_CAMERAS", "CAM008").split(",")
+    if camera.strip()
+)
+
+
+def is_fall_camera_enabled(camera_id):
+    return str(camera_id or "").strip().upper() in FALL_CAMERAS
+
+
 FALL_MODEL_PATH = str(
     resolve_model_path(os.getenv("FALL_MODEL_PATH", "yolo11m-pose.pt"))
 )

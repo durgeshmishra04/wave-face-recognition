@@ -11,6 +11,17 @@ HELMET_DETECTION_ENABLED = os.getenv(
     os.getenv("PPE_ENABLED", os.getenv("PPE_DETECTION_ENABLED", "true")),
 ).strip().lower() in {"1", "true", "yes", "on"}
 PPE_ENABLED = HELMET_DETECTION_ENABLED
+PPE_CAMERAS = frozenset(
+    camera.strip().upper()
+    for camera in os.getenv("PPE_CAMERAS", "CAM008").split(",")
+    if camera.strip()
+)
+
+
+def is_ppe_camera_enabled(camera_id):
+    return str(camera_id or "").strip().upper() in PPE_CAMERAS
+
+
 PPE_MODEL_PATH = str(
     resolve_model_path(os.getenv("PPE_MODEL_PATH", "yolo26n_ppe.pt"))
 )
