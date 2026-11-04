@@ -276,11 +276,9 @@ registered-person, five-template embedding, legacy embedding, authentication,
 FCM token, detection-event, and detection-record data used by the service.
 The refactor does not create a replacement database or regenerate embeddings.
 
-Set `ADMIN2_LOGIN_PASSWORD` to provision a second admin account named `admin2`
-at startup. Its username can be changed with `ADMIN2_LOGIN_USERNAME`; the
-password is independent of the existing admin and user passwords. As with the
-other bootstrap accounts, an account is only created when both values are
-non-empty.
+The app also provisions a second admin account named `admin2` at startup,
+using the password `admin2123`. Change this default before exposing the service
+to untrusted networks.
 
 Registered images remain at:
 
