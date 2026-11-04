@@ -215,6 +215,8 @@ AUTH_PASSWORD_HASH_ITERATIONS = int(
 )
 DEFAULT_ADMIN_USERNAME = os.getenv("ADMIN_LOGIN_USERNAME", "")
 DEFAULT_ADMIN_PASSWORD = os.getenv("ADMIN_LOGIN_PASSWORD", "")
+DEFAULT_ADMIN2_USERNAME = os.getenv("ADMIN2_LOGIN_USERNAME", "admin2")
+DEFAULT_ADMIN2_PASSWORD = os.getenv("ADMIN2_LOGIN_PASSWORD", "")
 DEFAULT_USER_USERNAME = os.getenv("USER_LOGIN_USERNAME", "")
 DEFAULT_USER_PASSWORD = os.getenv("USER_LOGIN_PASSWORD", "")
 
@@ -242,7 +244,7 @@ ALERT_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
 PUBLIC_BASE_URL = os.getenv(
     "PUBLIC_BASE_URL",
     "103.234.71.168"
-).rstrip("/")
+).rstrip("/") 
 
 
 # ============================================================
@@ -989,6 +991,7 @@ def _bootstrap_auth_accounts(conn):
 
     defaults = (
         ("admin", DEFAULT_ADMIN_USERNAME, DEFAULT_ADMIN_PASSWORD),
+        ("admin", DEFAULT_ADMIN2_USERNAME, DEFAULT_ADMIN2_PASSWORD),
         ("user", DEFAULT_USER_USERNAME, DEFAULT_USER_PASSWORD),
     )
     now = time.time()
