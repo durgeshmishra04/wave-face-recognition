@@ -278,8 +278,9 @@ token by posting `username` and `password` as JSON to
 `/api/incidents/auth/login`, then send it as `Authorization: Bearer <token>`.
 Tokens expire after 12 hours and can be revoked using the incident logout
 route. Workflow roles are mapped server-side from the existing accounts:
-`supervisor` (user account), `admin2` (CSO), and `admin` (Superadmin). Request
-body role or username fields are never used to authorize actions.
+`supervisor` and user account ID `2` (Supervisor), `admin2` (CSO), and `admin`
+(Superadmin). Request body role or username fields are never used to authorize
+actions.
 
 Incident list and detail APIs read the existing `detection_records` table and
 only return `unknown_person` events; they do not create or rerun detections.

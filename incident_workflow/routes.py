@@ -41,7 +41,7 @@ def create_blueprint(authenticate_credentials):
             if session is None:
                 return json_error("Invalid or expired incident session", 401)
             account_role = "user" if session[1] == "supervisor" else "admin"
-            if workflow_role(account_role, session[2]) != session[1]:
+            if workflow_role(account_role, session[2], session[0]) != session[1]:
                 return json_error("Incident session role is no longer valid", 401)
             g.incident_actor = {
                 "account_id": session[0],
@@ -81,7 +81,7 @@ def create_blueprint(authenticate_credentials):
             return json_error("Invalid credentials", 401)
         account_role = account[1]
         account_username = account[2]
-        role = workflow_role(account_role, account_username)
+        role = workflow_role(account_role, account_username, int(account[0]))
         if role is None:
             return json_error("This account has no incident workflow access", 403)
 

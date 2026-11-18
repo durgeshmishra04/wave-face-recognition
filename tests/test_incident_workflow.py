@@ -10,6 +10,8 @@ from incident_workflow.validators import alert_image_url, utc_date_boundary
 
 def test_workflow_roles_are_bound_to_existing_account_identity():
     assert workflow_role("user", "supervisor") == "supervisor"
+    assert workflow_role("user", "operator", 2) == "supervisor"
+    assert workflow_role("user", "operator", 3) is None
     assert workflow_role("admin", "admin2") == "cso"
     assert workflow_role("admin", "admin") == "superadmin"
     assert workflow_role("admin", "supervisor") is None
@@ -97,3 +99,59 @@ def test_incident_bearer_identity_comes_from_server_session(monkeypatch):
         },
     )
     assert forbidden.status_code == 403
+
+
+def test_user_id_2_can_log_in_to_incident_workflow(monkeypatch):
+    created_sessions = {}
+
+    def authenticate(username, password):
+        if password != "secret":
+            return None
+        account_id = {"operator": 2, "other": 3}.get(username)
+        if account_id is None:
+            return None
+        return account_id, "user", username, "password-hash"
+
+    def create_session(token_hash, account_id, role, expires_at):
+        created_sessions[token_hash] = (account_id, role, expires_at)
+
+    def get_session(token_hash):
+        session = created_sessions.get(token_hash)
+        if session is None:
+            return None
+        account_id, role, _ = session
+        username = {2: "operator", 3: "other"}.get(account_id)
+        return account_id, role, username
+
+    monkeypatch.setattr(repository, "create_session", create_session)
+    monkeypatch.setattr(repository, "get_session", get_session)
+    monkeypatch.setattr(
+        service,
+        "list_incidents",
+        lambda *args: {
+            "data": [],
+            "pagination": {"page": 1, "limit": 20, "total": 0, "totalPages": 0},
+        },
+    )
+    app = Flask(__name__)
+    app.register_blueprint(create_blueprint(authenticate))
+    client = app.test_client()
+
+    login = client.post(
+        "/api/incidents/auth/login",
+        json={"username": "operator", "password": "secret"},
+    )
+    assert login.status_code == 200
+    response = login.get_json()["data"]
+    assert response["role"] == "supervisor"
+    listed = client.get(
+        "/api/incidents",
+        headers={"Authorization": f"Bearer {response['token']}"},
+    )
+    assert listed.status_code == 200
+
+    denied = client.post(
+        "/api/incidents/auth/login",
+        json={"username": "other", "password": "secret"},
+    )
+    assert denied.status_code == 403

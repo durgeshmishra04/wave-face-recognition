@@ -6,6 +6,10 @@ ACCOUNT_ROLES = {
     ("admin", "admin"): "superadmin",
 }
 
+ACCOUNT_ID_ROLES = {
+    ("user", 2): "supervisor",
+}
+
 WORKFLOW_STATUSES = {
     "pending_supervisor_remark",
     "pending_cso_review",
@@ -24,8 +28,11 @@ WORKFLOW_TRANSITIONS = {
 }
 
 
-def workflow_role(account_role, username):
+def workflow_role(account_role, username, account_id=None):
     """Return the workflow role only for the explicitly mapped account."""
+    role = ACCOUNT_ID_ROLES.get((account_role, account_id))
+    if role is not None:
+        return role
     return ACCOUNT_ROLES.get((account_role, username))
 
 
