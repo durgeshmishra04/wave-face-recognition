@@ -41,6 +41,7 @@ from flask_cors import CORS
 from flask_socketio import SocketIO, join_room, leave_room
 
 from database import validate_postgres_connection
+from incident_workflow import create_blueprint, initialize_schema
 from insightface.app import FaceAnalysis
 from detection_database import DetectionDatabase
 from detection_events import DetectionEventManager
@@ -1092,6 +1093,19 @@ def _auth_account_by_credentials(role, username, password):
         return row
     finally:
         conn.close()
+
+
+def _authenticate_incident_credentials(username, password):
+    for role in ("user", "admin"):
+        account = _auth_account_by_credentials(role, username, password)
+        if account is not None:
+            return account
+    return None
+
+
+app.register_blueprint(
+    create_blueprint(_authenticate_incident_credentials)
+)
 
 
 def _auth_account_by_id(role, account_id):
@@ -6401,6 +6415,7 @@ def main():
 
     load_known_faces()
     initialize_auth_accounts()
+    initialize_schema()
 
 
     # ----------------------------------------

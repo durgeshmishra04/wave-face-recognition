@@ -264,6 +264,31 @@ codes, and response shapes are compatibility contracts.
 | GET | `/api/detections` | Return persisted detection events |
 | GET | `/api/snapshot` | Return the latest selected-camera JPEG as base64 |
 | POST | `/api/test-notification` | Send a test alert using the latest default-camera frame |
+| POST | `/api/incidents/auth/login` | Exchange existing account credentials for an incident Bearer token |
+| POST | `/api/incidents/auth/logout` | Revoke the current incident Bearer token |
+| GET | `/api/incidents` | List persisted unknown-person detection events with workflow status and filters |
+| GET | `/api/incidents/<incident_id>` | Get unknown-person detection and workflow history |
+| POST | `/api/incidents/<incident_id>/supervisor-remark` | Submit or, after rejection, resubmit visitor details |
+| POST | `/api/incidents/<incident_id>/cso-review` | Approve or reject a supervisor submission |
+| POST | `/api/incidents/<incident_id>/final-action` | Save a Superadmin final workflow action |
+
+Incident endpoints use a separate authentication exchange, leaving the
+existing login request and response contracts unchanged. Obtain an incident
+token by posting `username` and `password` as JSON to
+`/api/incidents/auth/login`, then send it as `Authorization: Bearer <token>`.
+Tokens expire after 12 hours and can be revoked using the incident logout
+route. Workflow roles are mapped server-side from the existing accounts:
+`supervisor` (user account), `admin2` (CSO), and `admin` (Superadmin). Request
+body role or username fields are never used to authorize actions.
+
+Incident list and detail APIs read the existing `detection_records` table and
+only return `unknown_person` events; they do not create or rerun detections.
+The isolated workflow migration adds `incident_workflow`,
+`incident_workflow_history`, and `incident_sessions` tables. A CSO rejection
+sets the status to `cso_rejected`; the supervisor may then resubmit, returning
+the workflow to `pending_cso_review`. Each submission/review/final decision is
+kept in workflow history. Superadmin final actions are recorded as workflow
+decisions only and do not alter employee records, cameras, or detection logic.
 
 Socket.IO handlers are `connect`, `disconnect`, `join_camera`, and
 `leave_camera`. The server emits `face_frame`, `face_alert`, and
@@ -286,7 +311,7 @@ Registered images remain at:
 known_faces/<storage_key>/image_1.jpg
 known_faces/<storage_key>/image_2.jpg
 known_faces/<storage_key>/image_3.jpg
-known_faces/<storage_key>/image_4.jpg
+known_faces/<storage_key>/image_4.jpg 
 known_faces/<storage_key>/image_5.jpg
 ```
 

@@ -9,7 +9,19 @@
   },
   "authentication": {
     "enforced": false,
-    "note": "Login validates credentials and registers an FCM device token. The current REST routes do not enforce a session or Bearer token."
+    "note": "Existing login routes validate credentials and register FCM device tokens. Existing non-incident REST routes retain their current behavior; incident workflow routes require the separate Bearer-token authentication below."
+  },
+  "incident_workflow_authentication": {
+    "enforced": true,
+    "login_path": "/api/incidents/auth/login",
+    "logout_path": "/api/incidents/auth/logout",
+    "token_header": "Authorization: Bearer <token>",
+    "token_lifetime_hours": 12,
+    "roles": {
+      "supervisor": "Existing user account named supervisor",
+      "cso": "Existing admin account named admin2",
+      "superadmin": "Existing admin account named admin"
+    }
   },
   "common_errors": [
     {"status": 400, "body": {"success": false, "message": "Invalid or missing input"}},
@@ -160,6 +172,62 @@
       "request": {"body": null},
       "success": {"status": 200, "body": {"success": true, "message": "Test notification sent"}},
       "errors": [503]
+    },
+    {
+      "method": "POST",
+      "path": "/api/incidents/auth/login",
+      "purpose": "Exchanges credentials for an incident-workflow-only Bearer token without changing existing login responses.",
+      "request": {"content_type": "application/json", "example": {"username": "admin2", "password": "<account-password>"}},
+      "success": {"status": 200, "body": {"success": true, "message": "Incident session created", "data": {"token": "<bearer-token>", "token_type": "Bearer", "expires_at": "2026-11-04T12:00:00Z", "role": "cso", "username": "admin2"}}},
+      "errors": [400, 401, 403]
+    },
+    {
+      "method": "POST",
+      "path": "/api/incidents/auth/logout",
+      "purpose": "Revokes the incident Bearer token supplied in the Authorization header.",
+      "request": {"headers": {"Authorization": "Bearer <token>"}},
+      "success": {"status": 200, "body": {"success": true, "message": "Incident session revoked", "data": null}},
+      "errors": [401]
+    },
+    {
+      "method": "GET",
+      "path": "/api/incidents",
+      "purpose": "Lists actual persisted unknown-person detection events with workflow status and pagination.",
+      "request": {"headers": {"Authorization": "Bearer <token>"}, "query": {"category": "unknown_person", "page": 1, "limit": 20, "status": "pending_supervisor_remark (optional)", "camera_id": "CAM001 (optional)", "start_date": "2026-11-01 (optional)", "end_date": "2026-11-04 (optional)"}},
+      "success": {"status": 200, "body": {"success": true, "data": [{"id": 101, "title": "Unknown Person Detected", "description": "Unknown person detected at MAIN GATE 01", "receivedAt": "2026-11-04T10:30:00Z", "image": "/alerts/image.jpg", "category": "unknown_person", "cameraId": "CAM001", "cameraName": "MAIN GATE 01", "status": "pending_supervisor_remark"}], "pagination": {"page": 1, "limit": 20, "total": 1, "totalPages": 1}}},
+      "errors": [400, 401, 403]
+    },
+    {
+      "method": "GET",
+      "path": "/api/incidents/{incident_id}",
+      "purpose": "Returns an unknown-person detection, its current workflow data, and submission/review history.",
+      "request": {"headers": {"Authorization": "Bearer <token>"}, "path_parameters": {"incident_id": 101}},
+      "success": {"status": 200, "body": {"success": true, "message": "Operation completed successfully", "data": {"incidentId": 101, "visitorName": null, "phone": null, "whomToMeet": null, "reason": null, "supervisorRemark": null, "supervisorName": null, "supervisorSubmittedAt": null, "supervisorStatus": "pending", "csoRemark": null, "csoName": null, "csoReviewedAt": null, "csoStatus": null, "finalAction": null, "finalRemark": null, "finalActionAt": null, "finalActionBy": null, "status": "pending_supervisor_remark"}}},
+      "errors": [400, 401, 403, 404]
+    },
+    {
+      "method": "POST",
+      "path": "/api/incidents/{incident_id}/supervisor-remark",
+      "purpose": "Submits visitor information and a supervisor remark; allows resubmission after a CSO rejection.",
+      "request": {"headers": {"Authorization": "Bearer <supervisor-token>"}, "content_type": "application/json", "example": {"visitorName": "Rahul Sharma", "phone": "9876543210", "whomToMeet": "HR Department", "reason": "Official Meeting", "remark": "Visitor details verified"}},
+      "success": {"status": 200, "body": {"success": true, "message": "Supervisor remark submitted", "data": {"incidentId": 101, "status": "pending_cso_review"}}},
+      "errors": [400, 401, 403, 404, 409]
+    },
+    {
+      "method": "POST",
+      "path": "/api/incidents/{incident_id}/cso-review",
+      "purpose": "Records a CSO approval or rejection. Rejected incidents return to the supervisor for resubmission.",
+      "request": {"headers": {"Authorization": "Bearer <cso-token>"}, "content_type": "application/json", "examples": [{"decision": "approved", "remark": "Visitor details verified and approved"}, {"decision": "rejected", "remark": "Visitor verification unsuccessful"}]},
+      "success": {"status": 200, "body": {"success": true, "message": "CSO review submitted", "data": {"incidentId": 101, "status": "cso_approved"}}},
+      "errors": [400, 401, 403, 404, 409]
+    },
+    {
+      "method": "POST",
+      "path": "/api/incidents/{incident_id}/final-action",
+      "purpose": "Records a Superadmin final workflow action without changing employee, blacklist, camera, or detection data.",
+      "request": {"headers": {"Authorization": "Bearer <superadmin-token>"}, "content_type": "application/json", "example": {"action": "allow", "remark": "Visitor verified. Entry permitted."}, "allowed_actions": ["allow", "monitor", "escalate", "blacklist"]},
+      "success": {"status": 200, "body": {"success": true, "message": "Final incident action submitted", "data": {"incidentId": 101, "status": "completed"}}},
+      "errors": [400, 401, 403, 404, 409]
     },
     {
       "method": "GET",
