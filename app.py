@@ -1,9 +1,4 @@
-"""Application entry point.
-
-The existing pipeline remains in alcon_stream_new.py during the staged
-organization refactor. Keeping this launcher small preserves current startup
-behavior while providing the new stable command: python app.py.
-"""
+"""Application entry point."""
 
 from alcon_stream_new import main
 

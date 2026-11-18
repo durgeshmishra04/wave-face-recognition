@@ -113,6 +113,18 @@ CAM001_ENABLED=true
 `ENABLED_CAMERAS=ALL` enables every configured camera. Invalid camera IDs are
 rejected. `config/cameras.py` is now the owner of this loading behavior.
 
+Fall and PPE/helmet detection use independent camera scopes configured with
+`FALL_CAMERAS` and `PPE_CAMERAS` in `.env`. Each accepts a comma-separated
+list of camera IDs and defaults to `CAM008`:
+
+```env
+FALL_CAMERAS=CAM003,CAM013
+PPE_CAMERAS=CAM013
+```
+
+A camera must also be enabled in `config/cameras.json` or with its
+`CAMxxx_ENABLED=true` override for either KPI to run.
+
 The active ROI values are in `roi/camera_rois.py`. `CAMERA_ROIS` contains one
 independent entry for every configured camera. Edit only the camera you want:
 
@@ -263,6 +275,10 @@ The existing database is `known_faces/known_faces.db`. It contains the
 registered-person, five-template embedding, legacy embedding, authentication,
 FCM token, detection-event, and detection-record data used by the service.
 The refactor does not create a replacement database or regenerate embeddings.
+
+The app also provisions a second admin account named `admin2` at startup,
+using the password `admin2123`. Change this default before exposing the service
+to untrusted networks.
 
 Registered images remain at:
 

@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import os
 import re
-from pathlib import Path
 
 from dotenv import load_dotenv
 import psycopg
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+from runtime_paths import runtime_root
+
+PROJECT_ROOT = runtime_root()
 load_dotenv(PROJECT_ROOT / ".env")
 
 

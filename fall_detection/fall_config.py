@@ -2,15 +2,30 @@
 
 import os
 
+from runtime_paths import resolve_model_path
+
 # FALL_DETECTION_ENABLED is the deployment-facing global switch. FALL_ENABLED
 # remains the existing package-level alias used by the pipeline.
 FALL_DETECTION_ENABLED = os.getenv(
     "FALL_DETECTION_ENABLED", "true"
 ).strip().lower() in {"1", "true", "yes", "on"}
 FALL_ENABLED = FALL_DETECTION_ENABLED
-FALL_MODEL_PATH = os.getenv("FALL_MODEL_PATH", "yolo11m-pose.pt")
-FALL_CONFIDENCE = float(os.getenv("FALL_CONFIDENCE", "0.80"))
-FALL_POSE_CONFIDENCE = float(os.getenv("FALL_POSE_CONFIDENCE", "0.80"))
+FALL_CAMERAS = frozenset(
+    camera.strip().upper()
+    for camera in os.getenv("FALL_CAMERAS", "CAM008").split(",")
+    if camera.strip()
+)
+
+
+def is_fall_camera_enabled(camera_id):
+    return str(camera_id or "").strip().upper() in FALL_CAMERAS
+
+
+FALL_MODEL_PATH = str(
+    resolve_model_path(os.getenv("FALL_MODEL_PATH", "yolo11m-pose.pt"))
+)
+FALL_CONFIDENCE = float(os.getenv("FALL_CONFIDENCE", "0.60"))
+FALL_POSE_CONFIDENCE = float(os.getenv("FALL_POSE_CONFIDENCE", "0.60"))
 FALL_CONFIRMATION_FRAMES = max(2, int(os.getenv("FALL_CONFIRMATION_FRAMES", "2")))
 FALL_RECOVERY_FRAMES = max(2, int(os.getenv("FALL_RECOVERY_FRAMES", "5")))
 FALL_MIN_NORMAL_FRAMES = max(1, int(os.getenv("FALL_MIN_NORMAL_FRAMES", "2")))

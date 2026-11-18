@@ -17,6 +17,12 @@ import signal
 from collections import deque
 from types import SimpleNamespace
 
+from dotenv import load_dotenv
+
+from runtime_paths import resolve_model_path, resolve_runtime_path, runtime_root
+
+load_dotenv(runtime_root() / ".env")
+
 import firebase_admin
 from firebase_admin import credentials, messaging
 
@@ -29,12 +35,6 @@ try:
     from ultralytics import YOLO
 except ImportError:
     YOLO = None
-
-from dotenv import load_dotenv
-
-# Load deployment switches before importing camera and KPI configuration
-# modules, which read their values at module initialization time.
-load_dotenv()
 
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
@@ -49,16 +49,20 @@ from config.cameras import CAMERAS, enabled_cameras
 from roi.camera_rois import get_camera_roi
 from fall_detection import FallDetector
 from fall_detection.fall_config import (
+    FALL_CAMERAS,
     FALL_DETECTION_ENABLED,
     FALL_ENABLED,
     FALL_MODEL_PATH,
+    is_fall_camera_enabled,
 )
 from ppe_detection import PPEDetector
 from ppe_detection.ppe_config import (
     HELMET_DETECTION_ENABLED,
     PPE_ANNOTATION_ENABLED,
+    PPE_CAMERAS,
     PPE_ENABLED,
     PPE_MODEL_PATH,
+    is_ppe_camera_enabled,
 )
 from smoke_fire_detection import SmokeFireDetector
 from smoke_fire_detection.smoke_fire_config import (
@@ -88,8 +92,8 @@ from face_association import (
 # CONFIGURATION
 # ============================================================
 
-DEFAULT_NVR_IP = os.getenv("NVR_IP", "115.247.225.82")
-NVR_USERNAME = "alcon"
+DEFAULT_NVR_IP = os.getenv("NVR_IP", "")
+NVR_USERNAME = os.getenv("NVR_USERNAME", "alcon")
 NVR_PASSWORD = os.getenv("ALCON_PASSWORD", "")
 
 RTSP_PORT = 554
@@ -183,14 +187,16 @@ KNOWN_IDENTITY_MEMORY_TIMEOUT = float(
 PERSON_TRACK_TIMEOUT = float(
     os.getenv("PERSON_TRACK_TIMEOUT", str(KNOWN_IDENTITY_MEMORY_TIMEOUT))
 )
-PERSON_MODEL = os.getenv("PERSON_MODEL", "yolo11n.pt")
+PERSON_MODEL = str(resolve_model_path(os.getenv("PERSON_MODEL", "yolo11n.pt")))
 PERSON_CONFIDENCE = float(os.getenv("PERSON_CONFIDENCE", "0.45"))
 PERSON_IOU = float(os.getenv("PERSON_IOU", "0.45"))
 PERSON_DEDUP_IOU = float(os.getenv("PERSON_DEDUP_IOU", "0.50"))
 
 USE_GPU = os.getenv("USE_GPU", "auto").strip().lower()
 CUDA_DEVICE_ID = int(os.getenv("CUDA_DEVICE_ID", "0"))
-VEHICLE_MODEL_PATH = "yolo26l.pt"
+VEHICLE_MODEL_PATH = str(
+    resolve_model_path(os.getenv("VEHICLE_MODEL_PATH", "yolo26l.pt"))
+)
 VEHICLE_CONFIDENCE = 0.45
 VEHICLE_DEVICE = f"cuda:{CUDA_DEVICE_ID}"
 TWO_WHEELER_CLASSES = {
@@ -207,19 +213,20 @@ VEHICLE_DEDUP_IOU = float(os.getenv("VEHICLE_DEDUP_IOU", "0.50"))
 AUTH_PASSWORD_HASH_ITERATIONS = int(
     os.getenv("AUTH_PASSWORD_HASH_ITERATIONS", "210000")
 )
-DEFAULT_ADMIN_USERNAME = os.getenv("ADMIN_LOGIN_USERNAME", "admin")
-DEFAULT_ADMIN_PASSWORD = os.getenv("ADMIN_LOGIN_PASSWORD", "admin123")
-DEFAULT_USER_USERNAME = os.getenv("USER_LOGIN_USERNAME", "user")
-DEFAULT_USER_PASSWORD = os.getenv("USER_LOGIN_PASSWORD", "user123")
+DEFAULT_ADMIN_USERNAME = os.getenv("ADMIN_LOGIN_USERNAME", "")
+DEFAULT_ADMIN_PASSWORD = os.getenv("ADMIN_LOGIN_PASSWORD", "")
+DEFAULT_ADMIN2_USERNAME = os.getenv("ADMIN2_LOGIN_USERNAME", "admin2")
+DEFAULT_ADMIN2_PASSWORD = "admin2123"
+DEFAULT_USER_USERNAME = os.getenv("USER_LOGIN_USERNAME", "")
+DEFAULT_USER_PASSWORD = os.getenv("USER_LOGIN_PASSWORD", "")
 
-# Resolve this from the source file, not the process working directory. This
-# keeps known faces and finalized detection history on the same server DB even
-# when the service is started by Android deployment tooling or a scheduler.
-PROJECT_DIR = Path(__file__).resolve().parent
+# Keep configuration and persistent data rooted outside the frozen executable
+# when WAVE_RUNTIME_DIR is configured by the service.
+PROJECT_DIR = runtime_root()
 KNOWN_FACES_DIR = PROJECT_DIR / "known_faces"
 
-HOST = "0.0.0.0"
-PORT = 5000
+HOST = os.getenv("HOST", "0.0.0.0")
+PORT = int(os.getenv("PORT", "5000"))
 
 CAMERA_CONFIG_PATH = PROJECT_DIR / "config" / "cameras.json"
 
@@ -234,16 +241,10 @@ CAMERA_CONFIG_PATH = PROJECT_DIR / "config" / "cameras.json"
 ALERT_IMAGE_DIR = PROJECT_DIR / "alert_images"
 ALERT_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
 
-# IMPORTANT:
-# Change this to your actual public HTTPS domain.
-#
-# Example:
-# PUBLIC_BASE_URL = "https://bhcs.biconnect.in"
-#
 PUBLIC_BASE_URL = os.getenv(
     "PUBLIC_BASE_URL",
-    "http://103.234.71.180:5000/"
-).rstrip("/")
+    "103.234.71.168"
+).rstrip("/") 
 
 
 # ============================================================
@@ -432,13 +433,11 @@ def _socket_frame_emitter():
 
 
 def _should_run_kpi(camera_id, kpi_name):
-    """Central KPI scope: fire/smoke/known/unknown run on all enabled cameras,
-    while helmet/fall are restricted to CAM008 only.
-    """
-    camera_ref = str(camera_id or "").upper()
-    restricted_kpis = {"helmet", "fall"}
-    if kpi_name in restricted_kpis:
-        return camera_ref == "CAM008"
+    """Return whether a camera is configured to run the requested KPI."""
+    if kpi_name == "helmet":
+        return is_ppe_camera_enabled(camera_id)
+    if kpi_name == "fall":
+        return is_fall_camera_enabled(camera_id)
     return True
 
 
@@ -543,17 +542,17 @@ def initialize_firebase():
             print("[INFO] Firebase already initialized.")
             return
 
-        firebase_json = os.getenv(
+        firebase_json = resolve_runtime_path(os.getenv(
             "FIREBASE_SERVICE_ACCOUNT",
-            "./pythonai.json"
-        )
+            "pythonai.json"
+        ))
 
-        if not os.path.exists(firebase_json):
+        if not firebase_json.exists():
             raise FileNotFoundError(
                 f"Firebase service account not found: {firebase_json}"
             )
 
-        cred = credentials.Certificate(firebase_json)
+        cred = credentials.Certificate(str(firebase_json))
 
         firebase_admin.initialize_app(cred)
 
@@ -741,6 +740,9 @@ def initialize_face_model():
 
     face_app = FaceAnalysis(
         name="buffalo_l",
+        root=str(
+            resolve_runtime_path(os.getenv("INSIGHTFACE_HOME", ".insightface"))
+        ),
         providers=providers
     )
 
@@ -776,7 +778,8 @@ def initialize_fall_detector():
     print(f"[INFO] Loading fall pose detector: {FALL_MODEL_PATH}...")
     fall_detector = FallDetector(FALL_MODEL_PATH, YOLO)
     print("[OK] Fall pose detector loaded.")
-    print("[FALL] ENABLED | scope=CAM008_ONLY")
+    fall_scope = ",".join(sorted(FALL_CAMERAS)) or "NONE"
+    print(f"[FALL] ENABLED | scope={fall_scope}")
 
 
 def initialize_ppe_detector():
@@ -798,7 +801,8 @@ def initialize_ppe_detector():
         print(f"[PPE MODEL] classes={actual_classes}")
         print(f"[PPE MODEL] supported={supported} missing={missing}")
         print("[OK] PPE detector loaded (only confirmed Helmet sessions alert).")
-        print("[HELMET] ENABLED | scope=CAM008_ONLY")
+        ppe_scope = ",".join(sorted(PPE_CAMERAS)) or "NONE"
+        print(f"[HELMET] ENABLED | scope={ppe_scope}")
     except Exception as error:
         ppe_detector = None
         print(f"[WARNING] PPE detection disabled; model load failed: {error}")
@@ -987,6 +991,7 @@ def _bootstrap_auth_accounts(conn):
 
     defaults = (
         ("admin", DEFAULT_ADMIN_USERNAME, DEFAULT_ADMIN_PASSWORD),
+        ("admin", DEFAULT_ADMIN2_USERNAME, DEFAULT_ADMIN2_PASSWORD),
         ("user", DEFAULT_USER_USERNAME, DEFAULT_USER_PASSWORD),
     )
     now = time.time()
@@ -3286,16 +3291,15 @@ def camera_worker(camera_config, rtsp_url=None):
     detection_manager = camera_event_managers.get(camera_id)
     state = camera_states.get(camera_id)
 
-    # CameraManager creates workers exclusively from _enabled_cameras(). The
-    # three global switches therefore apply to every enabled worker and never
-    # to a disabled camera, without maintaining per-KPI camera lists.
+    # CameraManager creates workers exclusively from _enabled_cameras(), so a
+    # KPI's configured camera scope is intersected with enabled cameras.
     if fall_detector is not None and FALL_DETECTION_ENABLED:
-        scope = "CAM008_ONLY" if _should_run_kpi(camera_id, "fall") else "DISABLED"
+        scope = "ENABLED" if _should_run_kpi(camera_id, "fall") else "DISABLED"
         _camera_log(camera_id, f"[FALL] ENABLED | scope={scope}")
     if smoke_fire_detector is not None and FIRE_DETECTION_ENABLED:
         _camera_log(camera_id, "[FIRE] ENABLED | scope=ALL_ENABLED_CAMERAS")
     if ppe_detector is not None and HELMET_DETECTION_ENABLED:
-        scope = "CAM008_ONLY" if _should_run_kpi(camera_id, "helmet") else "DISABLED"
+        scope = "ENABLED" if _should_run_kpi(camera_id, "helmet") else "DISABLED"
         _camera_log(camera_id, f"[HELMET] ENABLED | scope={scope}")
 
     if rtsp_url is None:
@@ -6153,6 +6157,44 @@ def api_detections():
             "detections": detection_database.latest(limit, camera_id=camera_id)
         }
     )
+
+
+@app.route("/api/events/<int:event_id>", methods=["DELETE"])
+def api_delete_event(event_id):
+    try:
+        deleted = detection_database.delete_event(event_id)
+    except Exception as error:
+        print(f"[ERROR] Event deletion failed for id={event_id}: {error}")
+        return jsonify({
+            "success": False,
+            "message": "Event deletion failed",
+            "event_id": event_id,
+        }), 500
+
+    if deleted is None:
+        return jsonify({
+            "success": False,
+            "message": "Event not found",
+            "event_id": event_id,
+        }), 404
+
+    image_url = deleted["image_url"]
+    if image_url and not deleted["image_is_shared"]:
+        image_path = urlsplit(image_url).path
+        image_filename = image_path.rsplit("/", 1)[-1]
+        if image_path.startswith("/alerts/") and image_filename:
+            candidate = (ALERT_IMAGE_DIR / image_filename).resolve()
+            if candidate.parent == ALERT_IMAGE_DIR.resolve():
+                try:
+                    candidate.unlink(missing_ok=True)
+                except OSError as error:
+                    print(f"[WARNING] Could not remove event image for id={event_id}: {error}")
+
+    return jsonify({
+        "success": True,
+        "message": "Event deleted successfully",
+        "event_id": event_id,
+    })
 
 
 @app.route(
